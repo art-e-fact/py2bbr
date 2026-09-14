@@ -9,7 +9,7 @@ CLI can turn them into clean, non-traceback error messages.
 class Py2BbrError(Exception):
     """Base class for all py2bbr errors."""
 
-    def __str__(self) -> str:  # pragma: no cover - trivial
+    def __str__(self) -> str:
         return super().__str__()
 
 
