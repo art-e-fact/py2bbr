@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.eggs/
+
+# Environments / tooling
+.venv/
+venv/
+.uv/
+.python-version
+
+# uv
+uv.lock
+
+# Test / coverage
+.pytest_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.tox/
+
+# Build artifacts (generated layers / recipes / work dirs)
+*.layer/
+kas-workdir/
+build/
+
+# Editors
+.idea/
+.vscode/
+*.swp
+.DS_Store
