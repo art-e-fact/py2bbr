@@ -3,7 +3,8 @@
 Stages, cheapest first:
 
 * ``structural``  - pure-Python checks on the generated ``.bb`` (always runs).
-* ``parse``       - ``bitbake <pn> -c parse`` (needs bitbake + a sourced BUILDDIR).
+* ``parse``       - ``bitbake -p <pn>`` (parse-only; needs bitbake + a
+                    sourced BUILDDIR).
 * ``checklayer``  - ``yocto-check-layer <layer>`` (needs the tool + BUILDDIR;
                     runs ``bitbake world`` and is expensive).
 * ``build``       - ``kas build -c <kasfile>`` (needs kas + network; full build).
@@ -211,9 +212,9 @@ def bitbake_parse(
     meta: PackageMetadata, builddir: str, timeout: int
 ) -> CheckResult:
     pn = bitbake_pn(meta.name)
-    code, out = _run_cmd(
-        ["bitbake", pn, "-c", "parse"], cwd=builddir, timeout=timeout
-    )
+    # '-p'/'--parse-only' is bitbake's real parse-only mode. '-c parse' would
+    # select a do_parse task that does not exist and can never succeed.
+    code, out = _run_cmd(["bitbake", "-p", pn], cwd=builddir, timeout=timeout)
     if code == 0:
         return CheckResult("parse", Status.PASS, f"bitbake parsed {pn}")
     tail = "\n".join(out.splitlines()[-15:])

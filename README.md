@@ -87,7 +87,7 @@ output always states exactly what was validated:
 | Stage | What it does | Requires |
 | --- | --- | --- |
 | `structural` | Pure-Python checks on the `.bb` (required vars, balanced quotes/braces). | nothing |
-| `parse` | `bitbake <pn> -c parse`. | `bitbake` + a sourced `BUILDDIR` |
+| `parse` | `bitbake -p <pn>` (parse-only). | `bitbake` + a sourced `BUILDDIR` |
 | `checklayer` | `yocto-check-layer <layer>` (runs `bitbake world`; expensive). | `yocto-check-layer` + `BUILDDIR` |
 | `build` | `kas build -c <kasfile>` (full build). | `kas` + network |
 

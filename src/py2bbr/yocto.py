@@ -116,12 +116,27 @@ def layer_collection(layer_name: str) -> str:
 
 
 def _layer_conf(collection: str, codename: str) -> str:
+    # BBFILES: bitbake only scans files matching BBFILES globs, so a layer
+    # that never adds its recipe tree is invisible ("No bb files ... matched
+    # BBFILE_PATTERN_<c>") even though the layer itself loads.
+    # LAYERDEPENDS: only hard-depend on "core". bitbake refuses to load a
+    # layer whose LAYERDEPENDS names a collection not enabled in BBLAYERS and
+    # silently drops every recipe in it ("Nothing PROVIDES ..."). The classes
+    # py2bbr emits (pypi, setuptools3, python_pep517,
+    # python_setuptools_build_meta) all live in poky core for the supported
+    # series, so meta-python ("python") must not be a hard layer dependency;
+    # recipe-level needs of it fail per-recipe with a precise error instead.
+    # LAYERSERIES_COMPAT: the modern series-compatibility variable; the old
+    # LAYERCOMPATIBLE is no longer read by bitbake.
     return (
+        f'BBPATH .= ":${{LAYERDIR}}"\n'
+        f'BBFILES += "${{LAYERDIR}}/recipes-*/*/*.bb"\n'
+        f"\n"
         f'BBFILE_COLLECTIONS += "{collection}"\n'
         f'BBFILE_PATTERN_{collection} := "^${{LAYERDIR}}/"\n'
         f'BBFILE_PRIORITY_{collection} = "5"\n'
-        f'LAYERDEPENDS_{collection} = "core python"\n'
-        f'LAYERCOMPATIBLE_{collection} = "{codename}"\n'
+        f'LAYERDEPENDS_{collection} = "core"\n'
+        f'LAYERSERIES_COMPAT_{collection} = "{codename}"\n'
     )
 
 
