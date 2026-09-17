@@ -26,7 +26,7 @@ Hopefully from PyPi soonish. For now, please install from the repository.
 Developed with Python **3.11+** and [uv](https://docs.astral.sh/uv/).
 
 ```console
-uv sync --extra dev
+uv sync --dev
 uv run py2bbr --help
 
 # Tests
@@ -94,8 +94,10 @@ output always states exactly what was validated:
 ## Supported Yocto series
 
 `py2bbr` ships a mapping of Yocto version → codename / poky branch / target Python.
-Currently: **6.0 (Wayne)**, **5.0 (Scarthgap, default)**, 4.3 (Styhead), 4.1
-(Mickledore), 3.1 (Dunfell). Add entries in `src/py2bbr/yocto.py` if you need more.
+Currently: **6.0 (Wayne)** and **5.0 (Scarthgap, default)** are supported. We expect
+4.3 (Styhead), 4.1 (Mickledore) and 3.1 (Dunfell) to work too, but untested (so
+commented out in code for now). Add entries in `src/py2bbr/yocto.py` to start
+supporting more.
 
 Tests are currently conducted on 5.0 (the default), and the others are "experimental"
 for now using LLM generated code.
@@ -113,6 +115,62 @@ for now using LLM generated code.
 4. Render the recipe (canonical `inherit pypi setuptools3` pattern), a layer, and a
    `kas` build file (validated against the official kas JSON schema).
 5. Run the validation ladder.
+
+## Examples
+
+### Add async-pyserial to a PetaLinux project
+
+A concrete use case for py2bbr is to create layer/recipes to add to projects like managed
+by PetaLinux. Here is an example to add the `async-pyserial` package available on PyPi to
+a PetaLinux 2024.2 project (choice led by one of our current projects---nothing special
+to it and should work on other versions by double checking their documentations).
+
+We assume:
+
+* A PetaLinux 2024.2 project created under the `pl-project` folder. The PetaLinux distribution must be recent enough to accept Python packages by default, or configured to accept them (typically a `petalinux-config` command).
+* A layer/recipe for `async-pyserial` create by py2bbr: `uv run py2bbr async-pyserial`, run under the `mylayer` folder. Currently it creates a `mylayer/build/meta-py2bbr` folder and related.
+* `py2bbr` has been called to target the same Yocto version as PetaLinux. Here both use Yocto 5.0 series, Scarthgap.
+
+The steps are as follows:
+
+1. Copy the layer into the project (documented location, UG1144 "Adding Layers"):
+
+```
+cp -r mylayer/build/meta-py2bbr pl-project/project-spec/
+```
+
+2. Register the layer
+
+```
+cd pl-project
+petalinux-config   # → Yocto Settings → User Layers
+# enter: ${PROOT}/project-spec/meta-py2bbr
+# save and exit
+Verify the layer now appears in <proj>/build/conf/bblayers.conf.
+```
+
+3. Add the package to the rootfs:
+
+```
+echo 'CONFIG_python3-async-pyserial' >> pl-project/project-spec/meta-user/conf/user-rootfsconfig
+petalinux-config -c rootfs   # → user packages → enable python3-async-pyserial
+```
+
+4. Rebuild:
+
+```
+petalinux-build
+```
+
+5. Verify on the target (e.g. in QEMU, or directly on device:
+
+```
+python3 -c "import async_pyserial"
+```
+
+Note on minimal PetaLinux: Some installations of PetaLinux do not include `python3`, reportedly `petalinux-image-minimal`. If Python is reported missing:
+- Add `python3` to the `IMAGE_INSTALL:append` line (in interactive configuration or under pl-project/project-spec/configs`.
+- Switch to the full image (petalinux-build targeting petalinux-image-full), which includes `python3` and `pip`.
 
 ## License
 
