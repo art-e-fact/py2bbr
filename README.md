@@ -37,21 +37,23 @@ uv run pytest
 
 ```console
 # Generate a recipe + layer + kas build file for `pyserial` (Scarthgap by default)
-$ py2bbr pyserial
+py2bbr pyserial
 
 # Pin a version, pick a Yocto series
-$ py2bbr "requests==2.34.2" --yocto-version 5.0
+py2bbr "requests==2.34.2" --yocto-version 5.0
 
 # Reach a package that is not on PyPI (private index)
-$ py2bbr mytool \
+py2bbr mytool \
     --extra-index-url https://pypi.mycompany.com/simple \
     --trusted-host pypi.mycompany.com
 
 # Go all the way to a real build (requires kas + network)
-$ py2bbr pyserial --check build
+py2bbr pyserial --check build
 ```
 
 ### Output
+
+Typically under a [Yocto Poky](https://github.com/yoctoproject/poky) `build` folder:
 
 ```
 .
@@ -127,9 +129,14 @@ to it and should work on other versions by double checking their documentations)
 
 We assume:
 
-* A PetaLinux 2024.2 project created under the `pl-project` folder. The PetaLinux distribution must be recent enough to accept Python packages by default, or configured to accept them (typically a `petalinux-config` command).
-* A layer/recipe for `async-pyserial` create by py2bbr: `uv run py2bbr async-pyserial`, run under the `mylayer` folder. Currently it creates a `mylayer/build/meta-py2bbr` folder and related.
-* `py2bbr` has been called to target the same Yocto version as PetaLinux. Here both use Yocto 5.0 series, Scarthgap.
+* A PetaLinux 2024.2 project created under the `pl-project` folder. The PetaLinux
+  distribution must be recent enough to accept Python packages by default, or configured
+  to accept them (typically a `petalinux-config` command).
+* A layer/recipe for `async-pyserial` create by py2bbr: `uv run py2bbr async-pyserial`,
+  run under the `mylayer` folder. Currently it creates a `mylayer/build/meta-py2bbr`
+  folder and related.
+* `py2bbr` has been called to target the same Yocto version as PetaLinux. Here both use
+  Yocto 5.0 series, Scarthgap.
 
 The steps are as follows:
 
