@@ -11,7 +11,12 @@ may only hard-depend on ``core``.
 
 from __future__ import annotations
 
-from py2bbr.yocto import render_layer, resolve_yocto_version
+from py2bbr.yocto import (
+    default_layer_name,
+    layer_collection,
+    render_layer,
+    resolve_yocto_version,
+)
 
 
 def _layer_conf(meta, yocto) -> str:
@@ -54,4 +59,38 @@ class TestLayerConf:
         )
         assert _line(conf, "LAYERDEPENDS_py2bbr") == (
             'LAYERDEPENDS_py2bbr = "core"'
+        )
+
+
+class TestUniqueLayerName:
+    def test_default_layer_name_from_canonical(self):
+        assert default_layer_name("async_pyserial") == "meta-async-pyserial"
+        assert default_layer_name("async-pyserial") == "meta-async-pyserial"
+        assert default_layer_name("Django") == "meta-django"
+        assert default_layer_name("zope.interface") == "meta-zope-interface"
+
+    def test_layer_collection_unique_per_package(self):
+        assert layer_collection("meta-async-pyserial") == "async_pyserial"
+        assert layer_collection("meta-django") == "django"
+        assert layer_collection("meta-zope-interface") == "zope_interface"
+
+    def test_render_layer_uses_package_collection(self, make_meta_fn, yocto):
+        meta = make_meta_fn(
+            name="async-pyserial", canonical_name="async-pyserial"
+        )
+        conf = render_layer(meta, yocto, "meta-async-pyserial")[
+            "conf/layer.conf"
+        ]
+        assert _line(conf, "BBFILE_COLLECTIONS") == (
+            'BBFILE_COLLECTIONS += "async_pyserial"'
+        )
+        assert "BBFILE_PATTERN_async_pyserial" in conf
+        assert _line(conf, "LAYERDEPENDS_async_pyserial") == (
+            'LAYERDEPENDS_async_pyserial = "core"'
+        )
+
+    def test_explicit_layer_name_override_still_works(self, meta, yocto):
+        conf = render_layer(meta, yocto, "meta-custom")["conf/layer.conf"]
+        assert _line(conf, "BBFILE_COLLECTIONS") == (
+            'BBFILE_COLLECTIONS += "custom"'
         )

@@ -14,7 +14,7 @@ from pathlib import Path
 
 from py2bbr.errors import YoctoVersionError
 from py2bbr.model import PackageMetadata, YoctoVersion
-from py2bbr.recipe import bitbake_pn, recipe_filename
+from py2bbr.recipe import bitbake_pn, canonical_name, recipe_filename
 
 # Known Yocto Project series. ``poky_branch`` == the codename (poky release
 # branches are named after the codename). ``meta_python_branch`` matches.
@@ -113,6 +113,15 @@ def layer_collection(layer_name: str) -> str:
     name = re.sub(r"^[mM]eta[-_]?", "", layer_name)
     name = re.sub(r"[^a-zA-Z0-9]+", "_", name).lower().strip("_")
     return name or "py2bbr"
+
+
+def default_layer_name(package_name: str) -> str:
+    """The default layer directory name for a package: ``meta-<canonical>``.
+
+    e.g. ``async_pyserial`` -> ``meta-async-pyserial``. One layer per package
+    (per PEP 503 canonical name), so generated layers never collide.
+    """
+    return f"meta-{canonical_name(package_name)}"
 
 
 def _layer_conf(collection: str, codename: str) -> str:

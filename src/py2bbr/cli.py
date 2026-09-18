@@ -25,13 +25,12 @@ from py2bbr.model import DEFAULT_YOCTO_VERSION
 from py2bbr.recipe import render_recipe_to_path
 from py2bbr.yocto import (
     DEFAULT_KAS_VERSION,
+    default_layer_name,
     render_kas_file,
     resolve_yocto_version,
     validate_kas_file,
     write_layer,
 )
-
-DEFAULT_LAYER_NAME = "meta-py2bbr"
 
 
 def _parse_package_spec(spec: str) -> tuple[str, str | None]:
@@ -73,8 +72,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     out.add_argument(
         "--layer-name",
-        default=DEFAULT_LAYER_NAME,
-        help="Name of the generated Yocto layer directory.",
+        default=None,
+        help="Name of the generated Yocto layer directory "
+        "(default: meta-<package>).",
     )
     out.add_argument(
         "--no-layer",
@@ -228,7 +228,6 @@ def main(argv: list[str] | None = None) -> int:
 
         output = Path(args.output)
         output.mkdir(parents=True, exist_ok=True)
-        layer_dir = output / args.layer_name if not args.no_layer else None
 
         # 1. Fetch + parse metadata.
         if args.verbose:
@@ -247,6 +246,8 @@ def main(argv: list[str] | None = None) -> int:
         )
 
         # 2. Render + write the recipe (and optionally a full layer).
+        layer_name = args.layer_name or default_layer_name(meta.canonical_name)
+        layer_dir = output / layer_name if not args.no_layer else None
         if args.no_layer:
             recipe_path, warnings = render_recipe_to_path(
                 meta, yocto, output, build_class=args.build_class

@@ -57,12 +57,16 @@ Typically under a [Yocto Poky](https://github.com/yoctoproject/poky) `build` fol
 
 ```
 .
-├── meta-py2bbr/
+├── meta-pyserial/
 │   ├── README
 │   ├── conf/layer.conf
 │   └── recipes-devtools/python/python3-pyserial_3.5.bb
 └── py2bbr.kas.yml
 ```
+
+The layer is named after the package (`meta-<package>`, e.g.
+`meta-async-pyserial` for `async_pyserial`) so every generated layer is unique;
+override with `--layer-name`.
 
 The `kas` build file (`py2bbr.kas.yml`) sets up poky + meta-python at the matching
 branch, includes the generated layer, and targets the recipe — so `kas build -c
@@ -77,6 +81,7 @@ py2bbr.kas.yml` compiles it in a clean environment.
 | `--pip-arg` | Append any extra raw argument to `pip download` (repeatable). |
 | `--check {structural,parse,checklayer,build}` | Validation ceiling (default `parse`). |
 | `--build-class` | Override the inherited build class (default auto → `setuptools3`). |
+| `--layer-name` | Override the layer directory name (default: `meta-<package>`, e.g. `meta-async-pyserial`). |
 | `--no-layer`, `--no-kas` | Emit only the recipe / skip the kas file. |
 | `--keep-sources` | Keep downloaded artifacts for debugging. |
 
@@ -115,8 +120,9 @@ for now using LLM generated code.
    optional extras and non-target markers are dropped, the rest become
    single-line, double-quoted `RDEPENDS:${PN} += "python3-<dep>"` values (literal
    `python3-` prefix, no `\` continuations — see the PetaLinux note below).
-4. Render the recipe (canonical `inherit pypi setuptools3` pattern), a layer, and a
-   `kas` build file (validated against the official kas JSON schema).
+4. Render the recipe (canonical `inherit pypi setuptools3` pattern), a
+   `meta-<package>` layer named after the package's canonical name, and a `kas`
+   build file (validated against the official kas JSON schema).
 5. Run the validation ladder.
 
 ## Examples
@@ -134,8 +140,8 @@ We assume:
   distribution must be recent enough to accept Python packages by default, or configured
   to accept them (typically a `petalinux-config` command).
 * A layer/recipe for `async-pyserial` create by py2bbr: `uv run py2bbr async-pyserial`,
-  run under the `mylayer` folder. Currently it creates a `mylayer/build/meta-py2bbr`
-  folder and related.
+run under the `mylayer` folder. Currently it creates a `mylayer/build/meta-async-pyserial`
+folder and related.
 * `py2bbr` has been called to target the same Yocto version as PetaLinux. Here both use
   Yocto 5.0 series, Scarthgap.
 
@@ -144,7 +150,7 @@ The steps are as follows:
 1. Copy the layer into the project (documented location, UG1144 "Adding Layers"):
 
 ```
-cp -r mylayer/build/meta-py2bbr pl-project/project-spec/
+cp -r mylayer/build/meta-async-pyserial pl-project/project-spec/
 ```
 
 2. Register the layer
@@ -152,7 +158,7 @@ cp -r mylayer/build/meta-py2bbr pl-project/project-spec/
 ```
 cd pl-project
 petalinux-config   # → Yocto Settings → User Layers
-# enter: ${PROOT}/project-spec/meta-py2bbr
+# enter: ${PROOT}/project-spec/meta-async-pyserial
 # save and exit
 Verify the layer now appears in <proj>/build/conf/bblayers.conf.
 ```
