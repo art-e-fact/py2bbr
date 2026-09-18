@@ -73,8 +73,8 @@ class Dependency:
     def bitbake_name(self) -> str:
         """The runtime Bitbake package this maps to (without the python prefix).
 
-        e.g. ``mypy-extensions``. The recipe renders it as
-        ``${PYTHON_PN}-<name>``.
+        e.g. ``mypy-extensions``. The recipe renders it as a single-line,
+        quoted ``python3-<name>`` value (never ``${PYTHON_PN}-<name>``).
         """
         return self.name
 

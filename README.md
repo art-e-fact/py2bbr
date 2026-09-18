@@ -88,7 +88,7 @@ output always states exactly what was validated:
 
 | Stage | What it does | Requires |
 | --- | --- | --- |
-| `structural` | Pure-Python checks on the `.bb` (required vars, balanced quotes/braces). | nothing |
+| `structural` | Pure-Python checks on the `.bb` (required vars, balanced quotes/braces, corruption signatures: timestamp residue, `-`-prefixed dep tokens, single-quote balance). | nothing |
 | `parse` | `bitbake -p <pn>` (parse-only). | `bitbake` + a sourced `BUILDDIR` |
 | `checklayer` | `yocto-check-layer <layer>` (runs `bitbake world`; expensive). | `yocto-check-layer` + `BUILDDIR` |
 | `build` | `kas build -c <kasfile>` (full build). | `kas` + network |
@@ -113,7 +113,8 @@ for now using LLM generated code.
    its MD5, and compute the sdist SHA-256.
 3. Classify `Requires-Dist` with [`packaging`](https://pypi.org/project/packaging/):
    optional extras and non-target markers are dropped, the rest become
-   `RDEPENDS:${PN} += "${PYTHON_PN}-<dep>"`.
+   single-line, double-quoted `RDEPENDS:${PN} += "python3-<dep>"` values (literal
+   `python3-` prefix, no `\` continuations — see the PetaLinux note below).
 4. Render the recipe (canonical `inherit pypi setuptools3` pattern), a layer, and a
    `kas` build file (validated against the official kas JSON schema).
 5. Run the validation ladder.
@@ -174,6 +175,33 @@ petalinux-build
 ```
 python3 -c "import async_pyserial"
 ```
+
+### Why recipes are single-line quoted
+
+`py2bbr` renders `DEPENDS` / `RDEPENDS` as single-line, double-quoted values
+with a literal `python3-` prefix, and pins `PYPI_PACKAGE` when the sdist file
+name differs from the canonical package name (e.g. `async_pyserial` vs
+`async-pyserial`, which makes both `do_fetch` and `S = ${WORKDIR}/${PYPI_PACKAGE}-${PV}`
+point at the actual artifact). Older py2bbr output used multi-line `\`
+continuations with ``${PYTHON_PN}`` references — a construct some PetaLinux
+releases corrupt in a line-oriented post-processing step (shell-style
+continuation joining with the variable unset), producing unparsable lines like
+`DEPENDS += -pybind11-native '00:00`. The single-line quoted shape survives such
+passes intact, and `py2bbr --check structural` reports the known corruption
+signatures (timestamp residue, `-`-prefixed dep tokens, unbalanced single
+quotes) if they ever reappear.
+
+PEP 517 builds get one more guard: when the recipe uses a PEP 517 build class
+(`python_pep517` / `python_setuptools_build_meta`), `py2bbr` appends a
+`do_configure` fragment that strips version bounds inside `build-system.requires`.
+PetaLinux 2024.2 / Scarthgap ships `setuptools 69.1.1` and `wheel 0.42.0` in the
+native sysroot, while the build class' `do_compile` runs
+`python3 -m build --no-isolation`, whose dependency check compares the source's
+`requires` bounds against those native versions — so e.g. `async-pyserial`
+0.2.4 (which demands `setuptools>=71.0.1` and `wheel>=0.43.0`) aborted with
+`ERROR Missing dependencies`. The native sysroot versions are authoritative
+for the build, so only the `[build-system]` bounds are relaxed; `[project]`
+dependency bounds are left intact.
 
 Note on minimal PetaLinux: Some installations of PetaLinux do not include `python3`, reportedly `petalinux-image-minimal`. If Python is reported missing:
 - Add `python3` to the `IMAGE_INSTALL:append` line (in interactive configuration or under pl-project/project-spec/configs`.

@@ -114,6 +114,55 @@ def _balanced_braces(text: str) -> tuple[bool, str]:
     return True, ""
 
 
+def _comment_or_blank(line: str) -> bool:
+    return not line.strip() or line.lstrip().startswith("#")
+
+
+def _timestamp_residue(text: str) -> tuple[bool, str]:
+    # Signature of the PetaLinux corruption: a shell timestamp appended to a
+    # joined continuation line (``... '00:00``). Never valid in a recipe.
+    bad = [
+        i
+        for i, line in enumerate(text.splitlines(), 1)
+        if not _comment_or_blank(line)
+        and re.search(r"'\d{1,2}:\d{2}\s*$", line)
+    ]
+    if bad:
+        return False, f"timestamp residue on lines {bad}"
+    return True, ""
+
+
+def _dep_token_prefix(text: str) -> tuple[bool, str]:
+    # A value token starting with '-' means the ``${PYTHON_PN}-`` prefix was
+    # emptied by expansion (``DEPENDS += -pybind11-native``). Legit dep names
+    # never start with '-'.
+    bad = []
+    for i, line in enumerate(text.splitlines(), 1):
+        if not re.match(r"^(DEPENDS|RDEPENDS)\b", line.lstrip()):
+            continue
+        parts = line.split("+=", 1)
+        if len(parts) != 2:
+            continue
+        for tok in parts[1].strip().strip('"').split():
+            if tok.startswith("-"):
+                bad.append(f"{i} ({tok})")
+    if bad:
+        return False, "dep token starting with '-': " + ", ".join(bad)
+    return True, ""
+
+
+def _balanced_single_quotes(text: str) -> tuple[bool, str]:
+    bad = []
+    for i, line in enumerate(text.splitlines(), 1):
+        if _comment_or_blank(line):
+            continue
+        if line.count("'") % 2 != 0:
+            bad.append(i)
+    if bad:
+        return False, f"unbalanced single-quotes on lines {bad}"
+    return True, ""
+
+
 def structural_check(recipe_path: Path) -> CheckResult:
     """Cheap, dependency-free checks on a generated recipe."""
     items: list[tuple[str, Status, str]] = []
@@ -160,6 +209,22 @@ def structural_check(recipe_path: Path) -> CheckResult:
     ok_b, msg_b = _balanced_braces(text)
     items.append(
         ("balanced braces", Status.PASS if ok_b else Status.WARN, msg_b)
+    )
+    ok_ts, msg_ts = _timestamp_residue(text)
+    items.append(
+        ("timestamp residue", Status.PASS if ok_ts else Status.FAIL, msg_ts)
+    )
+    ok_dt, msg_dt = _dep_token_prefix(text)
+    items.append(
+        ("dep token prefix", Status.PASS if ok_dt else Status.FAIL, msg_dt)
+    )
+    ok_sq, msg_sq = _balanced_single_quotes(text)
+    items.append(
+        (
+            "balanced single-quotes",
+            Status.PASS if ok_sq else Status.WARN,
+            msg_sq,
+        )
     )
 
     failed = [i for i in items if i[1] is Status.FAIL]
