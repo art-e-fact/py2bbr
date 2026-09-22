@@ -291,7 +291,15 @@ def parse_metadata_file(source: FetchedSource) -> email.message.Message:
 
 
 def _first(msg: email.message.Message, key: str) -> str:
-    val = msg.get(key)
+    """The sole value of ``key``, or ``""`` when absent or repeated.
+
+    A repeated header (e.g. two ``License`` lines after a bad merge) is
+    ambiguous, so treat it as missing rather than guess.
+    """
+    values = msg.get_all(key) or []
+    if len(values) != 1:
+        return ""
+    val = values[0]
     return val.strip() if isinstance(val, str) else ""
 
 

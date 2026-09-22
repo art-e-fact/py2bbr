@@ -233,9 +233,12 @@ def render_recipe(
             "Yocto's native setuptools/wheel; the recipe relaxes them in "
             "do_configure:append (the native sysroot versions are authoritative)."
         )
+        # The spec class already excludes quotes, so the match stops before the
+        # closing quote: no need to capture/re-emit it (which would unbalance
+        # the line's raw quote counts for the structural check).
         sed_program = (
             r"/^[[:space:]]*\[build-system\]/,/^[[:space:]]*\[/ "
-            r"s/([A-Za-z0-9_.]+)([[:space:]]*[<>=!~][^\"';]*[0-9][^\"';]*)(\"|')/\1\3/g"
+            r"s/([A-Za-z0-9_.]+)([[:space:]]*[<>=!~][^\"';]*[0-9][^\"';]*)/\1/g"
         )
         lines.append("do_configure:append() {")
         lines.append("    if [ -f ${S}/pyproject.toml ]; then")

@@ -3,16 +3,28 @@
 from __future__ import annotations
 
 import email
+import gzip
+import hashlib
+import io
+import subprocess
+import sys
+import tarfile
+import zipfile
 from pathlib import Path
 
+import pytest
+
+from py2bbr import metadata as M
+from py2bbr.errors import MetadataError, MetadataNotFoundError
 from py2bbr.metadata import (
+    FetchedSource,
     PipOptions,
     _marker_env,
     _pick_artifact,
     classify_requires_dist,
     detect_license,
 )
-from py2bbr.model import DepKind
+from py2bbr.model import DepKind, SourceKind
 from py2bbr.yocto import resolve_yocto_version
 
 
@@ -146,3 +158,325 @@ class TestMarkerEnv:
         env = _marker_env(y)
         assert env["python_version"] == "3.12"
         assert env["sys_platform"] == "linux"
+
+    def test_no_yocto_keeps_host_python(self):
+        env = _marker_env(None)
+        assert env["sys_platform"] == "linux"
+        assert "python_version" in env
+
+
+_PKG_INFO = """\
+Metadata-Version: 2.1
+Name: black
+Version: 26.5.1
+Summary: The uncompromising code formatter.
+Description: A longer description of black.
+Home-page: https://github.com/psf/black
+License: MIT
+Requires-Python: >=3.10
+Project-URL: Repository, https://github.com/psf/black
+Requires-Dist: click>=8.0.0
+Requires-Dist: tomli>=1.1.0; python_version < "3.11"
+Requires-Dist: colorama>=0.4; extra == "colorama"
+"""
+
+_PYPROJECT = """\
+[build-system]
+requires = ["hatchling>=1.27.0"]
+build-backend = "hatchling.build"
+"""
+
+
+def _sdist(tmp_path: Path, members: dict[str, str]) -> Path:
+    p = tmp_path / "black-26.5.1.tar.gz"
+    with tarfile.open(p, "w:gz") as tf:
+        for name, data in members.items():
+            blob = data.encode()
+            info = tarfile.TarInfo(name)
+            info.size = len(blob)
+            tf.addfile(info, io.BytesIO(blob))
+    return p
+
+
+def _sdist_src(p: Path) -> FetchedSource:
+    return FetchedSource(p, SourceKind.SDIST, "sha", p.name)
+
+
+_FULL_MEMBERS = {
+    "black-26.5.1/PKG-INFO": _PKG_INFO,
+    "black-26.5.1/pyproject.toml": _PYPROJECT,
+    "black-26.5.1/LICENSE": "MIT license text\n",
+}
+
+
+class TestPipExecutable:
+    def test_module_preferred(self, monkeypatch):
+        import importlib.util
+
+        monkeypatch.setattr(importlib.util, "find_spec", lambda name: "pip")
+        assert M._pip_executable() == [sys.executable, "-m", "pip"]
+
+    def test_path_fallback(self, monkeypatch):
+        import importlib.util
+
+        monkeypatch.setattr(importlib.util, "find_spec", lambda name: None)
+        monkeypatch.setattr(
+            M.shutil,
+            "which",
+            lambda c: "/usr/bin/pip3" if c == "pip3" else None,
+        )
+        assert M._pip_executable() == ["/usr/bin/pip3"]
+
+    def test_last_resort(self, monkeypatch):
+        import importlib.util
+
+        monkeypatch.setattr(importlib.util, "find_spec", lambda name: None)
+        monkeypatch.setattr(M.shutil, "which", lambda c: None)
+        assert M._pip_executable() == [sys.executable, "-m", "pip"]
+
+
+class TestRunPipDownload:
+    def test_command_shape(self, monkeypatch, tmp_path):
+        captured: dict = {}
+
+        def fake_run(cmd, **kw):
+            captured["cmd"] = cmd
+            return subprocess.CompletedProcess(cmd, 0, "ok", "")
+
+        monkeypatch.setattr(M, "_pip_executable", lambda: ["fake", "pip"])
+        monkeypatch.setattr(M.subprocess, "run", fake_run)
+        M._run_pip_download(
+            "black==26.5.1",
+            tmp_path,
+            PipOptions(index_url="https://i", pip_args=["--x"]),
+            "--no-binary=:all:",
+        )
+        cmd = captured["cmd"]
+        assert cmd[:2] == ["fake", "pip"]
+        assert "download" in cmd
+        assert "black==26.5.1" in cmd
+        assert "--no-binary=:all:" in cmd
+        assert ["-d", str(tmp_path)] in [
+            cmd[i : i + 2] for i in range(len(cmd) - 1)
+        ]
+        assert cmd[-3:] == ["--index-url", "https://i", "--x"]
+
+
+class TestFetchSource:
+    def test_success(self, tmp_path, monkeypatch):
+        dest = tmp_path / "download"
+        dest.mkdir()
+        art = dest / "black-26.5.1.tar.gz"
+        art.write_bytes(b"data")
+        monkeypatch.setattr(M, "_run_pip_download", lambda *a, **k: None)
+        src = M.fetch_source("black", "26.5.1", PipOptions(), tmp_path)
+        assert src.path == art
+        assert src.kind is SourceKind.SDIST
+        assert src.sha256 == hashlib.sha256(b"data").hexdigest()
+
+    def test_keep_true(self, tmp_path, monkeypatch):
+        dest = tmp_path / "download"
+        dest.mkdir()
+        art = dest / "black-26.5.1.tar.gz"
+        art.write_bytes(b"data")
+        monkeypatch.setattr(M, "_run_pip_download", lambda *a, **k: None)
+        src = M.fetch_source(
+            "black", "26.5.1", PipOptions(), tmp_path, keep=True
+        )
+        assert src.path == art
+
+    def test_wheel_fallback(self, tmp_path, monkeypatch):
+        dest = tmp_path / "download"
+        dest.mkdir()
+        art = dest / "black-26.5.1-py3-none-any.whl"
+        art.write_bytes(b"wheel")
+        monkeypatch.setattr(M, "_run_pip_download", lambda *a, **k: None)
+        src = M.fetch_source("black", "26.5.1", PipOptions(), tmp_path)
+        assert src.kind is SourceKind.WHEEL
+
+    def test_not_found(self, tmp_path, monkeypatch):
+        (tmp_path / "download").mkdir()
+        proc = subprocess.CompletedProcess([], 1, "", "no sdist\nno wheel")
+        monkeypatch.setattr(M, "_run_pip_download", lambda *a, **k: proc)
+        with pytest.raises(MetadataNotFoundError, match="no sdist"):
+            M.fetch_source("nope", None, PipOptions(), tmp_path)
+
+
+class TestPickArtifactExtra:
+    def test_sdist_when_not_preferred(self, tmp_path):
+        (tmp_path / "pkg-1.0.tar.gz").write_bytes(b"x")
+        assert _pick_artifact(tmp_path, prefer_sdist=False) is not None
+
+    def test_kind_of(self, tmp_path):
+        w = tmp_path / "a.whl"
+        w.write_bytes(b"")
+        s = tmp_path / "a.tar.gz"
+        s.write_bytes(b"")
+        assert M._kind_of(w) is SourceKind.WHEEL
+        assert M._kind_of(s) is SourceKind.SDIST
+
+
+class TestArchiveReading:
+    def test_parse_metadata_sdist(self, tmp_path):
+        src = _sdist_src(_sdist(tmp_path, _FULL_MEMBERS))
+        msg = M.parse_metadata_file(src)
+        assert msg["Name"] == "black"
+        assert msg["Version"] == "26.5.1"
+
+    def test_find_license_sdist(self, tmp_path):
+        src = _sdist_src(_sdist(tmp_path, _FULL_MEMBERS))
+        name, md5 = M.find_license_file(src)
+        assert name == "LICENSE"
+        assert md5 == hashlib.md5(b"MIT license text\n").hexdigest()
+
+    def test_license_nested_ignored(self, tmp_path):
+        src = _sdist_src(_sdist(tmp_path, {"black-26.5.1/src/LICENSE": "x"}))
+        assert M.find_license_file(src) is None
+
+    def test_read_build_system_top_level(self, tmp_path):
+        src = _sdist_src(_sdist(tmp_path, _FULL_MEMBERS))
+        assert M.read_build_system(src) == (
+            "hatchling.build",
+            ["hatchling>=1.27.0"],
+        )
+
+    def test_build_system_top_level_no_bs(self, tmp_path):
+        members = dict(_FULL_MEMBERS)
+        members["black-26.5.1/pyproject.toml"] = "[project]\nname = 'black'\n"
+        src = _sdist_src(_sdist(tmp_path, members))
+        assert M.read_build_system(src) == ("", [])
+
+    def test_build_system_no_pyproject(self, tmp_path):
+        src = _sdist_src(_sdist(tmp_path, {"black-26.5.1/PKG-INFO": _PKG_INFO}))
+        assert M.read_build_system(src) == ("", [])
+
+    def test_build_system_nested_fallback(self, tmp_path):
+        src = _sdist_src(
+            _sdist(
+                tmp_path,
+                {"black-26.5.1/vendor/pyproject.toml": _PYPROJECT},
+            )
+        )
+        assert M.read_build_system(src) == (
+            "hatchling.build",
+            ["hatchling>=1.27.0"],
+        )
+
+    def test_build_system_bad_toml(self, tmp_path):
+        src = _sdist_src(
+            _sdist(
+                tmp_path,
+                {"black-26.5.1/vendor/pyproject.toml": "not [valid toml"},
+            )
+        )
+        assert M.read_build_system(src) == ("", [])
+        assert M._parse_toml(b"not [valid toml") is None
+
+    def test_wheel_paths(self, tmp_path):
+        p = tmp_path / "black-26.5.1-py3-none-any.whl"
+        with zipfile.ZipFile(p, "w") as zf:
+            zf.writestr("black-26.5.1.dist-info/METADATA", _PKG_INFO)
+            zf.writestr("black-26.5.1.dist-info/LICENSE", "MIT license text\n")
+        src = FetchedSource(p, SourceKind.WHEEL, "sha", p.name)
+        assert M.parse_metadata_file(src)["Version"] == "26.5.1"
+        name, _md5 = M.find_license_file(src)
+        assert name == "LICENSE"
+        assert M.read_build_system(src) == ("", [])
+
+    def test_no_metadata_raises(self, tmp_path):
+        p = tmp_path / "x.tar.gz"
+        p.write_bytes(gzip.compress(b"not a tarball"))
+        src = FetchedSource(p, SourceKind.SDIST, "sha", "x.tar.gz")
+        with pytest.raises(MetadataError, match="no PKG-INFO/METADATA"):
+            M.parse_metadata_file(src)
+        assert M.find_license_file(src) is None
+        assert M._read_text_from_archive(p, lambda n: True) is None
+
+
+class TestMessageHelpers:
+    def test_first_non_string(self):
+        m = email.message.Message()
+        m.add_header("X", "a")
+        m.add_header("X", "b")
+        assert M._first(m, "X") == ""
+        assert M._first(m, "Missing") == ""
+
+    def test_project_urls_default_label(self):
+        msg = _msg("Project-URL: , https://x.example\n")
+        assert M._project_urls(msg) == [("Homepage", "https://x.example")]
+
+    def test_homepage_field_wins(self):
+        assert (
+            M._homepage(_msg("Home-page: https://h.example\n"), [])
+            == "https://h.example"
+        )
+
+    def test_homepage_label_priority(self):
+        urls = [
+            ("Docs", "https://d.example"),
+            ("Repository", "https://r.example"),
+        ]
+        assert M._homepage(_msg(""), urls) == "https://r.example"
+
+    def test_homepage_first_url_fallback(self):
+        assert (
+            M._homepage(_msg(""), [("Docs", "https://d.example")])
+            == "https://d.example"
+        )
+
+
+class TestBuildMetadata:
+    def test_full_flow(self, tmp_path, monkeypatch):
+        src = _sdist_src(_sdist(tmp_path, _FULL_MEMBERS))
+        monkeypatch.setattr(M, "fetch_source", lambda *a, **k: src)
+        meta, _ = M.build_metadata(
+            "black", "26.5.1", PipOptions(), tmp_path, yocto=M.default_yocto()
+        )
+        assert meta.name == "black"
+        assert meta.version == "26.5.1"
+        assert meta.license == "MIT"
+        assert meta.license_file == "LICENSE"
+        assert meta.build_backend == "hatchling.build"
+        assert [d.name for d in meta.runtime_deps] == ["click"]
+        assert [d.name for d in meta.build_deps] == ["hatchling"]
+        assert [d.name for d in meta.dropped_deps] == ["tomli", "colorama"]
+        assert meta.resolved_from == "https://pypi.org"
+
+    def test_resolved_from_index(self, tmp_path, monkeypatch):
+        src = _sdist_src(_sdist(tmp_path, _FULL_MEMBERS))
+        monkeypatch.setattr(M, "fetch_source", lambda *a, **k: src)
+        meta, _ = M.build_metadata(
+            "black", "26.5.1", PipOptions(index_url="https://idx"), tmp_path
+        )
+        assert meta.resolved_from == "https://idx"
+        assert meta.index_flags == ["--index-url=https://idx"]
+
+    def test_resolved_from_extra_index(self, tmp_path, monkeypatch):
+        src = _sdist_src(_sdist(tmp_path, _FULL_MEMBERS))
+        monkeypatch.setattr(M, "fetch_source", lambda *a, **k: src)
+        meta, _ = M.build_metadata(
+            "black",
+            "26.5.1",
+            PipOptions(extra_index_urls=["https://extra"]),
+            tmp_path,
+        )
+        assert meta.resolved_from == "https://extra"
+
+    def test_build_deps_invalid_requirement_skipped(self):
+        deps = M._build_deps_from_requires(["ok>=1", "not a requirement !!!"])
+        assert [d.name for d in deps] == ["ok"]
+
+
+class TestMiscMetadata:
+    def test_canonical(self):
+        assert M._canonical("Async_PySerial") == "async-pyserial"
+
+    def test_default_yocto(self):
+        assert M.default_yocto().version == "5.0"
+
+    def test_describe_full(self):
+        opts = PipOptions(index_url="https://i", trusted_hosts=["h"])
+        assert opts.describe() == [
+            "--index-url=https://i",
+            "--trusted-host=h",
+        ]

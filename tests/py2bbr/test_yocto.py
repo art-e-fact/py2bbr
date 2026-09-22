@@ -11,11 +11,22 @@ may only hard-depend on ``core``.
 
 from __future__ import annotations
 
+import sys
+
+import pytest
+import yaml
+
+from py2bbr.errors import YoctoVersionError
 from py2bbr.yocto import (
+    _version_key,
     default_layer_name,
+    known_versions,
     layer_collection,
+    render_kas_file,
     render_layer,
     resolve_yocto_version,
+    validate_kas_file,
+    write_layer,
 )
 
 
@@ -94,3 +105,81 @@ class TestUniqueLayerName:
         assert _line(conf, "BBFILE_COLLECTIONS") == (
             'BBFILE_COLLECTIONS += "custom"'
         )
+
+    def test_layer_collection_fallback(self):
+        assert layer_collection("") == "py2bbr"
+
+
+class TestResolveVersion:
+    def test_none_defaults_to_50(self):
+        assert resolve_yocto_version(None).version == "5.0"
+
+    def test_digit_major(self):
+        assert resolve_yocto_version("5").version == "5.0"
+
+    def test_codename(self):
+        assert resolve_yocto_version("wayne").version == "6.0"
+
+    def test_invalid(self):
+        with pytest.raises(YoctoVersionError, match="unknown Yocto version"):
+            resolve_yocto_version("9.9")
+
+    def test_known_versions_newest_first(self):
+        assert [v.version for v in known_versions()] == ["6.0", "5.0"]
+
+    def test_version_key(self):
+        assert _version_key("6.0") == (6, 0)
+        assert _version_key("weird") == (0,)
+
+
+class TestWriteLayer:
+    def test_writes_full_tree(self, meta, yocto, tmp_path):
+        layer_dir = tmp_path / "meta-black"
+        recipe_path = write_layer(meta, yocto, layer_dir)
+        assert (
+            recipe_path
+            == layer_dir
+            / "recipes-devtools"
+            / "python"
+            / "python3-black_26.5.1.bb"
+        )
+        assert recipe_path.is_file()
+        assert (layer_dir / "conf" / "layer.conf").is_file()
+        assert (layer_dir / "README").is_file()
+
+
+class TestKasFile:
+    def test_render(self, meta, yocto, tmp_path):
+        layer = tmp_path / "meta-black"
+        cfg = yaml.safe_load(
+            render_kas_file(
+                meta, yocto, layer, extra_targets=["core-image-base"]
+            )
+        )
+        assert cfg["header"]["version"] == 5
+        assert cfg["build_system"] == "openembedded"
+        assert cfg["machine"] == "qemux86-64"
+        assert cfg["target"] == ["python3-black", "core-image-base"]
+        assert cfg["repos"]["poky"]["branch"] == "scarthgap"
+        assert cfg["repos"]["meta-black"]["path"] == str(layer.resolve())
+
+    def test_validate_valid(self, meta, yocto, tmp_path):
+        cfg = yaml.safe_load(
+            render_kas_file(meta, yocto, tmp_path / "meta-black")
+        )
+        assert validate_kas_file(cfg) == []
+
+    def test_validate_invalid(self, meta, yocto, tmp_path):
+        cfg = yaml.safe_load(
+            render_kas_file(meta, yocto, tmp_path / "meta-black")
+        )
+        del cfg["header"]
+        assert validate_kas_file(cfg)
+
+    def test_validate_fallback(self, monkeypatch):
+        monkeypatch.setitem(sys.modules, "jsonschema", None)
+        assert validate_kas_file({}) == ["kas config missing required 'header'"]
+        assert validate_kas_file({"header": {}}) == [
+            "kas config header missing 'version'"
+        ]
+        assert validate_kas_file({"header": {"version": 5}}) == []

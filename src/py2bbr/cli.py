@@ -47,8 +47,38 @@ def _parse_package_spec(spec: str) -> tuple[str, str | None]:
     return req.name, version
 
 
+class _PipArgParser(argparse.ArgumentParser):
+    """ArgumentParser that lets ``--pip-arg`` consume option-like values.
+
+    argparse refuses to use a token starting with ``-`` as an option value, so
+    ``--pip-arg --retries`` would fail with "expected one argument". Rewrite
+    such pairs into the unambiguous ``--pip-arg=--retries`` form first.
+    """
+
+    def parse_known_args(self, args=None, namespace=None):
+        if args is None:
+            args = sys.argv[1:]
+        args = list(args)
+        merged: list[str] = []
+        i = 0
+        while i < len(args):
+            tok = args[i]
+            if (
+                tok == "--pip-arg"
+                and i + 1 < len(args)
+                and args[i + 1].startswith("-")
+                and args[i + 1] != "--"
+            ):
+                merged.append(f"--pip-arg={args[i + 1]}")
+                i += 2
+            else:
+                merged.append(tok)
+                i += 1
+        return super().parse_known_args(merged, namespace)
+
+
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
+    p = _PipArgParser(
         prog="py2bbr",
         description="Convert a Python package into a Yocto Bitbake recipe.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,

@@ -62,7 +62,7 @@ packages = ["src/py2bbr"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-ra --cov py2bbr --cov-config .coveragerc --cov-report term-missing --cov-fail-under 36"
+addopts = "-ra --cov py2bbr --cov-config .coveragerc --cov-report term-missing --cov-fail-under 80"
 
 [tool.coverage.run]
 source = ["py2bbr"]
