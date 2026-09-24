@@ -67,7 +67,7 @@ _LICENSE_TEXT_HINTS: list[tuple[str, str]] = [
     ("apache-2.0", "Apache-2.0"),
     ("apache 2.0", "Apache-2.0"),
     ("mit license", "MIT"),
-    ("\bmit\b", "MIT"),
+    (r"\bmit\b", "MIT"),
     ("bsd 3-clause", "BSD-3-Clause"),
     ("new bsd", "BSD-3-Clause"),
     ("bsd license", "BSD-3-Clause"),
@@ -79,7 +79,7 @@ _LICENSE_TEXT_HINTS: list[tuple[str, str]] = [
     ("gnu general public license v2", "GPL-2.0-only"),
     ("lgpl", "LGPL-3.0-only"),
     ("isc license", "ISC"),
-    ("\bisc\b", "ISC"),
+    (r"\bisc\b", "ISC"),
     ("mozilla public license", "MPL-2.0"),
     ("eclipse public license", "EPL-2.0"),
 ]
