@@ -10,7 +10,7 @@ import pytest
 from py2bbr import cli
 from py2bbr.errors import Py2BbrError
 from py2bbr.metadata import FetchedSource
-from py2bbr.model import SourceKind
+from py2bbr.model import PackageMetadata, SourceKind
 
 
 class TestParsePackageSpec:
@@ -44,6 +44,19 @@ class TestBuildParser:
         assert args.timeout == 0
         assert args.check_timeout == 1800
         assert not args.quiet and not args.verbose
+        assert args.with_deps is True
+
+    def test_deps_flag(self):
+        assert (
+            cli.build_parser().parse_args(["black", "--no-deps"]).with_deps
+            is False
+        )
+        assert (
+            cli.build_parser()
+            .parse_args(["black", "--no-deps", "--with-deps"])
+            .with_deps
+            is True
+        )
 
     def test_flags(self):
         args = cli.build_parser().parse_args(
@@ -98,10 +111,29 @@ def _fake_build_metadata(meta, src):
     return fn
 
 
+def _dep_aware_fake(meta, src, make_meta_fn):
+    metas: dict[str, PackageMetadata] = {}
+
+    def fn(name, *a, **k):
+        if name == meta.name:
+            return meta, src
+        if name not in metas:
+            metas[name] = make_meta_fn(
+                name=name,
+                canonical_name=name,
+                version="1.0.0",
+                runtime_deps=[],
+            )
+        return metas[name], src
+
+    return fn
+
+
 class TestMain:
-    def test_end_to_end(self, tmp_path, monkeypatch, meta):
+    def test_end_to_end(self, tmp_path, monkeypatch, meta, make_meta_fn):
+        src = _source(tmp_path)
         monkeypatch.setattr(
-            cli, "build_metadata", _fake_build_metadata(meta, _source(tmp_path))
+            cli, "build_metadata", _dep_aware_fake(meta, src, make_meta_fn)
         )
         rc = cli.main(
             ["black", "-o", str(tmp_path / "out"), "--check", "structural"]
@@ -114,6 +146,22 @@ class TestMain:
             / "recipes-devtools"
             / "python"
             / "python3-black_26.5.1.bb"
+        ).is_file()
+        # Default: the layer is self-contained, i.e. one recipe per closure
+        # member (click, packaging) is generated next to the top recipe.
+        assert (
+            out
+            / "meta-black"
+            / "recipes-devtools"
+            / "python"
+            / "python3-click_1.0.0.bb"
+        ).is_file()
+        assert (
+            out
+            / "meta-black"
+            / "recipes-devtools"
+            / "python"
+            / "python3-packaging_1.0.0.bb"
         ).is_file()
         assert (out / "meta-black" / "conf" / "layer.conf").is_file()
         assert (out / "py2bbr.kas.yml").is_file()

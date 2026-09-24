@@ -184,6 +184,33 @@ class TestKasFile:
         ]
         assert validate_kas_file({"header": {"version": 5}}) == []
 
+    def test_self_contained_excludes_meta_python(self, meta, yocto, tmp_path):
+        # The default self-contained layer carries a recipe for every closure
+        # member, so meta-python must not be referenced: its matching recipes
+        # (e.g. python3-click) would duplicate the generated member recipes.
+        cfg = yaml.safe_load(
+            render_kas_file(
+                meta,
+                yocto,
+                tmp_path / "meta-black",
+                include_meta_python=False,
+            )
+        )
+        assert "meta-python" not in cfg["repos"]
+
+    def test_no_deps_keeps_meta_python(self, meta, yocto, tmp_path):
+        # With --no-deps, RDEPENDS are left to external layers, so the kas
+        # build must still reach meta-python to provide them.
+        cfg = yaml.safe_load(
+            render_kas_file(
+                meta,
+                yocto,
+                tmp_path / "meta-black",
+                include_meta_python=True,
+            )
+        )
+        assert "meta-python" in cfg["repos"]
+
 
 class TestLayerClosureRecipes:
     def test_render_layer_one_recipe_per_member(

@@ -263,34 +263,38 @@ class TestRunPipDownload:
 
 
 class TestFetchSource:
+    @staticmethod
+    def _writer(filename, data=b"data"):
+        def fake(requirement, dest, *a, **k):
+            (dest / filename).write_bytes(data)
+            return subprocess.CompletedProcess([], 0, "", "")
+
+        return fake
+
     def test_success(self, tmp_path, monkeypatch):
-        dest = tmp_path / "download"
-        dest.mkdir()
-        art = dest / "black-26.5.1.tar.gz"
-        art.write_bytes(b"data")
-        monkeypatch.setattr(M, "_run_pip_download", lambda *a, **k: None)
+        monkeypatch.setattr(
+            M, "_run_pip_download", self._writer("black-26.5.1.tar.gz")
+        )
         src = M.fetch_source("black", "26.5.1", PipOptions(), tmp_path)
-        assert src.path == art
+        assert src.path.name == "black-26.5.1.tar.gz"
         assert src.kind is SourceKind.SDIST
         assert src.sha256 == hashlib.sha256(b"data").hexdigest()
 
     def test_keep_true(self, tmp_path, monkeypatch):
-        dest = tmp_path / "download"
-        dest.mkdir()
-        art = dest / "black-26.5.1.tar.gz"
-        art.write_bytes(b"data")
-        monkeypatch.setattr(M, "_run_pip_download", lambda *a, **k: None)
+        monkeypatch.setattr(
+            M, "_run_pip_download", self._writer("black-26.5.1.tar.gz")
+        )
         src = M.fetch_source(
             "black", "26.5.1", PipOptions(), tmp_path, keep=True
         )
-        assert src.path == art
+        assert src.path.name == "black-26.5.1.tar.gz"
 
     def test_wheel_fallback(self, tmp_path, monkeypatch):
-        dest = tmp_path / "download"
-        dest.mkdir()
-        art = dest / "black-26.5.1-py3-none-any.whl"
-        art.write_bytes(b"wheel")
-        monkeypatch.setattr(M, "_run_pip_download", lambda *a, **k: None)
+        monkeypatch.setattr(
+            M,
+            "_run_pip_download",
+            self._writer("black-26.5.1-py3-none-any.whl"),
+        )
         src = M.fetch_source("black", "26.5.1", PipOptions(), tmp_path)
         assert src.kind is SourceKind.WHEEL
 
@@ -300,6 +304,36 @@ class TestFetchSource:
         monkeypatch.setattr(M, "_run_pip_download", lambda *a, **k: proc)
         with pytest.raises(MetadataNotFoundError, match="no sdist"):
             M.fetch_source("nope", None, PipOptions(), tmp_path)
+
+    def test_fetch_after_other_packages_picks_own_artifact(
+        self, tmp_path, monkeypatch
+    ):
+        # Regression: all fetches share workdir/download, and _pick_artifact
+        # used to return min() over the whole dir, so after "blessed" landed
+        # every later fetch (editor, readchar, ...) resolved to blessed.
+        # Each fetch must select the artifact pip placed for THIS requirement.
+        def fake_download(req, dest_dir, *a, **k):
+            name = req.split(">")[0].split("=")[0].strip()
+            (dest_dir / f"{name}-1.0.tar.gz").write_bytes(name.encode())
+
+        monkeypatch.setattr(M, "_run_pip_download", fake_download)
+        M.fetch_source("blessed", "1.0", PipOptions(), tmp_path)
+        src = M.fetch_source("readchar", "1.0", PipOptions(), tmp_path)
+        assert src.filename == "readchar-1.0.tar.gz"
+
+    def test_second_fetch_same_package_picks_new_artifact(
+        self, tmp_path, monkeypatch
+    ):
+        # Regression: a re-run resolving a NEW upstream version must not pick
+        # the artifact left in workdir/download by the previous run.
+        def fake_download(req, dest_dir, *a, **k):
+            version = req.split("==")[1]
+            (dest_dir / f"black-{version}.tar.gz").write_bytes(version.encode())
+
+        monkeypatch.setattr(M, "_run_pip_download", fake_download)
+        M.fetch_source("black", "26.5.1", PipOptions(), tmp_path)
+        src = M.fetch_source("black", "26.5.2", PipOptions(), tmp_path)
+        assert src.filename == "black-26.5.2.tar.gz"
 
 
 class TestPickArtifactExtra:
