@@ -240,12 +240,16 @@ def render_kas_file(
     machine: str = "qemux86-64",
     kas_version: int = DEFAULT_KAS_VERSION,
     extra_targets: list[str] | None = None,
+    include_meta_python: bool = True,
 ) -> str:
     """
     Render a ``kas`` build file (YAML) that builds the generated recipe.
 
-    The file references poky + meta-python at the matching branch and includes
-    the generated layer as a local (non-URL) repo.
+    The file references poky at the matching branch and includes the generated
+    layer as a local (non-URL) repo. ``include_meta_python`` adds the
+    meta-python layer (needed only when deps are left to it, i.e. ``--no-deps``;
+    a self-contained layer must exclude it or its recipes would duplicate the
+    generated member recipes).
     """
     import yaml
 
@@ -255,25 +259,28 @@ def render_kas_file(
     pn = bitbake_pn(meta.name, yocto.python_pn)
     targets = list(dict.fromkeys([pn] + list(extra_targets or [])))
 
+    repos: dict[str, dict] = {
+        "poky": {
+            "url": yocto.poky_url,
+            "branch": yocto.poky_branch,
+        },
+        layer_dir.name: {
+            "url": None,
+            "path": str(layer_dir),
+        },
+    }
+    if include_meta_python:
+        repos["meta-python"] = {
+            "url": yocto.meta_python_url,
+            "branch": yocto.meta_python_branch or yocto.codename,
+        }
+
     config = {
         "header": {"version": kas_version},
         "build_system": "openembedded",
         "machine": machine,
         "target": targets,
-        "repos": {
-            "poky": {
-                "url": yocto.poky_url,
-                "branch": yocto.poky_branch,
-            },
-            "meta-python": {
-                "url": yocto.meta_python_url,
-                "branch": yocto.meta_python_branch or yocto.codename,
-            },
-            layer_dir.name: {
-                "url": None,
-                "path": str(layer_dir),
-            },
-        },
+        "repos": repos,
     }
     return yaml.safe_dump(config, sort_keys=False, default_flow_style=False)
 

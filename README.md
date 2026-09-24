@@ -68,9 +68,12 @@ The layer is named after the package (`meta-<package>`, e.g.
 `meta-async-pyserial` for `async_pyserial`) so every generated layer is unique;
 override with `--layer-name`.
 
-The `kas` build file (`py2bbr.kas.yml`) sets up poky + meta-python at the matching
-branch, includes the generated layer, and targets the recipe — so `kas build -c
-py2bbr.kas.yml` compiles it in a clean environment.
+The `kas` build file (`py2bbr.kas.yml`) sets up poky at the matching branch,
+includes the generated layer, and targets the recipe — so `kas build -c
+py2bbr.kas.yml` compiles it in a clean environment. meta-python is only added
+when deps are left to it (`--no-deps`); a self-contained layer (the default)
+carries a recipe for every dependency, so meta-python would only duplicate
+providers.
 
 ## Key options
 
@@ -84,9 +87,10 @@ py2bbr.kas.yml` compiles it in a clean environment.
 | `--layer-name` | Override the layer directory name (default: `meta-<package>`, e.g. `meta-async-pyserial`). |
 | `--no-layer`, `--no-kas` | Emit only the recipe / skip the kas file. |
 | `--keep-sources` | Keep downloaded artifacts for debugging. |
-| `--with-deps` | Resolve the transitive runtime-dependency closure and render one recipe per member (same layer; the kas target stays the top recipe, bitbake follows RDEPENDS). |
-| `--max-depth N` | Cap the closure depth with `--with-deps` (default: unlimited). |
-| `--skip-dep NAME` | Exclude a dependency from the `--with-deps` closure (repeatable; canonical names). |
+| `--with-deps` | Resolve the transitive runtime-dependency closure and render one recipe per member in the same layer (default; the kas target stays the top recipe, bitbake follows RDEPENDS). |
+| `--no-deps` | Disable the closure (default is on): emit only the top recipe and leave its RDEPENDS to other layers (e.g. meta-python). |
+| `--max-depth N` | Cap the closure depth (default: unlimited). |
+| `--skip-dep NAME` | Exclude a dependency from the closure (repeatable; canonical names). |
 
 ## Checks
 

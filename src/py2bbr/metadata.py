@@ -24,6 +24,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import tempfile
 import tomllib
 import zipfile
 from collections.abc import Callable
@@ -207,11 +208,19 @@ def fetch_source(
     ``tomli>=1.0.2``) through to pip so the upstream bounds are honoured when
     picking versions.
 
+    Each call downloads into its own fresh subdirectory of
+    ``workdir/download``: the closure resolver fetches many packages into the
+    same ``workdir``, and ``_pick_artifact`` must only ever see the artifacts
+    of *this* requirement (a shared dir would resolve every member to the
+    alphabetically-first artifact already present, and a reused per-package
+    dir would keep picking a stale version from an earlier run).
+
     Raises :class:`MetadataNotFoundError` if no artifact is available.
     """
     requirement = requirement or (f"{name}=={version}" if version else name)
-    dest = workdir / "download"
-    dest.mkdir(parents=True, exist_ok=True)
+    parent = workdir / "download"
+    parent.mkdir(parents=True, exist_ok=True)
+    dest = Path(tempfile.mkdtemp(prefix=f"{_canonical(name)}-", dir=parent))
 
     # Prefer sdist so the sha256 matches what `inherit pypi` fetches.
     proc = _run_pip_download(requirement, dest, pip_opts, "--no-binary=:all:")

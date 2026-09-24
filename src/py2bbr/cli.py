@@ -128,11 +128,25 @@ def build_parser() -> argparse.ArgumentParser:
     )
     out.add_argument(
         "--with-deps",
+        dest="with_deps",
         action="store_true",
+        default=True,
         help=(
             "Resolve the transitive runtime dependency closure and render one "
             "recipe per closure member into the same layer (RDEPENDS chains "
-            "them; the top recipe stays the kas target)."
+            "them; the top recipe stays the kas target). This is the default "
+            "so generated layers are self-contained; pass --no-deps to "
+            "disable it."
+        ),
+    )
+    out.add_argument(
+        "--no-deps",
+        dest="with_deps",
+        action="store_false",
+        help=(
+            "Do not resolve the runtime dependency closure; emit only the top "
+            "recipe and leave its RDEPENDS to be provided by other layers "
+            "(e.g. meta-python)."
         ),
     )
     out.add_argument(
@@ -300,19 +314,19 @@ def main(argv: list[str] | None = None) -> int:
             keep=args.keep_sources,
         )
 
-        # Dependency closure: resolve transitive runtime deps, thread recipes
-        # into the layer rendering + kas extra targets.
+        # Dependency closure (default on, so the layer is self-contained:
+        # every RDEPENDS has a recipe in the same layer). Skipped with
+        # --no-layer (no layer to hold member recipes) or --no-deps (deps
+        # left to other layers, e.g. meta-python).
         closure = [meta]
         warnings_extra: list[str] = []
-        if args.with_deps:
+        if args.with_deps and not args.no_layer:
             from py2bbr.metadata import resolve_closure
 
             def _builder(req):
-                import py2bbr.metadata as _m
-
-                return _m.build_metadata(
+                return build_metadata(
                     req.name,
-                    req.version,
+                    None,
                     pip_opts,
                     workdir,
                     yocto=yocto,
@@ -333,13 +347,6 @@ def main(argv: list[str] | None = None) -> int:
         extra_metas = closure[1:] if len(closure) > 1 else None
         warnings = list(warnings_extra)
         if args.no_layer:
-            if extra_metas:
-                warnings.append(
-                    "--with-deps with --no-layer: closure recipes written "
-                    "individually, one recipe per member (only the top recipe "
-                    "is emitted; use --with-deps without --no-layer to get one "
-                    ".bb per closure member)"
-                )
             recipe_path, recipe_warnings = render_recipe_to_path(
                 meta, yocto, output, build_class=args.build_class
             )
@@ -374,6 +381,10 @@ def main(argv: list[str] | None = None) -> int:
                     bitbake_pn(m.name, yocto.python_pn)
                     for m in (closure[1:] if len(closure) > 1 else [])
                 ],
+                # self-contained layer (default): no meta-python, its recipes
+                # would duplicate the generated member recipes; meta-python
+                # is only needed when deps are left to it (--no-deps).
+                include_meta_python=not args.with_deps,
             )
             kas_file.parent.mkdir(parents=True, exist_ok=True)
             kas_file.write_text(kas_text, encoding="utf-8")
