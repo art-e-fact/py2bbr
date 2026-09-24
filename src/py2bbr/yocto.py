@@ -9,12 +9,16 @@ ship a release/branch table). ``kas`` is used to (a) validate the generated
 
 from __future__ import annotations
 
+import logging
 import re
+import shutil
 from pathlib import Path
 
 from py2bbr.errors import YoctoVersionError
 from py2bbr.model import PackageMetadata, YoctoVersion
 from py2bbr.recipe import bitbake_pn, canonical_name, recipe_filename
+
+logger = logging.getLogger(__name__)
 
 # Known Yocto Project series. ``poky_branch`` == the codename (poky release
 # branches are named after the codename). ``meta_python_branch`` matches.
@@ -208,8 +212,16 @@ def write_layer(
     layer_dir: Path,
     build_class: str | None = None,
     extra_metas: list[PackageMetadata] | None = None,
+    vendor_sources: dict[str, Path] | None = None,
 ) -> Path:
-    """Write the layer tree under ``layer_dir``; return the top recipe path."""
+    """Write the layer tree under ``layer_dir``; return the top recipe path.
+
+    ``vendor_sources`` maps recipe file names (e.g. ``python3-x_1.0.bb``) to
+    the sdist each vendored recipe must ship; each is copied into the layer's
+    ``recipes-devtools/python/files/`` so the ``file://`` SRC_URI resolves
+    through FILESPATH. A vendored recipe without its source is an error: the
+    generated recipe would reference a file the layer does not carry.
+    """
     layer_dir = Path(layer_dir)
     files = render_layer(
         meta,
@@ -218,6 +230,17 @@ def write_layer(
         build_class=build_class,
         extra_metas=extra_metas,
     )
+    vendored_recipes = {
+        recipe_filename(bitbake_pn(m.name, yocto.python_pn), m.version)
+        for m in [meta, *(extra_metas or [])]
+        if m.vendored
+    }
+    missing = vendored_recipes - set(vendor_sources or {})
+    if missing:
+        raise ValueError(
+            "vendored recipe(s) lack their sdist in vendor_sources: "
+            + ", ".join(sorted(missing))
+        )
     recipe_path = None
     for rel, content in files.items():
         dest = layer_dir / rel
@@ -230,6 +253,21 @@ def write_layer(
             )
         ):
             recipe_path = dest
+    for src in (vendor_sources or {}).values():
+        files_dir = layer_dir / "recipes-devtools" / "python" / "files"
+        files_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, files_dir / Path(src).name)
+    if vendor_sources:
+        logger.info(
+            "vendored %d sdist(s) into %s",
+            len(vendor_sources),
+            layer_dir / "recipes-devtools" / "python" / "files",
+        )
+    logger.info(
+        "wrote layer %s (%d .bb recipe(s))",
+        layer_dir,
+        sum(1 for rel in files if rel.endswith(".bb")),
+    )
     return layer_dir if recipe_path is None else recipe_path
 
 

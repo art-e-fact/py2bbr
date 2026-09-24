@@ -17,6 +17,7 @@ import pytest
 import yaml
 
 from py2bbr.errors import YoctoVersionError
+from py2bbr.recipe import bitbake_pn, recipe_filename
 from py2bbr.yocto import (
     _version_key,
     default_layer_name,
@@ -146,6 +147,46 @@ class TestWriteLayer:
         assert recipe_path.is_file()
         assert (layer_dir / "conf" / "layer.conf").is_file()
         assert (layer_dir / "README").is_file()
+
+    def test_write_layer_copies_vendored_sources(
+        self, make_meta_fn, yocto, tmp_path
+    ):
+        src = tmp_path / "pyvizionsdk-26.9.1.tar.gz"
+        src.write_bytes(b"fake-sdist")
+        meta = make_meta_fn(
+            name="pyvizionsdk",
+            canonical_name="pyvizionsdk",
+            version="26.9.1",
+            source_filename="pyvizionsdk-26.9.1.tar.gz",
+            vendored=True,
+        )
+        recipe_name = recipe_filename(
+            bitbake_pn("pyvizionsdk", yocto.python_pn), "26.9.1"
+        )
+        layer_dir = tmp_path / "meta-pyvizionsdk"
+        write_layer(meta, yocto, layer_dir, vendor_sources={recipe_name: src})
+        vendored = (
+            layer_dir
+            / "recipes-devtools"
+            / "python"
+            / "files"
+            / "pyvizionsdk-26.9.1.tar.gz"
+        )
+        assert vendored.read_bytes() == b"fake-sdist"
+
+    def test_write_layer_vendored_missing_source_raises(
+        self, make_meta_fn, yocto, tmp_path
+    ):
+        meta = make_meta_fn(
+            name="pyvizionsdk",
+            canonical_name="pyvizionsdk",
+            version="26.9.1",
+            source_filename="pyvizionsdk-26.9.1.tar.gz",
+            vendored=True,
+        )
+        layer_dir = tmp_path / "meta-pyvizionsdk"
+        with pytest.raises(ValueError, match="vendor_sources"):
+            write_layer(meta, yocto, layer_dir, vendor_sources={})
 
 
 class TestKasFile:

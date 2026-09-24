@@ -105,6 +105,9 @@ class PackageMetadata:
     source_kind: SourceKind = SourceKind.SDIST
     source_filename: str = ""
     source_sha256: str | None = None
+    #: True when the sdist is not reachable on public PyPI at the URL the
+    #: ``pypi`` class fetches, so the recipe vendors it (file:// SRC_URI).
+    vendored: bool = False
     #: PEP 517 ``[build-system].build-backend`` (e.g. ``setuptools.build_meta``).
     build_backend: str = ""
 

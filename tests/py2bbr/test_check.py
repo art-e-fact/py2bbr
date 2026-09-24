@@ -117,6 +117,34 @@ class TestStructuralEdges:
         r = structural_check(p)
         assert r.status is Status.WARN
 
+
+class TestVendoredStructural:
+    """S6: a vendored recipe replaces ``inherit pypi`` with file:// SRC_URI.
+
+    The structural check must not demand the pypi class when the recipe
+    vendors its sdist, but must demand the ``S`` unpack dir that replaces the
+    class's ``S = ${WORKDIR}/${PYPI_PACKAGE}-${PV}``.
+    """
+
+    def test_vendored_form_without_pypi_class_passes(self, tmp_path):
+        text = _CLEAN.replace(
+            "inherit pypi\n",
+            'SRC_URI = "file://pyvizionsdk-26.9.1.tar.gz"\n'
+            'S = "${WORKDIR}/pyvizionsdk-26.9.1"\n',
+        )
+        result = structural_check(_write(tmp_path, text))
+        assert result.status is Status.PASS
+        assert "inherit pypi" not in [i[0] for i in result.items]
+
+    def test_vendored_form_requires_s(self, tmp_path):
+        text = _CLEAN.replace(
+            "inherit pypi\n", 'SRC_URI = "file://pyvizionsdk-26.9.1.tar.gz"\n'
+        )
+        result = structural_check(_write(tmp_path, text))
+        item = next(i for i in result.items if i[0] == "S (vendored)")
+        assert item[1] is Status.FAIL
+        assert result.status is Status.FAIL
+
     def test_unbalanced_double_quotes_fail(self, tmp_path):
         p = _write(
             tmp_path,

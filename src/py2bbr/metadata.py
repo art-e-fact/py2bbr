@@ -19,6 +19,7 @@ from __future__ import annotations
 import email
 import email.message
 import hashlib
+import logging
 import re
 import shutil
 import subprocess
@@ -26,6 +27,8 @@ import sys
 import tarfile
 import tempfile
 import tomllib
+import urllib.error
+import urllib.request
 import zipfile
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -44,6 +47,8 @@ from py2bbr.model import (
     YoctoVersion,
 )
 
+logger = logging.getLogger(__name__)
+
 # Map PEP 561 "License :: OSI Approved :: X" classifier tails to SPDX ids.
 _CLASSIFIER_TO_SPDX: dict[str, str] = {
     "MIT License": "MIT",
@@ -58,6 +63,7 @@ _CLASSIFIER_TO_SPDX: dict[str, str] = {
     "Python Software Foundation License": "PSF-2.0",
     "zlib/libpng License": "Zlib",
     "MPL 2.0": "MPL-2.0",
+    "Mozilla Public License 2.0 (MPL 2.0)": "MPL-2.0",
     "Eclipse Public License 1.0": "EPL-1.0",
     "EUPL 1.1": "EUPL-1.1",
 }
@@ -82,6 +88,8 @@ _LICENSE_TEXT_HINTS: list[tuple[str, str]] = [
     ("isc license", "ISC"),
     (r"\bisc\b", "ISC"),
     ("mozilla public license", "MPL-2.0"),
+    ("mplv2", "MPL-2.0"),
+    ("mpl v2", "MPL-2.0"),
     ("eclipse public license", "EPL-2.0"),
 ]
 
@@ -146,6 +154,9 @@ class FetchedSource:
     kind: SourceKind
     sha256: str
     filename: str
+    #: None = not checked; otherwise whether the pypi class' fetch URL for this
+    #: sdist responds on public PyPI (False -> the recipe must vendor instead).
+    public_reachable: bool | None = None
 
 
 def _pip_executable() -> list[str]:
@@ -191,6 +202,48 @@ def _run_pip_download(
     )
 
 
+# Base URL the ``pypi`` bitbake class fetches sdists from (scarthgap
+# pypi.bbclass: ``PYPI_SRC_URI = .../packages/source/<first>/<pkg>/<pkg>-<pv>.tar.gz``).
+_PYPI_FILES_BASE = "https://files.pythonhosted.org/packages/source"
+
+
+def _public_pypi_sdist_url(filename: str) -> str | None:
+    """The exact URL ``inherit pypi`` would fetch for an sdist, or None.
+
+    The class always requests ``.tar.gz`` (``PYPI_PACKAGE_EXT`` default) at
+    ``packages/source/<first-char>/<name>/<name>-<version>.tar.gz``; re-deriving
+    that URL lets us predict a ``do_fetch`` 404 for packages that only exist on
+    a private index (the pyvizionsdk failure). Wheels and undecodable names
+    have no derivable public sdist URL.
+    """
+    for ext in (".tar.gz", ".tar.bz2", ".tar.xz", ".zip"):
+        if filename.endswith(ext):
+            stem = filename[: -len(ext)]
+            break
+    else:
+        return None
+    # Versions never contain '-' (PEP 440), so the LAST '-' is the name/version
+    # split: dashed names (`typed-ast`) must survive it intact.
+    name, sep, version = stem.rpartition("-")
+    if not sep or not name or not version:
+        return None
+    return f"{_PYPI_FILES_BASE}/{name[0]}/{name}/{name}-{version}.tar.gz"
+
+
+def _sdist_reachable(url: str, timeout: float = 5.0) -> bool:
+    """Whether the public PyPI sdist URL answers a HEAD request with success.
+
+    Any transport error (DNS, TLS, 4xx/5xx, timeout) means the pypi class'
+    ``do_fetch`` would fail the same way, so it counts as unreachable.
+    """
+    request = urllib.request.Request(url, method="HEAD")
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return 200 <= response.status < 400
+    except (urllib.error.URLError, OSError, ValueError):
+        return False
+
+
 def fetch_source(
     name: str,
     version: str | None,
@@ -199,6 +252,7 @@ def fetch_source(
     keep: bool = False,
     *,
     requirement: str | None = None,
+    check_public: bool = False,
 ) -> FetchedSource:
     """Download the package (sdist preferred) into ``workdir``.
 
@@ -207,6 +261,11 @@ def fetch_source(
     closure resolver passes the raw requirement (with its bounds, e.g.
     ``tomli>=1.0.2``) through to pip so the upstream bounds are honoured when
     picking versions.
+
+    With ``check_public=True``, ``public_reachable`` records whether the
+    ``pypi`` class' fetch URL for the artifact answers on public PyPI
+    (S6/vendoring: packages only on a private index make do_fetch 404, so the
+    recipe must ship the sdist in the layer instead).
 
     Each call downloads into its own fresh subdirectory of
     ``workdir/download``: the closure resolver fetches many packages into the
@@ -237,13 +296,22 @@ def fetch_source(
             + "\n".join(f"  {line}" for line in tail)
         )
 
-    sha256 = hashlib.sha256(artifact.read_bytes()).hexdigest()
-    if keep:
-        return FetchedSource(
-            artifact, _kind_of(artifact), sha256, artifact.name
-        )
+    public_reachable: bool | None = None
+    if check_public:
+        url = _public_pypi_sdist_url(artifact.name)
+        public_reachable = _sdist_reachable(url) if url is not None else False
 
-    return FetchedSource(artifact, _kind_of(artifact), sha256, artifact.name)
+    sha256 = hashlib.sha256(artifact.read_bytes()).hexdigest()
+    kind = _kind_of(artifact)
+    logger.info(
+        "fetched %s (%s, %d bytes)",
+        artifact.name,
+        kind.value,
+        artifact.stat().st_size,
+    )
+    return FetchedSource(
+        artifact, kind, sha256, artifact.name, public_reachable
+    )
 
 
 def _pick_artifact(dest: Path, prefer_sdist: bool) -> Path | None:
@@ -385,7 +453,7 @@ def find_license_file(source: FetchedSource) -> tuple[str, str] | None:
     is relative to the unpacked source root so it can be used directly in
     ``LIC_FILES_CHKSUM = "file://<name>;md5=<md5>"``.
     """
-    names = set(_LICENSE_FILE_NAMES)
+    names = {n.upper() for n in _LICENSE_FILE_NAMES}
 
     def is_license(member: str) -> bool:
         parts = member.split("/")
@@ -614,10 +682,22 @@ def build_metadata(
     keep: bool = False,
     *,
     requirement: str | None = None,
+    check_public: bool = False,
 ) -> tuple[PackageMetadata, FetchedSource]:
-    """Fetch + parse a package into a fully-populated :class:`PackageMetadata`."""
+    """Fetch + parse a package into a fully-populated :class:`PackageMetadata`.
+
+    ``check_public`` forwards to :func:`fetch_source`; an sdist that is not
+    reachable at the ``pypi`` class' public URL marks the metadata ``vendored``
+    so the recipe ships the sdist in the layer instead of inheriting ``pypi``.
+    """
     source = fetch_source(
-        name, version, pip_opts, workdir, keep=keep, requirement=requirement
+        name,
+        version,
+        pip_opts,
+        workdir,
+        keep=keep,
+        requirement=requirement,
+        check_public=check_public,
     )
     msg = parse_metadata_file(source)
 
@@ -640,6 +720,28 @@ def build_metadata(
     )
     build_deps = _build_deps_from_requires(build_requires)
 
+    # Only sdists are fetched by the pypi class, so only they can hit its URL
+    # 404; a wheel's recipe keeps its own fetch semantics.
+    vendored = (
+        source.kind is SourceKind.SDIST and source.public_reachable is False
+    )
+    if vendored:
+        logger.info(
+            "%s: not on public PyPI - recipe vendors the sdist",
+            source.filename,
+        )
+    elif source.public_reachable is True:
+        logger.debug("%s: reachable on public PyPI", source.filename)
+    logger.debug(
+        "%s==%s: license=%s backend=%s runtime_deps=%d build_deps=%d",
+        meta_name,
+        meta_version,
+        license_spdx or "-",
+        backend or "setup.py",
+        len(runtime),
+        len(build_deps),
+    )
+
     meta = PackageMetadata(
         name=meta_name,
         canonical_name=_canonical(meta_name),
@@ -656,6 +758,7 @@ def build_metadata(
         source_kind=source.kind,
         source_filename=source.filename,
         source_sha256=source.sha256,
+        vendored=vendored,
         build_backend=backend,
         runtime_deps=runtime,
         build_deps=build_deps,

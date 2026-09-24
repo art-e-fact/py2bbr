@@ -12,6 +12,7 @@ Usage examples (see README.md for more information):
 from __future__ import annotations
 
 import argparse
+import logging
 import sys
 from pathlib import Path
 
@@ -22,7 +23,7 @@ from py2bbr.check import DEFAULT_LEVEL, STAGES, run_checks
 from py2bbr.errors import Py2BbrError
 from py2bbr.metadata import PipOptions, build_metadata
 from py2bbr.model import DEFAULT_YOCTO_VERSION
-from py2bbr.recipe import bitbake_pn, render_recipe_to_path
+from py2bbr.recipe import bitbake_pn, recipe_filename, render_recipe_to_path
 from py2bbr.yocto import (
     DEFAULT_KAS_VERSION,
     default_layer_name,
@@ -31,6 +32,8 @@ from py2bbr.yocto import (
     validate_kas_file,
     write_layer,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def _parse_package_spec(spec: str) -> tuple[str, str | None]:
@@ -235,6 +238,31 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _configure_logging(args) -> None:
+    """Route py2bbr stage progress to stderr: INFO by default, -q->WARNING, -v->DEBUG.
+
+    The level is set on the ``py2bbr`` logger (its ``py2bbr.*`` children
+    inherit it), so unrelated libraries are untouched. The stderr handler is
+    attached only when none exists yet, keeping the call idempotent across
+    repeated ``main()`` invocations (tests call it many times in one process).
+    """
+    level = (
+        logging.DEBUG
+        if args.verbose
+        else logging.WARNING
+        if args.quiet
+        else logging.INFO
+    )
+    lg = logging.getLogger("py2bbr")
+    lg.setLevel(level)
+    if not lg.handlers:
+        handler = logging.StreamHandler(sys.stderr)
+        handler.setFormatter(
+            logging.Formatter("[py2bbr] %(levelname)s %(message)s")
+        )
+        lg.addHandler(handler)
+
+
 def _print_report(
     args, meta, recipe_path, layer_dir, kas_file, warnings, results
 ):
@@ -283,10 +311,12 @@ def _print_report(
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    _configure_logging(args)
 
     try:
         name, version = _parse_package_spec(args.package)
         yocto = resolve_yocto_version(args.yocto_version)
+        logger.debug("yocto target: %s (%s)", yocto.version, yocto.codename)
         pip_opts = PipOptions(
             index_url=args.index_url,
             extra_index_urls=list(args.extra_index_url),
@@ -299,11 +329,7 @@ def main(argv: list[str] | None = None) -> int:
         output.mkdir(parents=True, exist_ok=True)
 
         # 1. Fetch + parse metadata.
-        if args.verbose:
-            print(
-                f"[py2bbr] fetching {name}=={version or 'latest'} ...",
-                file=sys.stderr,
-            )
+        logger.info("fetching %s==%s ...", name, version or "latest")
         workdir = output / ".py2bbr-work"
         meta, source = build_metadata(
             name,
@@ -312,7 +338,11 @@ def main(argv: list[str] | None = None) -> int:
             workdir,
             yocto=yocto,
             keep=args.keep_sources,
+            check_public=True,
         )
+        # Path of the artifact each closure member was fetched from, keyed by
+        # canonical name: vendored members copy their sdist into the layer.
+        closure_sources: dict[str, Path] = {meta.canonical_name: source.path}
 
         # Dependency closure (default on, so the layer is self-contained:
         # every RDEPENDS has a recipe in the same layer). Skipped with
@@ -324,7 +354,7 @@ def main(argv: list[str] | None = None) -> int:
             from py2bbr.metadata import resolve_closure
 
             def _builder(req):
-                return build_metadata(
+                member, msource = build_metadata(
                     req.name,
                     None,
                     pip_opts,
@@ -332,7 +362,10 @@ def main(argv: list[str] | None = None) -> int:
                     yocto=yocto,
                     keep=args.keep_sources,
                     requirement=req.requirement,
+                    check_public=True,
                 )
+                closure_sources[member.canonical_name] = msource.path
+                return member, msource
 
             closure, warnings_extra = resolve_closure(
                 meta,
@@ -340,6 +373,7 @@ def main(argv: list[str] | None = None) -> int:
                 skip=frozenset(args.skip_dep),
                 max_depth=args.max_depth,
             )
+        logger.info("closure: %d package(s) resolved", len(closure))
 
         # 2. Render + write the recipe (and optionally a full layer).
         layer_name = args.layer_name or default_layer_name(meta.canonical_name)
@@ -348,16 +382,29 @@ def main(argv: list[str] | None = None) -> int:
         warnings = list(warnings_extra)
         if args.no_layer:
             recipe_path, recipe_warnings = render_recipe_to_path(
-                meta, yocto, output, build_class=args.build_class
+                meta,
+                yocto,
+                output,
+                build_class=args.build_class,
+                vendor_source=source.path if meta.vendored else None,
             )
+            logger.info("wrote recipe %s", recipe_path)
             warnings += recipe_warnings
         else:
+            vendor_sources = {
+                recipe_filename(
+                    bitbake_pn(m.name, yocto.python_pn), m.version
+                ): closure_sources[m.canonical_name]
+                for m in closure
+                if m.vendored
+            }
             recipe_path = write_layer(
                 meta,
                 yocto,
                 layer_dir,
                 build_class=args.build_class,
                 extra_metas=extra_metas,
+                vendor_sources=vendor_sources or None,
             )
             from py2bbr.recipe import render_recipe
 
@@ -388,6 +435,7 @@ def main(argv: list[str] | None = None) -> int:
             )
             kas_file.parent.mkdir(parents=True, exist_ok=True)
             kas_file.write_text(kas_text, encoding="utf-8")
+            logger.info("wrote kas file %s", kas_file)
             import yaml
 
             config = yaml.safe_load(kas_text)
@@ -397,13 +445,11 @@ def main(argv: list[str] | None = None) -> int:
                     "generated kas file failed schema validation: "
                     + "; ".join(kas_errors)
                 )
-            elif args.verbose:
-                print(
-                    "[py2bbr] kas build file validated against kas schema",
-                    file=sys.stderr,
-                )
+            else:
+                logger.info("kas build file validated against kas schema")
 
         # 4. Run the validation ladder.
+        logger.info("running validation ladder (check=%s) ...", args.check)
         results = run_checks(
             meta,
             recipe_path,

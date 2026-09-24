@@ -16,6 +16,7 @@ output always shows exactly what was validated and what was not.
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import shutil
@@ -26,6 +27,8 @@ from pathlib import Path
 
 from py2bbr.model import PackageMetadata
 from py2bbr.recipe import bitbake_pn
+
+logger = logging.getLogger(__name__)
 
 #: Ordered stages, cheapest first. ``--check`` names the ceiling.
 STAGES = ("structural", "parse", "checklayer", "build")
@@ -182,9 +185,21 @@ def structural_check(recipe_path: Path) -> CheckResult:
     items.append(
         _check_required(text, r"^LICENSE\s*=", "LICENSE", required=True)
     )
-    items.append(
-        _check_required(text, r"^inherit\s+pypi", "inherit pypi", required=True)
-    )
+    vendored = bool(re.search(r'^SRC_URI\s*=\s*"file://', text, re.MULTILINE))
+    if vendored:
+        # S6 vendored form: no pypi class (its fetch URL 404s for the package),
+        # so S must be spelled out (the class' S default is gone).
+        items.append(
+            _check_required(
+                text, r'^S\s*=\s*"\$\{WORKDIR\}/', "S (vendored)", required=True
+            )
+        )
+    else:
+        items.append(
+            _check_required(
+                text, r"^inherit\s+pypi", "inherit pypi", required=True
+            )
+        )
     items.append(
         _check_required(
             text, r"^LIC_FILES_CHKSUM\s*=", "LIC_FILES_CHKSUM", required=False
@@ -344,6 +359,8 @@ def run_checks(
 
     results: list[CheckResult] = []
     for stage in STAGES[: ceiling + 1]:
+        logger.info("check %s: running ...", stage)
+        before = len(results)
         if stage == "structural":
             results.append(structural_check(recipe_path))
         elif stage == "parse":
@@ -361,12 +378,14 @@ def run_checks(
                         "no layer directory generated",
                     )
                 )
-                continue
-            avail, reason = _checklayer_available()
-            if not avail:
-                results.append(CheckResult("checklayer", Status.SKIP, reason))
             else:
-                results.append(checklayer(layer_dir, builddir, timeout))
+                avail, reason = _checklayer_available()
+                if not avail:
+                    results.append(
+                        CheckResult("checklayer", Status.SKIP, reason)
+                    )
+                else:
+                    results.append(checklayer(layer_dir, builddir, timeout))
         elif stage == "build":
             wd = workdir or (
                 Path(kas_file).parent / "kas-workdir"
@@ -379,4 +398,6 @@ def run_checks(
                 results.append(CheckResult("build", Status.SKIP, reason))
             else:
                 results.append(kas_build(kas_file, wd, timeout))
+        for r in results[before:]:
+            logger.info("check %s: %s - %s", r.stage, r.status.value, r.detail)
     return results

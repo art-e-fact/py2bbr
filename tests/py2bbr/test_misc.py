@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 import py2bbr
 from py2bbr import recipe
 from py2bbr.errors import SubprocessError
@@ -46,7 +48,11 @@ class TestRecipeEdges:
         assert "no license detected" in " ".join(warnings)
 
     def test_license_without_file_warns(self, make_meta_fn, yocto):
-        meta = make_meta_fn(license="MIT", license_file=None, license_md5=None)
+        # Only *unknown* SPDX ids warn: known ids now fall back to the
+        # common-licenses idiom (see TestLicenseRendering).
+        meta = make_meta_fn(
+            license="AGPL-3.0-only", license_file=None, license_md5=None
+        )
         text, warnings = recipe.render_recipe(meta, yocto)
         assert "LIC_FILES_CHKSUM" in " ".join(warnings)
         assert "LIC_FILES_CHKSUM =" not in text
@@ -60,3 +66,34 @@ class TestRecipeEdges:
         meta = make_meta_fn(source_filename="async_pyserial-0.2.4.tar.gz")
         text, _ = recipe.render_recipe(meta, yocto)
         assert "PYPI_PACKAGE" not in text
+
+    def test_vendored_render_recipe_to_path_copies_source(
+        self, make_meta_fn, yocto, tmp_path
+    ):
+        src = tmp_path / "pyvizionsdk-26.9.1.tar.gz"
+        src.write_bytes(b"sdist-bytes")
+        meta = make_meta_fn(
+            name="pyvizionsdk",
+            canonical_name="pyvizionsdk",
+            version="26.9.1",
+            source_filename="pyvizionsdk-26.9.1.tar.gz",
+            vendored=True,
+        )
+        _path, _warnings = recipe.render_recipe_to_path(
+            meta, yocto, tmp_path / "out", vendor_source=src
+        )
+        copied = tmp_path / "out" / "files" / "pyvizionsdk-26.9.1.tar.gz"
+        assert copied.read_bytes() == b"sdist-bytes"
+
+    def test_vendored_render_recipe_to_path_requires_source(
+        self, make_meta_fn, yocto, tmp_path
+    ):
+        meta = make_meta_fn(
+            name="pyvizionsdk",
+            canonical_name="pyvizionsdk",
+            version="26.9.1",
+            source_filename="pyvizionsdk-26.9.1.tar.gz",
+            vendored=True,
+        )
+        with pytest.raises(ValueError, match="vendor_source"):
+            recipe.render_recipe_to_path(meta, yocto, tmp_path / "out")

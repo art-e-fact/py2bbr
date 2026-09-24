@@ -151,6 +151,24 @@ class TestDetectLicense:
         spdx, _ = detect_license(msg)
         assert spdx == ""
 
+    def test_classifier_mozilla_public_license_2(self):
+        # Real jinxed 2.1.0 metadata: classifier tail "Mozilla Public License
+        # 2.0 (MPL 2.0)" — must map to MPL-2.0 (PetaLinux required a LICENSE).
+        msg = _msg(
+            "Metadata-Version: 2.1\nName: jinxed\n"
+            "Classifier: License :: OSI Approved :: "
+            "Mozilla Public License 2.0 (MPL 2.0)\n"
+        )
+        spdx, _ = detect_license(msg)
+        assert spdx == "MPL-2.0"
+
+    def test_license_text_mplv2(self):
+        # Real jinxed 2.1.0 also ships free-form "License: MPLv2.0"; the
+        # keyword sniff must catch the MPLv2 shorthand.
+        msg = _msg("Metadata-Version: 2.1\nName: jinxed\nLicense: MPLv2.0\n")
+        spdx, _ = detect_license(msg)
+        assert spdx == "MPL-2.0"
+
 
 class TestMarkerEnv:
     def test_target_python_version(self):
@@ -262,6 +280,49 @@ class TestRunPipDownload:
         assert cmd[-3:] == ["--index-url", "https://i", "--x"]
 
 
+class TestPublicSdistUrl:
+    """S6: packages absent from public PyPI need vendoring, not a pypi fetch.
+
+    py2bbr must predict whether ``inherit pypi``'s fetch URL will 404 (the
+    pyvizionsdk do_fetch failure) so the recipe can vendor the sdist instead.
+    The prediction re-derives that exact URL from the sdist filename.
+    """
+
+    def test_tar_gz_url_derived(self):
+        assert M._public_pypi_sdist_url("pyvizionsdk-26.9.1.tar.gz") == (
+            "https://files.pythonhosted.org/packages/source/"
+            "p/pyvizionsdk/pyvizionsdk-26.9.1.tar.gz"
+        )
+
+    def test_dashed_name_rpartition_keeps_full_name(self):
+        # Versions never contain '-' (PEP 440), so the LAST '-' always splits
+        # name from version; `typed-ast` must not be cut down to `typed`.
+        assert M._public_pypi_sdist_url("typed-ast-1.5.4.tar.gz") == (
+            "https://files.pythonhosted.org/packages/source/"
+            "t/typed-ast/typed-ast-1.5.4.tar.gz"
+        )
+
+    def test_underscore_name_kept(self):
+        assert M._public_pypi_sdist_url("async_pyserial-0.2.4.tar.gz") == (
+            "https://files.pythonhosted.org/packages/source/"
+            "a/async_pyserial/async_pyserial-0.2.4.tar.gz"
+        )
+
+    def test_zip_sdist_maps_to_tar_gz_url(self):
+        # The pypi class always fetches .tar.gz (PYPI_PACKAGE_EXT default), so
+        # even a zip sdist maps to the .tar.gz URL the build will request.
+        assert M._public_pypi_sdist_url("black-26.5.1.zip") == (
+            "https://files.pythonhosted.org/packages/source/"
+            "b/black/black-26.5.1.tar.gz"
+        )
+
+    def test_wheel_returns_none(self):
+        assert M._public_pypi_sdist_url("black-26.5.1-py3-none-any.whl") is None
+
+    def test_undecodable_returns_none(self):
+        assert M._public_pypi_sdist_url("not-an-sdist.txt") is None
+
+
 class TestFetchSource:
     @staticmethod
     def _writer(filename, data=b"data"):
@@ -335,6 +396,33 @@ class TestFetchSource:
         src = M.fetch_source("black", "26.5.2", PipOptions(), tmp_path)
         assert src.filename == "black-26.5.2.tar.gz"
 
+    def test_public_not_checked_by_default(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            M, "_run_pip_download", self._writer("black-26.5.1.tar.gz")
+        )
+        src = M.fetch_source("black", "26.5.1", PipOptions(), tmp_path)
+        assert src.public_reachable is None
+
+    def test_check_public_reachable_true(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            M, "_run_pip_download", self._writer("black-26.5.1.tar.gz")
+        )
+        monkeypatch.setattr(M, "_sdist_reachable", lambda url: True)
+        src = M.fetch_source(
+            "black", "26.5.1", PipOptions(), tmp_path, check_public=True
+        )
+        assert src.public_reachable is True
+
+    def test_check_public_unreachable_false(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            M, "_run_pip_download", self._writer("black-26.5.1.tar.gz")
+        )
+        monkeypatch.setattr(M, "_sdist_reachable", lambda url: False)
+        src = M.fetch_source(
+            "black", "26.5.1", PipOptions(), tmp_path, check_public=True
+        )
+        assert src.public_reachable is False
+
 
 class TestPickArtifactExtra:
     def test_sdist_when_not_preferred(self, tmp_path):
@@ -366,6 +454,17 @@ class TestArchiveReading:
     def test_license_nested_ignored(self, tmp_path):
         src = _sdist_src(_sdist(tmp_path, {"black-26.5.1/src/LICENSE": "x"}))
         assert M.find_license_file(src) is None
+
+    def test_license_mixed_case_extension(self, tmp_path):
+        # Real numpy sdist ships top-level LICENSE.txt; the name set is
+        # mixed-case while comparisons upper() the member, so lowercase
+        # extensions were never matched (no LIC_FILES_CHKSUM in the recipe).
+        src = _sdist_src(
+            _sdist(tmp_path, {"black-26.5.1/LICENSE.txt": "MIT license text\n"})
+        )
+        name, md5 = M.find_license_file(src)
+        assert name == "LICENSE.txt"
+        assert md5 == hashlib.md5(b"MIT license text\n").hexdigest()
 
     def test_read_build_system_top_level(self, tmp_path):
         src = _sdist_src(_sdist(tmp_path, _FULL_MEMBERS))

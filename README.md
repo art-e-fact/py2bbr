@@ -91,6 +91,7 @@ providers.
 | `--no-deps` | Disable the closure (default is on): emit only the top recipe and leave its RDEPENDS to other layers (e.g. meta-python). |
 | `--max-depth N` | Cap the closure depth (default: unlimited). |
 | `--skip-dep NAME` | Exclude a dependency from the closure (repeatable; canonical names). |
+| `-q`, `-v` | Logging: INFO stage progress lines on stderr (default); `-q` restricts to warnings/errors; `-v` adds DEBUG detail (per-package fetch/parse summaries, public-PyPI reachability). |
 
 ## Checks
 
@@ -219,6 +220,17 @@ dependency bounds are left intact.
 Note on minimal PetaLinux: Some installations of PetaLinux do not include `python3`, reportedly `petalinux-image-minimal`. If Python is reported missing:
 - Add `python3` to the `IMAGE_INSTALL:append` line (in interactive configuration or under pl-project/project-spec/configs`.
 - Switch to the full image (petalinux-build targeting petalinux-image-full), which includes `python3` and `pip`.
+
+### Private-index packages are vendored into the layer
+
+Some packages only exist on a private index (e.g. `pyvizionsdk`);
+`inherit pypi`'s `do_fetch` then 404s against public PyPI and the build dies.
+`py2bbr` checks reachability of the exact URL the `pypi` class would fetch, and
+when it is unreachable the recipe ships the sdist **inside the layer** instead:
+`SRC_URI = "file://pyvizionsdk-26.9.1.tar.gz"` (resolved through FILESPATH from
+`recipes-devtools/python/files/`), a derived `S`, and the same
+`SRC_URI[sha256sum]` / `LIC_FILES_CHKSUM` guarantees. The layer stays
+self-contained and builds offline.
 
 ## License
 

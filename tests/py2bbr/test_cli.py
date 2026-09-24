@@ -2,6 +2,7 @@
 Unit tests on CLI functions
 """
 
+import logging
 import runpy
 import sys
 
@@ -209,3 +210,66 @@ class TestMain:
             with pytest.raises(SystemExit) as exc:
                 runpy.run_module(mod, run_name="__main__")
             assert exc.value.code == 0
+
+
+class TestLogging:
+    """INFO stage progress on stderr; -q suppresses it, -v adds DEBUG."""
+
+    def test_info_stage_progress_by_default(
+        self, tmp_path, monkeypatch, meta, make_meta_fn, caplog
+    ):
+        monkeypatch.setattr(
+            cli,
+            "build_metadata",
+            _dep_aware_fake(meta, _source(tmp_path), make_meta_fn),
+        )
+        with caplog.at_level(logging.INFO):
+            rc = cli.main(
+                ["black", "-o", str(tmp_path / "out"), "--check", "structural"]
+            )
+        assert rc == 0
+        text = caplog.text
+        assert "fetching black==latest" in text
+        assert "closure: 3 package(s) resolved" in text
+        assert "wrote layer" in text
+        assert "wrote kas file" in text
+        assert "check structural" in text
+        assert not any(r.levelno == logging.DEBUG for r in caplog.records)
+
+    def test_quiet_suppresses_info(self, tmp_path, monkeypatch, meta, caplog):
+        monkeypatch.setattr(
+            cli, "build_metadata", _fake_build_metadata(meta, _source(tmp_path))
+        )
+        with caplog.at_level(logging.INFO):
+            rc = cli.main(
+                [
+                    "black",
+                    "-o",
+                    str(tmp_path / "o"),
+                    "-q",
+                    "--check",
+                    "structural",
+                ]
+            )
+        assert rc == 0
+        assert not any(r.levelno == logging.INFO for r in caplog.records)
+
+    def test_verbose_enables_debug(self, tmp_path, monkeypatch, meta, caplog):
+        monkeypatch.setattr(
+            cli, "build_metadata", _fake_build_metadata(meta, _source(tmp_path))
+        )
+        with caplog.at_level(logging.DEBUG):
+            rc = cli.main(
+                [
+                    "black",
+                    "-o",
+                    str(tmp_path / "o"),
+                    "-v",
+                    "--no-layer",
+                    "--no-kas",
+                    "--check",
+                    "structural",
+                ]
+            )
+        assert rc == 0
+        assert any(r.levelno == logging.DEBUG for r in caplog.records)
