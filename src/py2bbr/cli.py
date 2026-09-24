@@ -22,7 +22,7 @@ from py2bbr.check import DEFAULT_LEVEL, STAGES, run_checks
 from py2bbr.errors import Py2BbrError
 from py2bbr.metadata import PipOptions, build_metadata
 from py2bbr.model import DEFAULT_YOCTO_VERSION
-from py2bbr.recipe import render_recipe_to_path
+from py2bbr.recipe import bitbake_pn, render_recipe_to_path
 from py2bbr.yocto import (
     DEFAULT_KAS_VERSION,
     default_layer_name,
@@ -125,6 +125,31 @@ def build_parser() -> argparse.ArgumentParser:
         "--keep-sources",
         action="store_true",
         help="Keep the downloaded source artifacts (for debugging).",
+    )
+    out.add_argument(
+        "--with-deps",
+        action="store_true",
+        help=(
+            "Resolve the transitive runtime dependency closure and render one "
+            "recipe per closure member into the same layer (RDEPENDS chains "
+            "them; the top recipe stays the kas target)."
+        ),
+    )
+    out.add_argument(
+        "--max-depth",
+        type=int,
+        default=None,
+        help="Limit dependency resolution depth (None = unlimited).",
+    )
+    out.add_argument(
+        "--skip-dep",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help=(
+            "Skip this canonical package name (repeatable) when resolving the "
+            "dependency closure (escape hatch for distro-provided deps)."
+        ),
     )
 
     yocto = p.add_argument_group("yocto")
@@ -275,22 +300,64 @@ def main(argv: list[str] | None = None) -> int:
             keep=args.keep_sources,
         )
 
+        # Dependency closure: resolve transitive runtime deps, thread recipes
+        # into the layer rendering + kas extra targets.
+        closure = [meta]
+        warnings_extra: list[str] = []
+        if args.with_deps:
+            from py2bbr.metadata import resolve_closure
+
+            def _builder(req):
+                import py2bbr.metadata as _m
+
+                return _m.build_metadata(
+                    req.name,
+                    req.version,
+                    pip_opts,
+                    workdir,
+                    yocto=yocto,
+                    keep=args.keep_sources,
+                    requirement=req.requirement,
+                )
+
+            closure, warnings_extra = resolve_closure(
+                meta,
+                _builder,
+                skip=frozenset(args.skip_dep),
+                max_depth=args.max_depth,
+            )
+
         # 2. Render + write the recipe (and optionally a full layer).
         layer_name = args.layer_name or default_layer_name(meta.canonical_name)
         layer_dir = output / layer_name if not args.no_layer else None
+        extra_metas = closure[1:] if len(closure) > 1 else None
+        warnings = list(warnings_extra)
         if args.no_layer:
-            recipe_path, warnings = render_recipe_to_path(
+            if extra_metas:
+                warnings.append(
+                    "--with-deps with --no-layer: closure recipes written "
+                    "individually, one recipe per member (only the top recipe "
+                    "is emitted; use --with-deps without --no-layer to get one "
+                    ".bb per closure member)"
+                )
+            recipe_path, recipe_warnings = render_recipe_to_path(
                 meta, yocto, output, build_class=args.build_class
             )
+            warnings += recipe_warnings
         else:
             recipe_path = write_layer(
-                meta, yocto, layer_dir, build_class=args.build_class
+                meta,
+                yocto,
+                layer_dir,
+                build_class=args.build_class,
+                extra_metas=extra_metas,
             )
             from py2bbr.recipe import render_recipe
 
-            _text, warnings = render_recipe(
+            _text, recipe_warnings = render_recipe(
                 meta, yocto, build_class=args.build_class
             )
+            warnings += recipe_warnings
 
         # 3. Render + validate the kas build file.
         kas_file = None
@@ -303,6 +370,10 @@ def main(argv: list[str] | None = None) -> int:
                 layer_dir,
                 machine=args.machine,
                 kas_version=DEFAULT_KAS_VERSION,
+                extra_targets=[
+                    bitbake_pn(m.name, yocto.python_pn)
+                    for m in (closure[1:] if len(closure) > 1 else [])
+                ],
             )
             kas_file.parent.mkdir(parents=True, exist_ok=True)
             kas_file.write_text(kas_text, encoding="utf-8")

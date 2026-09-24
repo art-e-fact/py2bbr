@@ -84,6 +84,9 @@ py2bbr.kas.yml` compiles it in a clean environment.
 | `--layer-name` | Override the layer directory name (default: `meta-<package>`, e.g. `meta-async-pyserial`). |
 | `--no-layer`, `--no-kas` | Emit only the recipe / skip the kas file. |
 | `--keep-sources` | Keep downloaded artifacts for debugging. |
+| `--with-deps` | Resolve the transitive runtime-dependency closure and render one recipe per member (same layer; the kas target stays the top recipe, bitbake follows RDEPENDS). |
+| `--max-depth N` | Cap the closure depth with `--with-deps` (default: unlimited). |
+| `--skip-dep NAME` | Exclude a dependency from the `--with-deps` closure (repeatable; canonical names). |
 
 ## Checks
 

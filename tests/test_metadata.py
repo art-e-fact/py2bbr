@@ -24,7 +24,7 @@ from py2bbr.metadata import (
     classify_requires_dist,
     detect_license,
 )
-from py2bbr.model import DepKind, SourceKind
+from py2bbr.model import Dependency, DepKind, SourceKind
 from py2bbr.yocto import resolve_yocto_version
 
 
@@ -480,3 +480,143 @@ class TestMiscMetadata:
             "--index-url=https://i",
             "--trusted-host=h",
         ]
+
+
+class TestResolveClosure:
+    def _builder(self, registry, tmp_path):
+        def _b(dep):
+            meta = registry[dep.name]
+            return meta, _sdist_src(tmp_path / "pkg.tar.gz")
+
+        return _b
+
+    def test_no_runtime_deps(self, make_meta_fn, tmp_path):
+        top = make_meta_fn(runtime_deps=[])
+        closure, warnings = M.resolve_closure(top, self._builder({}, tmp_path))
+        assert closure == [top]
+        assert warnings == []
+
+    def test_bfs_order_and_dedup(self, make_meta_fn, tmp_path):
+        top = make_meta_fn(
+            runtime_deps=[
+                Dependency("a", DepKind.RUNTIME, requirement="a>=1"),
+                Dependency("b", DepKind.RUNTIME, requirement="b>=2"),
+            ]
+        )
+        a = make_meta_fn(
+            name="a",
+            canonical_name="a",
+            version="1",
+            runtime_deps=[Dependency("c", DepKind.RUNTIME, requirement="c>=3")],
+        )
+        b = make_meta_fn(
+            name="b", canonical_name="b", version="2", runtime_deps=[]
+        )
+        c = make_meta_fn(
+            name="c", canonical_name="c", version="3", runtime_deps=[]
+        )
+        closure, warnings = M.resolve_closure(
+            top, self._builder({"a": a, "b": b, "c": c}, tmp_path)
+        )
+        assert closure == [top, a, b, c]
+        assert warnings == []
+
+    def test_canonical_dedup(self, make_meta_fn, tmp_path):
+        top = make_meta_fn(
+            runtime_deps=[
+                Dependency("async-pyserial", DepKind.RUNTIME),
+                Dependency("async_pyserial", DepKind.RUNTIME),
+            ]
+        )
+        member = make_meta_fn(
+            name="async-pyserial",
+            canonical_name="async-pyserial",
+            version="1",
+            runtime_deps=[],
+        )
+        closure, warnings = M.resolve_closure(
+            top,
+            self._builder(
+                {"async-pyserial": member, "async_pyserial": member}, tmp_path
+            ),
+        )
+        assert closure == [top, member]
+        assert warnings == []
+
+    def test_cycle_safe(self, make_meta_fn, tmp_path):
+        a = make_meta_fn(
+            name="a",
+            canonical_name="a",
+            version="1",
+            runtime_deps=[Dependency("b", DepKind.RUNTIME)],
+        )
+        b = make_meta_fn(
+            name="b",
+            canonical_name="b",
+            version="2",
+            runtime_deps=[Dependency("a", DepKind.RUNTIME)],
+        )
+        closure, warnings = M.resolve_closure(
+            a, self._builder({"a": a, "b": b}, tmp_path)
+        )
+        assert closure == [a, b]
+        assert warnings == []
+
+    def test_skip_member_silently_and_warn_absent(self, make_meta_fn, tmp_path):
+        top = make_meta_fn(runtime_deps=[Dependency("a", DepKind.RUNTIME)])
+        a = make_meta_fn(
+            name="a", canonical_name="a", version="1", runtime_deps=[]
+        )
+        closure, warnings = M.resolve_closure(
+            top, self._builder({"a": a}, tmp_path), skip=frozenset({"a"})
+        )
+        assert closure == [top]
+        assert warnings == []
+
+        closure2, warnings2 = M.resolve_closure(
+            top, self._builder({"a": a}, tmp_path), skip=frozenset({"zzz"})
+        )
+        assert closure2 == [top, a]
+        assert warnings2 == ["--skip-dep zzz: not in the runtime closure"]
+
+    def test_max_depth(self, make_meta_fn, tmp_path):
+        top = make_meta_fn(runtime_deps=[Dependency("a", DepKind.RUNTIME)])
+        a = make_meta_fn(
+            name="a",
+            canonical_name="a",
+            version="1",
+            runtime_deps=[Dependency("c", DepKind.RUNTIME)],
+        )
+        c = make_meta_fn(
+            name="c", canonical_name="c", version="3", runtime_deps=[]
+        )
+        builder = self._builder({"a": a, "c": c}, tmp_path)
+        closure0, _ = M.resolve_closure(top, builder, max_depth=0)
+        assert closure0 == [top]
+        closure1, _ = M.resolve_closure(top, builder, max_depth=1)
+        assert closure1 == [top, a]
+        closure_all, _ = M.resolve_closure(top, builder)
+        assert closure_all == [top, a, c]
+
+    def test_builder_receives_raw_requirement(self, make_meta_fn, tmp_path):
+        seen = []
+        top = make_meta_fn(
+            runtime_deps=[
+                Dependency("a", DepKind.RUNTIME, requirement="a>=1.0")
+            ]
+        )
+
+        def _b(dep):
+            seen.append(dep.requirement)
+            member = make_meta_fn(
+                name=dep.name,
+                canonical_name=dep.name,
+                version="1",
+                runtime_deps=[],
+            )
+            return member, _sdist_src(tmp_path / "p.tar.gz")
+
+        closure, warnings = M.resolve_closure(top, _b)
+        assert [m.name for m in closure] == ["black", "a"]
+        assert seen == ["a>=1.0"]
+        assert warnings == []

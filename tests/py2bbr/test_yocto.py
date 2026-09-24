@@ -183,3 +183,29 @@ class TestKasFile:
             "kas config header missing 'version'"
         ]
         assert validate_kas_file({"header": {"version": 5}}) == []
+
+
+class TestLayerClosureRecipes:
+    def test_render_layer_one_recipe_per_member(
+        self, meta, make_meta_fn, yocto
+    ):
+        member = make_meta_fn(
+            name="click", canonical_name="click", version="8.1.7"
+        )
+        files = render_layer(meta, yocto, "meta-black", extra_metas=[member])
+        assert "recipes-devtools/python/python3-black_26.5.1.bb" in files
+        assert "recipes-devtools/python/python3-click_8.1.7.bb" in files
+
+    def test_write_layer_writes_member_recipes(
+        self, meta, make_meta_fn, yocto, tmp_path
+    ):
+        member = make_meta_fn(
+            name="click", canonical_name="click", version="8.1.7"
+        )
+        layer_dir = tmp_path / "meta-black"
+        recipe_path = write_layer(meta, yocto, layer_dir, extra_metas=[member])
+        assert recipe_path.name == "python3-black_26.5.1.bb"
+        assert (
+            layer_dir / "recipes-devtools/python/python3-click_8.1.7.bb"
+        ).is_file()
+        assert recipe_path.is_file()

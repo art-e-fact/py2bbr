@@ -26,6 +26,7 @@ import sys
 import tarfile
 import tomllib
 import zipfile
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -195,12 +196,20 @@ def fetch_source(
     pip_opts: PipOptions,
     workdir: Path,
     keep: bool = False,
+    *,
+    requirement: str | None = None,
 ) -> FetchedSource:
     """Download the package (sdist preferred) into ``workdir``.
 
+    ``requirement``, when given, is used verbatim as the ``pip download``
+    requirement instead of ``name``/``version``. This is how the dependency
+    closure resolver passes the raw requirement (with its bounds, e.g.
+    ``tomli>=1.0.2``) through to pip so the upstream bounds are honoured when
+    picking versions.
+
     Raises :class:`MetadataNotFoundError` if no artifact is available.
     """
-    requirement = f"{name}=={version}" if version else name
+    requirement = requirement or (f"{name}=={version}" if version else name)
     dest = workdir / "download"
     dest.mkdir(parents=True, exist_ok=True)
 
@@ -594,9 +603,13 @@ def build_metadata(
     workdir: Path,
     yocto: YoctoVersion | None = None,
     keep: bool = False,
+    *,
+    requirement: str | None = None,
 ) -> tuple[PackageMetadata, FetchedSource]:
     """Fetch + parse a package into a fully-populated :class:`PackageMetadata`."""
-    source = fetch_source(name, version, pip_opts, workdir, keep=keep)
+    source = fetch_source(
+        name, version, pip_opts, workdir, keep=keep, requirement=requirement
+    )
     msg = parse_metadata_file(source)
 
     meta_name = _first(msg, "Name") or name
@@ -654,6 +667,59 @@ def build_metadata(
 def _canonical(name: str) -> str:
     """PEP 503 canonical form (lowercase, runs of -_. collapsed to -)."""
     return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def resolve_closure(
+    top: PackageMetadata,
+    builder: Callable[[Dependency], tuple[PackageMetadata, FetchedSource]],
+    *,
+    skip: frozenset[str] = frozenset(),
+    max_depth: int | None = None,
+) -> tuple[list[PackageMetadata], list[str]]:
+    """Resolve the transitive **runtime** closure of ``top``.
+
+    BFS over ``runtime_deps``; each member is fetched through ``builder`` (the
+    network seam; tests inject a fake) with its raw requirements (bounds
+    intact, e.g. ``tomli>=1.0.2``) passed through verbatim so upstream
+    bounds are honoured when picking versions.
+
+    Returns ``(closure, warnings)`` with ``closure[0]`` == ``top`` (top
+    recipe stays the kas target; bitbake follows RDEPENDS transitively).
+    Members are deduplicated by canonical name (cycle-safe); ``skip`` is a set
+    of canonical names to drop (the ``--skip-dep`` escape hatch for
+    distro-provided packages, e.g. ``numpy``); ``max_depth`` limits recursion
+    depth (``None`` = unlimited).
+    """
+    from collections import deque
+
+    visited: set[str] = {_canonical(top.name)}
+    skipped: set[str] = set()
+    closure: list[PackageMetadata] = [top]
+    queue: deque[tuple[PackageMetadata, int]] = deque([(top, 0)])
+    warnings: list[str] = []
+
+    while queue:
+        meta, depth = queue.popleft()
+        if max_depth is not None and depth >= max_depth:
+            continue
+        for dep in meta.runtime_deps:
+            canonical = _canonical(dep.name)
+            if canonical in visited:
+                continue
+            if canonical in skip:
+                skipped.add(canonical)
+                continue
+            visited.add(canonical)
+            member, _source = builder(dep)
+            closure.append(member)
+            queue.append((member, depth + 1))
+
+    for canonical in sorted(skip):
+        if canonical not in visited and canonical not in skipped:
+            warnings.append(
+                f"--skip-dep {canonical}: not in the runtime closure"
+            )
+    return closure, warnings
 
 
 def default_yocto() -> YoctoVersion:

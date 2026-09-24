@@ -165,8 +165,16 @@ def render_layer(
     yocto: YoctoVersion,
     layer_name: str,
     build_class: str | None = None,
+    extra_metas: list[PackageMetadata] | None = None,
 ) -> dict[str, str]:
-    """Render a full Yocto layer as ``{relative_path: content}``."""
+    """Render a full Yocto layer as ``{relative_path: content}``.
+
+    ``extra_metas`` (the other members of the runtime-dependency closure, in
+    BFS order, ``extra_metas[0]`` excluded — ``meta`` is the top recipe) each
+    render their own recipe into the *same* layer. One recipe per member;
+    ``RDEPENDS:${PN}`` on each member pulls the next recipe transitively
+    (bitbake follows RDEPENDS), so the kas target stays ``meta``'s PN.
+    """
     from py2bbr.recipe import render_recipe
 
     collection = layer_collection(layer_name)
@@ -174,11 +182,24 @@ def render_layer(
     recipe_path = f"recipes-devtools/python/{recipe_filename(pn, meta.version)}"
     recipe_text, _warnings = render_recipe(meta, yocto, build_class=build_class)
 
-    return {
+    files = {
         "conf/layer.conf": _layer_conf(collection, yocto.codename),
         "README": _layer_readme(meta, yocto),
         recipe_path: recipe_text,
     }
+
+    for member in extra_metas or ():
+        member_pn = bitbake_pn(member.name, yocto.python_pn)
+        member_path = (
+            "recipes-devtools/python/"
+            f"{recipe_filename(member_pn, member.version)}"
+        )
+        member_text, _warnings = render_recipe(
+            member, yocto, build_class=build_class
+        )
+        files[member_path] = member_text
+
+    return files
 
 
 def write_layer(
@@ -186,16 +207,28 @@ def write_layer(
     yocto: YoctoVersion,
     layer_dir: Path,
     build_class: str | None = None,
+    extra_metas: list[PackageMetadata] | None = None,
 ) -> Path:
-    """Write the layer tree under ``layer_dir``; return the recipe path."""
+    """Write the layer tree under ``layer_dir``; return the top recipe path."""
     layer_dir = Path(layer_dir)
-    files = render_layer(meta, yocto, layer_dir.name, build_class=build_class)
+    files = render_layer(
+        meta,
+        yocto,
+        layer_dir.name,
+        build_class=build_class,
+        extra_metas=extra_metas,
+    )
     recipe_path = None
     for rel, content in files.items():
         dest = layer_dir / rel
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_text(content, encoding="utf-8")
-        if rel.endswith(".bb"):
+        if rel.endswith(".bb") and (
+            recipe_path is None
+            or rel.startswith(
+                f"recipes-devtools/python/{recipe_filename(bitbake_pn(meta.name, yocto.python_pn), meta.version)}"
+            )
+        ):
             recipe_path = dest
     return layer_dir if recipe_path is None else recipe_path
 
@@ -220,9 +253,7 @@ def render_kas_file(
 
     layer_dir = Path(layer_dir).resolve()
     pn = bitbake_pn(meta.name, yocto.python_pn)
-    targets = [pn]
-    if extra_targets:
-        targets = list(dict.fromkeys([pn] + list(extra_targets)))
+    targets = list(dict.fromkeys([pn] + list(extra_targets or [])))
 
     config = {
         "header": {"version": kas_version},
