@@ -91,7 +91,8 @@ providers.
 | `--no-deps` | Disable the closure (default is on): emit only the top recipe and leave its RDEPENDS to other layers (e.g. meta-python). |
 | `--max-depth N` | Cap the closure depth (default: unlimited). |
 | `--skip-dep NAME` | Exclude a dependency from the closure (repeatable; canonical names). |
-| `-q`, `-v` | Logging: INFO stage progress lines on stderr (default); `-q` restricts to warnings/errors; `-v` adds DEBUG detail (per-package fetch/parse summaries, public-PyPI reachability). |
+| `--jobs N` | Fetch closure dependencies in parallel (default `4`; `1` = sequential). Each in-flight fetch shows its own live progress bar on stderr (TTY only). Closure order is unchanged. |
+| `-q`, `-v` | Logging: INFO stage progress lines on stderr (default); `-q` restricts to warnings/errors (and disables the live fetch progress bars); `-v` adds DEBUG detail (per-package fetch/parse summaries, public-PyPI reachability). |
 
 ## Checks
 

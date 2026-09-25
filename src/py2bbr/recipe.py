@@ -31,6 +31,15 @@ assignment line and survive such passes intact.
   authoritative, so the bounds are stripped; ``[project]`` dependency bounds
   are left intact.
 
+* PEP 517 backends that make pypa/build's ``--no-isolation`` dependency check
+  demand non-Python tools (meson-python's recursive ``meson`` requirement plus
+  the ninja binary its hook appends; scikit-build-core's cmake/ninja) get them
+  declared as literal ``-native`` DEPENDS (``meson-native ninja-native`` /
+  ``cmake-native ninja-native``). Bitbake does not stage a native dependency's
+  own natives into the consuming recipe's sysroot, so the recipe must name them
+  itself (numpy 2.5.3 under PetaLinux aborted with "Missing dependencies:
+  meson-python / meson>=1.2.3 / ninja>=1.8.2").
+
 * ``python_pep517`` recipes additionally prune ``project.classifiers`` lines
   that claim Python versions newer than the target (e.g. ``Python :: 3.14`` on
   a 3.12 image): the native sysroot's hatchling validates classifiers against
@@ -45,6 +54,8 @@ import re
 import shutil
 
 from packaging.requirements import InvalidRequirement, Requirement
+from packaging.specifiers import InvalidSpecifier, SpecifierSet
+from packaging.version import InvalidVersion, Version
 
 from py2bbr.model import Dependency, PackageMetadata, YoctoVersion
 
@@ -59,6 +70,45 @@ def canonical_name(name: str) -> str:
 # them breaks recipe resolution ("Nothing PROVIDES 'python3-uv-build-native'").
 # Value: canonical (PEP 503) distribution name as it would appear in DEPENDS.
 _EXTERNAL_BUILD_BACKENDS = frozenset({"uv-build"})
+
+
+# Non-Python build tools that PEP 517 backends make pypa/build's
+# ``--no-isolation`` dependency check demand: directly via their
+# ``get_requires_for_build_*`` hook (meson-python appends ``ninja>=...`` when no
+# ninja binary is on PATH; scikit-build-core appends cmake/ninja), or
+# transitively via the backend's own Requires-Dist chain (meson-python's
+# ``meson>=1.2.3`` on py>=3.12, resolved recursively by build 1.1's
+# check_dependency). Bitbake does not stage a native dependency's own
+# ``-native`` deps into the consuming recipe's sysroot, so the recipe must name
+# the tools itself. Key: canonical (PEP 503) build-backend name as found in
+# ``[build-system].build-backend``; value: literal OE-native packages to add to
+# DEPENDS (all shipped by poky core for the supported series).
+_BUILD_BACKEND_TOOL_DEPS: dict[str, str] = {
+    "mesonpy": "meson-native ninja-native",
+    "meson-python": "meson-native ninja-native",
+    "scikit-build-core": "cmake-native ninja-native",
+}
+
+
+# Emitted into every recipe: PetaLinux's ``python_pep517_do_install`` (the
+# install step all build classes route through: setuptools3, python_pep517,
+# python_setuptools_build_meta, python_mesonpy) runs pypa installer with only
+# ``--destdir=${D}`` and no ``--prefix``. Installer 0.7.0 then derives its
+# scheme from the *native* python's sysconfig, whose base is the absolute
+# recipe-sysroot-native path, and pathlib-joins that onto ${D} -- so the wheel
+# payload lands under ``${D}/output/.../recipe-sysroot-native/...`` and
+# do_package fails with "installed but not shipped" (xmod 1.10.0 under
+# PetaLinux 2024.2). Pinning ``--prefix ${prefix}`` makes every scheme path
+# relative to ${D} again (target /usr, native /usr, nativesdk /usr/local).
+_INSTALL_PREFIX_OVERRIDE = """\
+# Work around PetaLinux's python_pep517_do_install calling pypa installer
+# without --prefix: the wheel payload would land under
+# ${D}/output/.../recipe-sysroot-native/... and do_package would fail with
+# "installed but not shipped". A --prefix keeps every path relative to ${D}.
+python_pep517_do_install() {
+    nativepython3 -m installer ${INSTALL_WHEEL_COMPILE_BYTECODE} --interpreter "${USRBINPATH}/env ${PEP517_INSTALL_PYTHON}" --prefix ${prefix} --destdir=${D} ${PEP517_WHEEL_PATH}/*.whl
+}
+"""
 
 
 def bitbake_pn(name: str, python_pn: str = "python3") -> str:
@@ -192,6 +242,8 @@ def pick_build_class(backend: str) -> tuple[str, bool]:
 
     * no backend (setup.py / implicit)   -> ``setuptools3``
     * ``setuptools.build_meta`` (etc.)   -> ``python_setuptools_build_meta``
+    * ``mesonpy`` / ``meson-python``     -> ``python_mesonpy`` (first-class OE
+      class: meson cross build with the backend from the native sysroot)
     * external dev tooling (uv, ...)     -> ``python_setuptools_build_meta``
       (+ warning; the pyproject backend is rewritten in do_configure, see
       ``render_recipe``)
@@ -204,6 +256,8 @@ def pick_build_class(backend: str) -> tuple[str, bool]:
     backend = (backend or "").lower()
     if not backend:
         return "setuptools3", False
+    if canonical_name(backend) in ("mesonpy", "meson-python"):
+        return "python_mesonpy", False
     if canonical_name(backend) in _EXTERNAL_BUILD_BACKENDS:
         return "python_setuptools_build_meta", True
     if "setuptools" in backend:
@@ -227,7 +281,11 @@ def _needs_bounds_relax(build_class: str, build_deps: list[Dependency]) -> bool:
     sysroot. The legacy ``setuptools3`` path installs the provided setuptools
     from the sysroot, so it never hits the check.
     """
-    if build_class not in ("python_pep517", "python_setuptools_build_meta"):
+    if build_class not in (
+        "python_pep517",
+        "python_setuptools_build_meta",
+        "python_mesonpy",
+    ):
         return False
     return any(_has_version_bound(d.requirement) for d in build_deps)
 
@@ -272,6 +330,79 @@ def _classifier_drop_pattern(target_python: str) -> str | None:
         f"s/,[[:space:]]*{entry}//g; "
         f"s/\\[[[:space:]]*{entry}[[:space:]]*\\]/[]/g"
     )
+
+
+# Build-backend / tool versions shipped in the *native sysroot* of each Yocto
+# series, verified from the dist-info of a PetaLinux 2024.2 build under
+# recipe-sysroot-native (poetry-core implied from its transitive deps). Key:
+# canonical (PEP 503) distribution name as it appears in build-system requires.
+_BUNDLED_TOOL_VERSIONS: dict[str, dict[str, str]] = {
+    "5.0": {
+        "build": "1.1.1",
+        "cython": "3.0.8",
+        "flit-core": "3.9.0",
+        "hatchling": "1.21.1",
+        "installer": "0.7.0",
+        "meson": "1.3.1",
+        "meson-python": "0.15.0",
+        "ninja": "1.11.1",
+        "packaging": "23.2",
+        "poetry-core": "1.9.0",
+        "pyproject-hooks": "1.0.0",
+        "pyproject-metadata": "0.7.1",
+        "setuptools": "69.1.1",
+        "wheel": "0.42.0",
+    },
+}
+
+
+def _minimum_version(specifier: str) -> Version | None:
+    """Lowest version a PEP 508 specifier set demands, or ``None``.
+
+    Only positive bounds are floors: ``>=`` / ``>`` / ``==`` and the ``~=``
+    compatible-release prefix. ``<`` / ``<=`` / ``!=`` are ceilings or
+    exclusions, and wildcard pins (``==3.1.*``) carry no usable floor.
+    """
+    try:
+        spec = SpecifierSet(specifier)
+    except InvalidSpecifier:
+        return None
+    floors: list[Version] = []
+    for item in spec:
+        if item.operator not in (">=", ">", "==", "~="):
+            continue
+        try:
+            floors.append(Version(item.version))
+        except InvalidVersion:
+            continue  # wildcard segment -- not a floor
+    return max(floors) if floors else None
+
+
+def build_version_gaps(
+    meta: PackageMetadata, yocto: YoctoVersion
+) -> list[Dependency]:
+    """Build deps the target series' native sysroot ships too old to satisfy.
+
+    A build-system requires bound above the sysroot's copy (numpy 2.5.3 wants
+    ``Cython>=3.1.0``; Scarthgap ships 3.0.8) would abort the PEP 517 build
+    class' ``--no-isolation`` dependency check. The caller provisions a newer
+    recipe of each gapped dep into the generated layer, so the layer builds
+    the tool itself instead of failing the check.
+
+    setuptools and wheel are exempt: the build classes always satisfy them
+    with the sysroot copies (bounds are relaxed in ``render_recipe``), and
+    provisioning newer ones would churn every recipe's build environment.
+    """
+    bundled = _BUNDLED_TOOL_VERSIONS.get(yocto.version, {})
+    gaps: list[Dependency] = []
+    for dep in meta.build_deps:
+        name = canonical_name(dep.name)
+        if name in ("setuptools", "wheel") or name not in bundled:
+            continue
+        needed = _minimum_version(dep.specifier)
+        if needed is not None and needed > Version(bundled[name]):
+            gaps.append(dep)
+    return gaps
 
 
 def render_recipe(
@@ -389,12 +520,17 @@ def render_recipe(
         if d.name.lower() not in ("setuptools", "wheel")
         and canonical_name(d.name) not in _EXTERNAL_BUILD_BACKENDS
     ]
-    if extra_build:
-        deps = " ".join(
-            f"{var}-native"
-            for var in _bitbake_deps(extra_build, f"{yocto.python_pn}-")
-        )
-        lines.append(f'DEPENDS += "{deps}"')
+    tools = _BUILD_BACKEND_TOOL_DEPS.get(
+        canonical_name(meta.build_backend or "")
+    )
+    deps = [
+        f"{var}-native"
+        for var in _bitbake_deps(extra_build, f"{yocto.python_pn}-")
+    ]
+    if tools:
+        deps.append(tools)
+    if deps:
+        lines.append(f'DEPENDS += "{" ".join(deps)}"')
         lines.append("")
 
     if meta.runtime_deps:
@@ -441,6 +577,34 @@ def render_recipe(
             r"/^[[:space:]]*\[project\]/,/^[[:space:]]*\[/ "
             r"s/^[[:space:]]*license[[:space:]]*=[[:space:]]*\"(.*)\"/license = {text = \"\1\"}/"
         )
+    if build_class in (
+        "python_pep517",
+        "python_setuptools_build_meta",
+        "python_mesonpy",
+    ):
+        # String licenses in any quote style (``license = "MIT"`` /
+        # ``license = 'MIT'``) are rejected by the sysroot's flit_core 3.9.0
+        # metadata validator (blessed 1.50.0 under PetaLinux) and setuptools'
+        # PEP 639 check; normalize to the table form every backend accepts.
+        # One program per quote style: the structural quote-balance check
+        # counts raw ``"`` chars per line, and a single ``\"`` would leave an
+        # odd count. No-ops when the field is absent or already a table; the
+        # double-quote one duplicates the external-backend rewrite above.
+        quoted_license = [
+            (
+                r"/^[[:space:]]*\[project\]/,/^[[:space:]]*\[/ "
+                r"s/^[[:space:]]*license[[:space:]]*=[[:space:]]*\"(.*)\"/"
+                r"license = {text = \"\1\"}/"
+            ),
+            (
+                r"/^[[:space:]]*\[project\]/,/^[[:space:]]*\[/ "
+                r"s/^[[:space:]]*license[[:space:]]*=[[:space:]]*'(.*)'/"
+                r"license = {text = '\1'}/"
+            ),
+        ]
+        if external_backend:
+            quoted_license = quoted_license[1:]
+        sed_programs.extend(quoted_license)
     if build_class == "python_pep517":
         classifier_drop = _classifier_drop_pattern(yocto.python_version)
         if classifier_drop:
@@ -458,6 +622,12 @@ def render_recipe(
         lines.append("    fi")
         lines.append("}")
         lines.append("")
+
+    # Every build class installs through python_pep517_do_install; override it
+    # with a --prefix so pypa installer keeps its scheme relative to ${D}
+    # (see _INSTALL_PREFIX_OVERRIDE).
+    lines.append(_INSTALL_PREFIX_OVERRIDE.rstrip())
+    lines.append("")
 
     lines.append('BBCLASSEXTEND = "native nativesdk"')
     lines.append("")

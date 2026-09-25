@@ -9,6 +9,7 @@ import sys
 import pytest
 
 from py2bbr import cli
+from py2bbr import metadata as M
 from py2bbr.errors import Py2BbrError
 from py2bbr.metadata import FetchedSource
 from py2bbr.model import PackageMetadata, SourceKind
@@ -97,6 +98,11 @@ class TestBuildParser:
         assert args.machine == "qemarmv7a"
         assert args.output == "out"
         assert args.layer_name == "meta-x"
+
+    def test_jobs_default_and_flag(self):
+        assert cli.build_parser().parse_args(["black"]).jobs == 4
+        args = cli.build_parser().parse_args(["black", "--jobs", "2"])
+        assert args.jobs == 2
 
 
 def _source(tmp_path) -> FetchedSource:
@@ -210,6 +216,56 @@ class TestMain:
             with pytest.raises(SystemExit) as exc:
                 runpy.run_module(mod, run_name="__main__")
             assert exc.value.code == 0
+
+    def test_jobs_passed_to_resolve_closure(
+        self, tmp_path, monkeypatch, meta, make_meta_fn
+    ):
+        seen = {}
+
+        def fake_resolve(top, builder, **kwargs):
+            seen.update(kwargs)
+            return [top], []
+
+        monkeypatch.setattr(M, "resolve_closure", fake_resolve)
+        monkeypatch.setattr(
+            cli,
+            "build_metadata",
+            _dep_aware_fake(meta, _source(tmp_path), make_meta_fn),
+        )
+        rc = cli.main(
+            [
+                "black",
+                "-o",
+                str(tmp_path / "out"),
+                "--jobs",
+                "2",
+                "--check",
+                "structural",
+            ]
+        )
+        assert rc == 0
+        assert seen["workers"] == 2
+
+
+class TestFetchProgress:
+    def test_disabled_is_noop(self):
+        prog = cli._FetchProgress(enabled=False)
+        assert prog._progress is None
+        with prog.fetch("click>=8.0.0"):
+            pass  # must not raise
+        prog.start()
+        prog.stop()
+
+    def test_enabled_tracks_task_lifecycle(self):
+        prog = cli._FetchProgress(enabled=True)
+        assert prog._progress is not None
+        with prog.fetch("click>=8.0.0"):
+            task_ids = frozenset(prog._progress.task_ids)
+            assert len(task_ids) == 1
+            (tid,) = task_ids
+            description = prog._progress.tasks[tid].description
+            assert "click>=8.0.0" in description
+        assert len(prog._progress.task_ids) == 0
 
 
 class TestLogging:

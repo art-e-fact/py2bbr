@@ -359,6 +359,31 @@ class TestFetchSource:
         src = M.fetch_source("black", "26.5.1", PipOptions(), tmp_path)
         assert src.kind is SourceKind.WHEEL
 
+    def test_wheel_fallback_warns_when_sdist_fails(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        # Regression: pip's isolated metadata build can fail environmentally
+        # (e.g. ENOSPC on a full /tmp) even though the sdist exists. The
+        # wheel fallback must surface pip's diagnostics, not silently lose
+        # [build-system] detection.
+        calls = {"n": 0}
+
+        def fake(requirement, dest, *a, **k):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return subprocess.CompletedProcess(
+                    [], 1, "", "ERROR: No space left on device"
+                )
+            (dest / "black-26.5.1-py3-none-any.whl").write_bytes(b"data")
+            return subprocess.CompletedProcess([], 0, "", "")
+
+        monkeypatch.setattr(M, "_run_pip_download", fake)
+        with caplog.at_level("WARNING", logger="py2bbr.metadata"):
+            src = M.fetch_source("black", "26.5.1", PipOptions(), tmp_path)
+        assert src.kind is SourceKind.WHEEL
+        assert "No space left on device" in caplog.text
+        assert "[build-system]" in caplog.text
+
     def test_not_found(self, tmp_path, monkeypatch):
         (tmp_path / "download").mkdir()
         proc = subprocess.CompletedProcess([], 1, "", "no sdist\nno wheel")
@@ -753,3 +778,107 @@ class TestResolveClosure:
         assert [m.name for m in closure] == ["black", "a"]
         assert seen == ["a>=1.0"]
         assert warnings == []
+
+    def test_parallel_workers_preserve_order_and_dedup(
+        self, make_meta_fn, tmp_path
+    ):
+        top = make_meta_fn(
+            runtime_deps=[
+                Dependency("d", DepKind.RUNTIME),
+                Dependency("c", DepKind.RUNTIME),
+                Dependency("b", DepKind.RUNTIME),
+            ]
+        )
+        b = make_meta_fn(
+            name="b", canonical_name="b", version="2", runtime_deps=[]
+        )
+        c = make_meta_fn(
+            name="c",
+            canonical_name="c",
+            version="3",
+            runtime_deps=[Dependency("e", DepKind.RUNTIME)],
+        )
+        d = make_meta_fn(
+            name="d", canonical_name="d", version="4", runtime_deps=[]
+        )
+        e = make_meta_fn(
+            name="e", canonical_name="e", version="5", runtime_deps=[]
+        )
+        registry = {"b": b, "c": c, "d": d, "e": e}
+        seq_closure, seq_warnings = M.resolve_closure(
+            top, self._builder(registry, tmp_path), workers=1
+        )
+        par_closure, par_warnings = M.resolve_closure(
+            top, self._builder(registry, tmp_path), workers=4
+        )
+        assert par_closure == seq_closure
+        assert par_warnings == seq_warnings
+        assert [m.name for m in par_closure] == ["black", "d", "c", "b", "e"]
+
+    def test_parallel_workers_honor_skip_and_max_depth(
+        self, make_meta_fn, tmp_path
+    ):
+        top = make_meta_fn(
+            runtime_deps=[
+                Dependency("a", DepKind.RUNTIME),
+                Dependency("b", DepKind.RUNTIME),
+            ]
+        )
+        a = make_meta_fn(
+            name="a",
+            canonical_name="a",
+            version="1",
+            runtime_deps=[Dependency("c", DepKind.RUNTIME)],
+        )
+        b = make_meta_fn(
+            name="b", canonical_name="b", version="2", runtime_deps=[]
+        )
+        c = make_meta_fn(
+            name="c", canonical_name="c", version="3", runtime_deps=[]
+        )
+        registry = {"a": a, "b": b, "c": c}
+        closure, warnings = M.resolve_closure(
+            top,
+            self._builder(registry, tmp_path),
+            skip=frozenset({"b"}),
+            max_depth=1,
+            workers=2,
+        )
+        assert closure == [top, a]
+        assert warnings == []
+
+    def test_parallel_closures_run_concurrently(self, make_meta_fn, tmp_path):
+        import threading
+
+        top = make_meta_fn(
+            runtime_deps=[
+                Dependency("a", DepKind.RUNTIME),
+                Dependency("b", DepKind.RUNTIME),
+                Dependency("c", DepKind.RUNTIME),
+            ]
+        )
+        barrier = threading.Barrier(3)
+        active = 0
+        max_active = 0
+        lock = threading.Lock()
+
+        def _parallel_builder(dep):
+            nonlocal active, max_active
+            with lock:
+                active += 1
+                max_active = max(max_active, active)
+            barrier.wait(timeout=5)
+            member = make_meta_fn(
+                name=dep.name,
+                canonical_name=dep.name,
+                version="1",
+                runtime_deps=[],
+            )
+            with lock:
+                active -= 1
+            return member, _sdist_src(tmp_path / f"{dep.name}.tar.gz")
+
+        closure, warnings = M.resolve_closure(top, _parallel_builder, workers=3)
+        assert [m.name for m in closure] == ["black", "a", "b", "c"]
+        assert warnings == []
+        assert max_active >= 2

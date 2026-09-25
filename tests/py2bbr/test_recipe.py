@@ -20,6 +20,9 @@ from py2bbr.model import Dependency, DepKind, YoctoVersion
 from py2bbr.recipe import (
     _classifier_drop_pattern,
     _newer_minor_pattern,
+    build_version_gaps,
+    canonical_name,
+    pick_build_class,
     render_recipe,
     render_recipe_to_path,
 )
@@ -54,6 +57,105 @@ class TestDependsRendersSingleLine:
         text, _ = render_recipe(meta, py2)
         assert 'DEPENDS += "python-hatchling-native"' in text
         assert 'RDEPENDS:${PN} += "python-click python-packaging"' in text
+
+
+class TestToolDepsForKnownBackends:
+    """PEP 517 backends that make pypa/build's --no-isolation check demand
+    non-Python tools must have those tools declared as literal ``-native``
+    DEPENDS (e.g. ``meson-native ninja-native`` for meson-python). Regression:
+    numpy 2.5.3 under PetaLinux aborted at do_compile with "Missing
+    dependencies: meson-python / meson>=1.2.3 / ninja>=1.8.2" because bitbake
+    does not transitively stage a native dependency's own ``-native`` deps into
+    the consuming recipe's sysroot, so the recipe must name them itself.
+    """
+
+    def test_mesonpy_backend_declares_meson_ninja_native(
+        self, make_meta_fn, yocto
+    ):
+        meta = make_meta_fn(
+            build_backend="mesonpy",
+            build_deps=[
+                Dependency(
+                    name="meson-python",
+                    kind=DepKind.BUILD,
+                    requirement="meson-python>=0.18.0",
+                ),
+                Dependency(
+                    name="Cython",
+                    kind=DepKind.BUILD,
+                    requirement="Cython>=3.1.0",
+                ),
+            ],
+        )
+        text, _ = render_recipe(meta, yocto)
+        lines = [l for l in text.splitlines() if l.startswith("DEPENDS")]
+        assert lines == [
+            (
+                'DEPENDS += "python3-meson-python-native python3-cython-native '
+                'meson-native ninja-native"'
+            )
+        ]
+
+    def test_meson_python_backend_name_also_maps(self, make_meta_fn, yocto):
+        meta = make_meta_fn(
+            build_backend="meson-python",
+            build_deps=[
+                Dependency(
+                    name="meson-python",
+                    kind=DepKind.BUILD,
+                    requirement="meson-python>=0.15",
+                ),
+            ],
+        )
+        text, _ = render_recipe(meta, yocto)
+        assert "meson-native ninja-native" in text
+
+    def test_scikit_build_core_declares_cmake_ninja(self, make_meta_fn, yocto):
+        meta = make_meta_fn(
+            build_backend="scikit_build_core",
+            build_deps=[
+                Dependency(
+                    name="scikit-build-core",
+                    kind=DepKind.BUILD,
+                    requirement="scikit-build-core>=0.10",
+                ),
+            ],
+        )
+        text, _ = render_recipe(meta, yocto)
+        lines = [l for l in text.splitlines() if l.startswith("DEPENDS")]
+        assert lines == [
+            'DEPENDS += "python3-scikit-build-core-native cmake-native ninja-native"'
+        ]
+
+    def test_setuptools_backend_adds_no_tool_deps(self, make_meta_fn, yocto):
+        meta = make_meta_fn(
+            build_backend="setuptools.build_meta",
+            build_deps=[
+                Dependency(
+                    name="setuptools",
+                    kind=DepKind.BUILD,
+                    requirement="setuptools>=70",
+                ),
+            ],
+        )
+        text, _ = render_recipe(meta, yocto)
+        assert not any(
+            t in text for t in ("meson-native", "ninja-native", "cmake-native")
+        )
+
+    def test_unknown_backend_adds_no_tool_deps(self, make_meta_fn, yocto):
+        meta = make_meta_fn(
+            build_backend="flit_core.buildapi",
+            build_deps=[
+                Dependency(
+                    name="flit_core",
+                    kind=DepKind.BUILD,
+                    requirement="flit_core>=3.9",
+                ),
+            ],
+        )
+        text, _ = render_recipe(meta, yocto)
+        assert "ninja-native" not in text
 
 
 class TestPypiPackage:
@@ -494,3 +596,222 @@ class TestClassifierPruning:
         ) in pruned
         assert '"Programming Language :: Python :: 3.13"' not in pruned
         assert '"Programming Language :: Python :: 3.14"' not in pruned
+
+
+class TestInstallPrefixOverride:
+    """Every recipe must pin an install ``--prefix``.
+
+    PetaLinux's ``python_pep517_do_install`` runs pypa installer with only
+    ``--destdir=${D}``; installer 0.7.0 then derives its scheme from the
+    *native* python's absolute ``recipe-sysroot-native`` base and pathlib-joins
+    it onto ``${D}``, so the payload lands under
+    ``${D}/output/.../recipe-sysroot-native/...`` and do_package fails with
+    "installed but not shipped" (xmod 1.10.0 under PetaLinux 2024.2).
+    """
+
+    def test_override_emitted_with_relative_prefix(self, meta, yocto):
+        text, _ = render_recipe(meta, yocto)
+        assert "python_pep517_do_install() {" in text
+        assert "--prefix ${prefix}" in text
+        assert "--destdir=${D}" in text
+
+    def test_override_for_every_build_class(self, make_meta_fn, yocto):
+        # setuptools3, python_setuptools_build_meta, python_mesonpy and
+        # python_pep517 all route their install through
+        # python_pep517_do_install.
+        for backend in (
+            "",
+            "setuptools.build_meta",
+            "mesonpy",
+            "flit_core.buildapi",
+        ):
+            meta = make_meta_fn(build_backend=backend)
+            text, _ = render_recipe(meta, yocto)
+            assert "--prefix ${prefix}" in text, backend
+
+    def test_single_override(self, meta, yocto):
+        text, _ = render_recipe(meta, yocto)
+        assert text.count("python_pep517_do_install() {") == 1
+
+
+class TestPep639LicenseNormalize:
+    """String-license normalization for PEP 517 classes.
+
+    blessed 1.50.0's ``license = 'MIT'`` (plus ``license-files = [...]``) makes
+    the native sysroot's flit_core 3.9.0 abort the wheel build with "license
+    field should be <class 'dict'>, not <class 'str'>"; the recipe's
+    do_configure:append rewrites both quote styles to the PEP 621 table form,
+    which every supported backend accepts.
+    """
+
+    def assert_normalized(self, text, label):
+        # double-quote program (external-backend block or the general one)
+        # and the single-quote program, each with even raw-quote counts
+        assert '{text = \\"\\1\\"}' in text, label
+        assert "{text = '\\1'}" in text, label
+
+    def test_pep517_family_normalizes_string_license(self, meta, yocto):
+        text, _ = render_recipe(meta, yocto)
+        self.assert_normalized(text, "hatchling.build")
+
+    def test_all_pep517_classes_get_the_sed(self, make_meta_fn, yocto):
+        for backend in (
+            "hatchling.build",
+            "setuptools.build_meta",
+            "flit_core.buildapi",
+            "mesonpy",
+        ):
+            text, _ = render_recipe(make_meta_fn(build_backend=backend), yocto)
+            self.assert_normalized(text, backend)
+
+    def test_general_sed_also_catches_single_quotes(self, make_meta_fn, yocto):
+        # Adjacent to the external-backend rewrite (double-quote-only), the
+        # quote-agnostic sed must own single-quoted strings too.
+        text, _ = render_recipe(make_meta_fn(build_backend="uv-build"), yocto)
+        self.assert_normalized(text, "uv-build")
+
+    def test_setuptools3_does_not_normalize(self, make_meta_fn, yocto):
+        text, _ = render_recipe(make_meta_fn(build_backend=""), yocto)
+        assert "{text" not in text
+
+
+class TestMesonpyBuildClass:
+    def test_mesonpy_maps_to_python_mesonpy(self):
+        assert pick_build_class("mesonpy") == ("python_mesonpy", False)
+        assert pick_build_class("meson-python") == ("python_mesonpy", False)
+
+    def test_mesonpy_recipe_inherits_python_mesonpy(self, make_meta_fn, yocto):
+        meta = make_meta_fn(
+            build_backend="mesonpy",
+            build_deps=[
+                Dependency(
+                    name="meson-python",
+                    kind=DepKind.BUILD,
+                    requirement="meson-python>=0.18.0,<0.19",
+                    specifier=">=0.18.0,<0.19",
+                ),
+                Dependency(
+                    name="Cython",
+                    kind=DepKind.BUILD,
+                    requirement="Cython>=3.1.0",
+                    specifier=">=3.1.0",
+                ),
+            ],
+        )
+        text, _ = render_recipe(meta, yocto)
+        assert "inherit pypi python_mesonpy" in text
+        # --no-isolation runs the dependency check too, so version bounds in
+        # [build-system] must still be relaxed.
+        assert "\\[build-system\\]" in text
+
+    def test_mesonpy_bounded_requires_emit_relax_block(
+        self, make_meta_fn, yocto
+    ):
+        meta = make_meta_fn(
+            build_backend="mesonpy",
+            build_deps=[
+                Dependency(
+                    name="Cython",
+                    kind=DepKind.BUILD,
+                    requirement="Cython>=3.1.0",
+                    specifier=">=3.1.0",
+                )
+            ],
+        )
+        text, _ = render_recipe(meta, yocto)
+        assert "s/([A-Za-z0-9_.]+)" in text  # version-bound stripping sed
+
+
+class TestBuildVersionGaps:
+    def test_cython_and_meson_python_gaps(self, make_meta_fn, yocto):
+        meta = make_meta_fn(
+            build_deps=[
+                Dependency(
+                    name="Cython",
+                    kind=DepKind.BUILD,
+                    requirement="Cython>=3.1.0,<4",
+                    specifier=">=3.1.0,<4",
+                ),
+                Dependency(
+                    name="meson-python",
+                    kind=DepKind.BUILD,
+                    requirement="meson-python>=0.18.0,<0.19",
+                    specifier=">=0.18.0,<0.19",
+                ),
+            ]
+        )
+        gaps = build_version_gaps(meta, yocto)
+        assert [g.name for g in gaps] == ["Cython", "meson-python"]
+
+    def test_satisfied_requirements_no_gap(self, make_meta_fn, yocto):
+        meta = make_meta_fn(
+            build_deps=[
+                Dependency(
+                    name="flit-core",
+                    kind=DepKind.BUILD,
+                    requirement="flit_core>=3.5",
+                    specifier=">=3.5",
+                ),
+                Dependency(
+                    name="build",
+                    kind=DepKind.BUILD,
+                    requirement="build>=1.1.1",
+                    specifier=">=1.1.1",
+                ),
+            ]
+        )
+        assert build_version_gaps(meta, yocto) == []
+
+    def test_setuptools_and_wheel_exempt(self, make_meta_fn, yocto):
+        # The PEP 517 classes always satisfy them from the sysroot (bounds are
+        # relaxed); provisioning newer ones would churn every build env.
+        meta = make_meta_fn(
+            build_deps=[
+                Dependency(
+                    name="setuptools",
+                    kind=DepKind.BUILD,
+                    requirement="setuptools>=71.0.1",
+                    specifier=">=71.0.1",
+                ),
+                Dependency(
+                    name="wheel",
+                    kind=DepKind.BUILD,
+                    requirement="wheel>=0.43.0",
+                    specifier=">=0.43.0",
+                ),
+            ]
+        )
+        assert build_version_gaps(meta, yocto) == []
+
+    def test_unknown_and_unbounded_no_gap(self, make_meta_fn, yocto):
+        meta = make_meta_fn(
+            build_deps=[
+                Dependency(
+                    name="custom-tool",
+                    kind=DepKind.BUILD,
+                    requirement="custom-tool>=2.0",
+                    specifier=">=2.0",
+                ),
+                Dependency(
+                    name="hatchling",
+                    kind=DepKind.BUILD,
+                    requirement="hatchling",
+                    specifier="",
+                ),
+            ]
+        )
+        assert build_version_gaps(meta, yocto) == []
+
+    def test_gap_compared_by_canonical_name(self, make_meta_fn, yocto):
+        meta = make_meta_fn(
+            build_deps=[
+                Dependency(
+                    name="Cython",
+                    kind=DepKind.BUILD,
+                    requirement="Cython>=3.1.0",
+                    specifier=">=3.1.0",
+                )
+            ]
+        )
+        gaps = build_version_gaps(meta, yocto)
+        assert [canonical_name(g.name) for g in gaps] == ["cython"]

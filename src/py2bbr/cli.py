@@ -14,16 +14,23 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 
 from packaging.requirements import InvalidRequirement, Requirement
 
 from py2bbr import __version__
 from py2bbr.check import DEFAULT_LEVEL, STAGES, run_checks
-from py2bbr.errors import Py2BbrError
+from py2bbr.errors import MetadataNotFoundError, Py2BbrError
 from py2bbr.metadata import PipOptions, build_metadata
 from py2bbr.model import DEFAULT_YOCTO_VERSION
-from py2bbr.recipe import bitbake_pn, recipe_filename, render_recipe_to_path
+from py2bbr.recipe import (
+    bitbake_pn,
+    build_version_gaps,
+    canonical_name,
+    recipe_filename,
+    render_recipe_to_path,
+)
 from py2bbr.yocto import (
     DEFAULT_KAS_VERSION,
     default_layer_name,
@@ -168,6 +175,15 @@ def build_parser() -> argparse.ArgumentParser:
             "dependency closure (escape hatch for distro-provided deps)."
         ),
     )
+    out.add_argument(
+        "--jobs",
+        type=int,
+        default=4,
+        help=(
+            "Number of fetches to run in parallel while resolving the "
+            "dependency closure (1 = sequential)."
+        ),
+    )
 
     yocto = p.add_argument_group("yocto")
     yocto.add_argument(
@@ -263,6 +279,54 @@ def _configure_logging(args) -> None:
         lg.addHandler(handler)
 
 
+class _FetchProgress:
+    """One live progress bar per in-flight fetch on stderr (TTY only).
+
+    Closure fetches run in parallel (``--jobs``); each gets its own rich task
+    row that is removed on completion, so the terminal shows exactly which
+    fetches are still running. Disabled when stderr is not a TTY (pipes,
+    tests) or under ``-q``; every call site stays unconditional and no-ops.
+    """
+
+    def __init__(self, enabled: bool):
+        self._progress = None
+        if enabled:
+            from rich.console import Console
+            from rich.progress import (
+                BarColumn,
+                Progress,
+                TextColumn,
+                TimeElapsedColumn,
+            )
+
+            self._progress = Progress(
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                TimeElapsedColumn(),
+                console=Console(stderr=True),
+                transient=True,
+            )
+
+    def start(self) -> None:
+        if self._progress is not None:
+            self._progress.start()
+
+    def stop(self) -> None:
+        if self._progress is not None:
+            self._progress.stop()
+
+    @contextmanager
+    def fetch(self, requirement: str):
+        if self._progress is None:
+            yield
+            return
+        task_id = self._progress.add_task(f"fetching {requirement}", total=None)
+        try:
+            yield
+        finally:
+            self._progress.remove_task(task_id)
+
+
 def _print_report(
     args, meta, recipe_path, layer_dir, kas_file, warnings, results
 ):
@@ -312,6 +376,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     _configure_logging(args)
+    progress = _FetchProgress(enabled=sys.stderr.isatty() and not args.quiet)
+    progress.start()
 
     try:
         name, version = _parse_package_spec(args.package)
@@ -331,15 +397,16 @@ def main(argv: list[str] | None = None) -> int:
         # 1. Fetch + parse metadata.
         logger.info("fetching %s==%s ...", name, version or "latest")
         workdir = output / ".py2bbr-work"
-        meta, source = build_metadata(
-            name,
-            version,
-            pip_opts,
-            workdir,
-            yocto=yocto,
-            keep=args.keep_sources,
-            check_public=True,
-        )
+        with progress.fetch(f"{name}=={version or 'latest'}"):
+            meta, source = build_metadata(
+                name,
+                version,
+                pip_opts,
+                workdir,
+                yocto=yocto,
+                keep=args.keep_sources,
+                check_public=True,
+            )
         # Path of the artifact each closure member was fetched from, keyed by
         # canonical name: vendored members copy their sdist into the layer.
         closure_sources: dict[str, Path] = {meta.canonical_name: source.path}
@@ -354,16 +421,17 @@ def main(argv: list[str] | None = None) -> int:
             from py2bbr.metadata import resolve_closure
 
             def _builder(req):
-                member, msource = build_metadata(
-                    req.name,
-                    None,
-                    pip_opts,
-                    workdir,
-                    yocto=yocto,
-                    keep=args.keep_sources,
-                    requirement=req.requirement,
-                    check_public=True,
-                )
+                with progress.fetch(req.requirement):
+                    member, msource = build_metadata(
+                        req.name,
+                        None,
+                        pip_opts,
+                        workdir,
+                        yocto=yocto,
+                        keep=args.keep_sources,
+                        requirement=req.requirement,
+                        check_public=True,
+                    )
                 closure_sources[member.canonical_name] = msource.path
                 return member, msource
 
@@ -372,8 +440,64 @@ def main(argv: list[str] | None = None) -> int:
                 _builder,
                 skip=frozenset(args.skip_dep),
                 max_depth=args.max_depth,
+                workers=max(1, args.jobs),
             )
         logger.info("closure: %d package(s) resolved", len(closure))
+
+        # Build-backend version-gap provisioning: when a build-system bound
+        # demands a newer tool than the target series' native sysroot ships
+        # (numpy 2.5.3 wants Cython>=3.1.0; Scarthgap has 3.0.8), render a
+        # recipe of the newer tool into the layer so the layer builds it
+        # itself instead of failing the --no-isolation dependency check.
+        gaps = [
+            dep
+            for member in list(closure)
+            for dep in build_version_gaps(member, yocto)
+        ]
+        if not (args.with_deps and not args.no_layer):
+            for dep in gaps:
+                warnings_extra.append(
+                    f"{dep.name}: build-system.requires demands {dep.requirement}, "
+                    "newer than the target Yocto's native sysroot ships; no "
+                    "layer is generated to hold a newer recipe (use --with-deps)."
+                )
+        else:
+            for dep in gaps:
+                if canonical_name(dep.name) in {
+                    canonical_name(m.name) for m in closure
+                }:
+                    continue
+                logger.info(
+                    "provisioning %s (sysroot of %s ships an older build dep)",
+                    dep.name,
+                    yocto.label,
+                )
+                try:
+                    with progress.fetch(dep.requirement):
+                        member, msource = build_metadata(
+                            dep.name,
+                            None,
+                            pip_opts,
+                            workdir,
+                            yocto=yocto,
+                            keep=args.keep_sources,
+                            requirement=dep.requirement,
+                            check_public=True,
+                        )
+                except MetadataNotFoundError as exc:
+                    warnings_extra.append(
+                        f"could not provision {dep.name}: {exc}"
+                    )
+                    continue
+                closure.append(member)
+                closure_sources[member.canonical_name] = msource.path
+            if gaps:
+                warnings_extra.append(
+                    "provisioned newer build-backend recipe(s) into the layer "
+                    "(the sysroot ships older than build-system.requires "
+                    "demands): "
+                    + ", ".join(sorted(canonical_name(g.name) for g in gaps))
+                )
 
         # 2. Render + write the recipe (and optionally a full layer).
         layer_name = args.layer_name or default_layer_name(meta.canonical_name)
@@ -483,6 +607,8 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         print("interrupted", file=sys.stderr)
         return 130
+    finally:
+        progress.stop()
 
 
 if __name__ == "__main__":

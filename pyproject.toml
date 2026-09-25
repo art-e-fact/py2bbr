@@ -34,6 +34,10 @@ classifiers = [
 dependencies = [
     "packaging>=23.2",
     "PyYAML>=6.0.1",
+    # rich renders the per-fetch progress bars during parallel dependency
+    # closure resolution (one live row per in-flight fetch, removed on
+    # completion; bars are disabled off-TTY and under -q).
+    "rich>=13.0",
     # kas is used to (a) validate the generated kas build file against the
     # official kas JSON schema and (b) drive the optional `--check build`
     # stage. Guarded at import time so core recipe generation degrades

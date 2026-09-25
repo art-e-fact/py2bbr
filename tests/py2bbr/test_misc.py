@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import io
+import tarfile
+
 import pytest
 
 import py2bbr
 from py2bbr import recipe
 from py2bbr.errors import SubprocessError
-from py2bbr.model import Dependency, DepKind
+from py2bbr.metadata import FetchedSource, parse_metadata_file
+from py2bbr.model import Dependency, DepKind, SourceKind
 
 
 class TestSubprocessError:
@@ -97,3 +101,63 @@ class TestRecipeEdges:
         )
         with pytest.raises(ValueError, match="vendor_source"):
             recipe.render_recipe_to_path(meta, yocto, tmp_path / "out")
+
+
+class TestParseMetadataFileRootLevel:
+    """Regression: flit_core 3.12 vendors ``vendor/tomli-1.2.3.dist-info/
+    METADATA`` *before* its own root ``PKG-INFO`` in the sdist; an archive-
+    member-order scan picked the vendored metadata and recipe generation
+    produced a bogus ``python3-tomli_1.2.3.bb`` (with flit_core's sha256) for
+    the flit_core fetch. Only the root-level metadata may describe the source.
+    """
+
+    def _source(self, tmp_path) -> FetchedSource:
+        tar = tmp_path / "pkg-1.0.0.tar.gz"
+        with tarfile.open(tar, "w:gz") as tf:
+            info = tarfile.TarInfo(
+                "pkg-1.0.0/pkg/vendor/evil-1.2.3.dist-info/METADATA"
+            )
+            data = (
+                b"Metadata-Version: 2.1\nName: evil\nVersion: 1.2.3\n"
+                b"Summary: vendored\n"
+            )
+            info.size = len(data)
+            tf.addfile(info, io.BytesIO(data))
+            info = tarfile.TarInfo("pkg-1.0.0/PKG-INFO")
+            root = (
+                b"Metadata-Version: 2.1\nName: the-real-pkg\nVersion: 1.0.0\n"
+                b"Summary: root\n"
+            )
+            info.size = len(root)
+            tf.addfile(info, io.BytesIO(root))
+        return FetchedSource(tar, SourceKind.SDIST, "sha", tar.name)
+
+    def test_root_pkg_info_wins_over_vendored_metadata(self, tmp_path):
+        msg = parse_metadata_file(self._source(tmp_path))
+        assert msg["Name"] == "the-real-pkg"
+        assert msg["Version"] == "1.0.0"
+
+    def test_archive_order_does_not_matter(self, tmp_path):
+        tar = tmp_path / "pkg-2.0.0.tar.gz"
+        with tarfile.open(tar, "w:gz") as tf:
+            root = (
+                b"Metadata-Version: 2.1\nName: the-real-pkg\nVersion: 2.0.0\n"
+                b"Summary: root\n"
+            )
+            info = tarfile.TarInfo("pkg-2.0.0/PKG-INFO")
+            info.size = len(root)
+            tf.addfile(info, io.BytesIO(root))
+            vendored = (
+                b"Metadata-Version: 2.1\nName: evil\nVersion: 9.9.9\n"
+                b"Summary: vendored\n"
+            )
+            info = tarfile.TarInfo(
+                "pkg-2.0.0/pkg/vendor/evil-9.9.9.dist-info/METADATA"
+            )
+            info.size = len(vendored)
+            tf.addfile(info, io.BytesIO(vendored))
+        msg = parse_metadata_file(
+            FetchedSource(tar, SourceKind.SDIST, "sha", tar.name)
+        )
+        assert msg["Name"] == "the-real-pkg"
+        assert msg["Version"] == "2.0.0"

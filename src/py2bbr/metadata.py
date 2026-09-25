@@ -244,6 +244,29 @@ def _sdist_reachable(url: str, timeout: float = 5.0) -> bool:
         return False
 
 
+def _warn_sdist_unavailable(
+    requirement: str, proc: subprocess.CompletedProcess[str]
+) -> None:
+    """Log why the sdist attempt produced no artifact, before wheel fallback.
+
+    pip downloads an sdist by preparing its PEP 517 metadata in an isolated
+    build env, which can fail for environmental reasons (e.g. ``ENOSPC`` on a
+    full ``/tmp``) even though the sdist exists on the index. A wheel-based
+    recipe then silently loses ``[build-system]`` detection (backend,
+    build deps, bounds-relax), so the pip diagnostics must not be dropped.
+    """
+    tail = "\n".join(
+        f"  {line}"
+        for line in (proc.stderr or proc.stdout or "").strip().splitlines()[-6:]
+    )
+    logger.warning(
+        "%s: sdist fetch failed; falling back to wheel (recipe loses "
+        "[build-system] detection). pip said:\n%s",
+        requirement,
+        tail or "  (no pip diagnostics)",
+    )
+
+
 def fetch_source(
     name: str,
     version: str | None,
@@ -285,8 +308,10 @@ def fetch_source(
     proc = _run_pip_download(requirement, dest, pip_opts, "--no-binary=:all:")
     artifact = _pick_artifact(dest, prefer_sdist=True)
     if artifact is None:
-        # Fall back to wheel (sdist-only metadata not available).
-        _run_pip_download(requirement, dest, pip_opts, "--only-binary=:all:")
+        _warn_sdist_unavailable(requirement, proc)
+        proc = _run_pip_download(
+            requirement, dest, pip_opts, "--only-binary=:all:"
+        )
         artifact = _pick_artifact(dest, prefer_sdist=False)
     if artifact is None:
         tail = (proc.stderr or proc.stdout or "").strip().splitlines()[-6:]
@@ -364,8 +389,16 @@ def parse_metadata_file(source: FetchedSource) -> email.message.Message:
     """Parse the core metadata (PKG-INFO or METADATA) of a source artifact."""
 
     def is_metadata(name: str) -> bool:
+        # Root-level only (zero or one directory prefix), the same convention
+        # ``read_build_system`` / ``find_license_file`` use: an sdist can
+        # vendor other packages' dist-info (flit_core 3.12 vendors a
+        # ``flit_core/vendor/tomli-1.2.3.dist-info/METADATA`` that sorts ahead
+        # of the package's own root ``PKG-INFO`` inside the archive), and
+        # the archive member order must not decide which package's metadata
+        # this source artifact describes.
+        depth = name.count("/") - (1 if name.startswith("./") else 0)
         base = name.rsplit("/", 1)[-1]
-        return base == "PKG-INFO" or base == "METADATA"
+        return (base == "PKG-INFO" or base == "METADATA") and depth <= 1
 
     found = _read_text_from_archive(source.path, is_metadata)
     if found is None:
@@ -787,6 +820,7 @@ def resolve_closure(
     *,
     skip: frozenset[str] = frozenset(),
     max_depth: int | None = None,
+    workers: int = 1,
 ) -> tuple[list[PackageMetadata], list[str]]:
     """Resolve the transitive **runtime** closure of ``top``.
 
@@ -795,6 +829,12 @@ def resolve_closure(
     intact, e.g. ``tomli>=1.0.2``) passed through verbatim so upstream
     bounds are honoured when picking versions.
 
+    With ``workers > 1`` the members of each BFS level are fetched in
+    parallel through one shared thread pool; ``executor.map`` preserves input
+    order, so the closure is identical to a sequential run. ``builder`` must
+    be thread-safe — the fetch path already is: every call downloads into its
+    own fresh subdirectory of ``workdir``.
+
     Returns ``(closure, warnings)`` with ``closure[0]`` == ``top`` (top
     recipe stays the kas target; bitbake follows RDEPENDS transitively).
     Members are deduplicated by canonical name (cycle-safe); ``skip`` is a set
@@ -802,29 +842,43 @@ def resolve_closure(
     distro-provided packages, e.g. ``numpy``); ``max_depth`` limits recursion
     depth (``None`` = unlimited).
     """
-    from collections import deque
+    from concurrent.futures import ThreadPoolExecutor
 
     visited: set[str] = {_canonical(top.name)}
     skipped: set[str] = set()
     closure: list[PackageMetadata] = [top]
-    queue: deque[tuple[PackageMetadata, int]] = deque([(top, 0)])
     warnings: list[str] = []
 
-    while queue:
-        meta, depth = queue.popleft()
-        if max_depth is not None and depth >= max_depth:
-            continue
-        for dep in meta.runtime_deps:
-            canonical = _canonical(dep.name)
-            if canonical in visited:
-                continue
-            if canonical in skip:
-                skipped.add(canonical)
-                continue
-            visited.add(canonical)
-            member, _source = builder(dep)
-            closure.append(member)
-            queue.append((member, depth + 1))
+    frontier: list[tuple[PackageMetadata, int]] = [(top, 0)]
+    pool = ThreadPoolExecutor(max_workers=workers) if workers > 1 else None
+    try:
+        while frontier:
+            depth = frontier[0][1]
+            if max_depth is not None and depth >= max_depth:
+                break
+            batch: list[Dependency] = []
+            for meta, _depth in frontier:
+                for dep in meta.runtime_deps:
+                    canonical = _canonical(dep.name)
+                    if canonical in visited:
+                        continue
+                    if canonical in skip:
+                        skipped.add(canonical)
+                        continue
+                    visited.add(canonical)
+                    batch.append(dep)
+            if not batch:
+                break
+            if pool is not None:
+                fetched = list(pool.map(builder, batch))
+            else:
+                fetched = [builder(dep) for dep in batch]
+            members = [member for member, _source in fetched]
+            closure.extend(members)
+            frontier = [(member, depth + 1) for member in members]
+    finally:
+        if pool is not None:
+            pool.shutdown(wait=True)
 
     for canonical in sorted(skip):
         if canonical not in visited and canonical not in skipped:
