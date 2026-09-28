@@ -179,6 +179,13 @@ class PackageMetadata:
     requires_python: str = ""
     #: ``Project-URL`` entries as ``(label, url)``.
     project_urls: list[tuple[str, str]] = field(default_factory=list)
+    #: Where ``build_backend`` came from: ``""`` for the package's own
+    #: ``pyproject.toml``, or a provenance label like
+    #: ``github.com/vizion/pyvizionsdk@pyproject.toml`` when the wheel shipped
+    #: none and it was read from the upstream repository instead. Empty means
+    #: the artifact did not say and no source could be reached, so the backend
+    #: is the implicit-setuptools default rather than a finding.
+    build_backend_source: str = ""
 
     # --- source artifact -------------------------------------------------
     source_kind: SourceKind = SourceKind.SDIST
@@ -206,6 +213,14 @@ class PackageMetadata:
     #: Build-config lines that hard-code an x86 assumption (``-march=native``,
     #: ``avx2``, ``x86_64``), i.e. code that may not compile for ARM.
     host_assumptions: list[str] = field(default_factory=list)
+    #: True when the artifact is a wheel whose tag admits prebuilt,
+    #: architecture-specific binaries (so it carries already-stripped ELF
+    #: objects). Bitbake's ``already-stripped`` QA check is a fatal error on
+    #: those, and a recipe that only unpacks cannot undo the strip, so the
+    #: generated recipe waives it - see :data:`py2bbr.recipe._WHEEL_QA_SKIP`.
+    #: False for a pure-Python (``py3-none-any``) wheel and for every sdist,
+    #: which bitbake compiles and strips itself.
+    ships_prebuilt_binaries: bool = False
 
     # --- dependencies ----------------------------------------------------
     runtime_deps: list[Dependency] = field(default_factory=list)

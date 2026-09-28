@@ -403,9 +403,22 @@ def evaluate(
                 f"{driver}, or the image gets {report.build_host} binaries"
             )
     else:
-        report.notes.append(
-            f"pure-Python sdist: {build_class} produces host-independent wheels"
-        )
+        # The note answers "why is nothing a compile problem here?", and the
+        # noun has to match the artifact: an sdist is compiled into a wheel, a
+        # py3-none-any wheel is already a finished artifact, and a wheel pinned
+        # to a machine was described above (the note can then only contradict
+        # it by claiming the payload is pure Python).
+        if meta.source_kind.value == "wheel":
+            if not wheel_arch and not foreign_os:
+                report.notes.append(
+                    "platform-independent wheel: it installs as shipped, so "
+                    "no compilation happens for any target"
+                )
+        else:
+            report.notes.append(
+                f"pure-Python sdist: {build_class} produces host-independent "
+                "wheels"
+            )
     if meta.machine_deps:
         names = ", ".join(sorted(d.name for d in meta.machine_deps))
         report.notes.append(

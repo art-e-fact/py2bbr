@@ -1786,13 +1786,14 @@ class TestVendoredWheelRecipe:
     """
 
     def _wheel_meta(self, make_meta_fn, **overrides):
-        return make_meta_fn(
-            source_kind=SourceKind.WHEEL,
-            source_filename="pyvizionsdk-26.9.1-py3-none-any.whl",
-            source_sha256="a" * 64,
-            vendored=True,
-            **overrides,
-        )
+        fields = {
+            "source_kind": SourceKind.WHEEL,
+            "source_filename": "pyvizionsdk-26.9.1-py3-none-any.whl",
+            "source_sha256": "a" * 64,
+            "vendored": True,
+        }
+        fields.update(overrides)
+        return make_meta_fn(**fields)
 
     def test_does_not_inherit_pypi_or_set_s(self, make_meta_fn, yocto):
         # Both are fatal in the wheel shape: the pypi fetch URL is derived from
@@ -1877,6 +1878,42 @@ class TestVendoredWheelRecipe:
     def test_warns_about_the_artifact_shape(self, make_meta_fn, yocto):
         _, warnings = render_recipe(self._wheel_meta(make_meta_fn), yocto)
         assert any("no source distribution" in w for w in warnings)
+
+    def test_waives_already_stripped_only_for_prebuilt_wheels(
+        self, make_meta_fn, yocto
+    ):
+        # The reported do_package failure: a wheel's extension modules arrive
+        # already stripped, and bitbake fails the build with the fatal QA error
+        # "already-stripped". The recipe waives it - but only when the wheel's
+        # tag admits prebuilt binaries, so a pure-Python wheel keeps the check.
+        text, warnings = render_recipe(self._wheel_meta(make_meta_fn), yocto)
+        assert "already-stripped" not in text
+        assert not any("already-stripped" in w for w in warnings)
+        meta = self._wheel_meta(
+            make_meta_fn,
+            source_filename=(
+                "pyvizionsdk-26.9.1-cp312-cp312-manylinux_2_31_aarch64.whl"
+            ),
+            ships_prebuilt_binaries=True,
+        )
+        text, warnings = render_recipe(meta, yocto)
+        assert 'INSANE_SKIP:${PN} = "already-stripped"' in text
+        assert any("already-stripped QA check" in w for w in warnings)
+
+    def test_warns_where_the_recovered_backend_came_from(
+        self, make_meta_fn, yocto
+    ):
+        # A wheel carries no build config; when it was read from the project's
+        # repository, the recipe says so - that answer describes the default
+        # branch, not necessarily this release.
+        meta = self._wheel_meta(
+            make_meta_fn,
+            build_backend="mesonpy",
+            build_backend_source="github.com/vizion/pyvizionsdk@pyproject.toml",
+        )
+        _, warnings = render_recipe(meta, yocto)
+        assert any("default branch" in w for w in warnings)
+        assert any("github.com/vizion/pyvizionsdk" in w for w in warnings)
 
     def test_names_the_runtime_the_wheel_must_match(self, make_meta_fn, yocto):
         # A vendored wheel is a build product for one exact Python ABI *and*

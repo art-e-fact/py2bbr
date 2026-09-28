@@ -945,6 +945,46 @@ do_install() {
 }
 """
 
+#: QA skip for a vendored wheel's prebuilt binaries.
+#:
+#: A wheel is shipped already stripped: cibuildwheel/auditwheel strip the
+#: extension modules and the bundled ``*.libs/*.so*`` as part of producing the
+#: artifact, so upstream never has to decide between "small wheel" and
+#: "recoverable debug symbols". Bitbake finds those stripped ELF files in
+#: ``${D}``, and ``already-stripped`` is a hard QA *error* in ``do_package``:
+#:
+#:   * ``staging.bbclass:sysroot_strip`` warns once per file, because the
+#:     sysroot cannot gain a debuglink either;
+#:   * ``oe.package.process_split_and_strip_files`` then fails the build with
+#:     ``QA Issue: File '.../pyVizionSDK.cpython-312-aarch64-linux-gnu.so' was
+#:     already stripped, this will prevent future debugging! [already-stripped]``
+#:     and, since fatal errors abort the task, nothing after it runs.
+#:
+#: There is no recipe-side way to undo the strip (it is upstream's decision, and
+#: the debug information is simply not in the file), so the check has to be
+#: waived - which is exactly what the QA framework consults this variable for,
+#: and what poky's own recipes do for prebuilt binaries
+#: (``python3-uv-build``, ``python3-packaging``, ``linux-firmware``).
+#:
+#: The trade is stated rather than hidden: no ``-dbg`` package, and no debug
+#: symbols for anything the extension modules call into. That is already the
+#: situation on the target, so waiving the check changes the build's outcome
+#: from *failed* to *as good as the artifact allows*.
+#:
+#: Scoped to ``${PN}``: the same QA run also covers the ``-dbg``/``-static``
+#: variants, but the check reads ``INSANE_SKIP:${PN}``, and adding a blanket
+#: ``INSANE_SKIP`` would waive checks for the *other* packages in this layer.
+_WHEEL_QA_SKIP = """\
+# The wheel ships prebuilt binaries that upstream already stripped (the
+# extension modules and the vendored *.libs/*.so* an auditwheel build renames
+# and strips), so there are no symbols for do_strip to extract and -dbg
+# packages to build. do_package treats that as the fatal QA error
+# "already-stripped"; nothing in this recipe can undo it, so the check is
+# waived for this package only - the same waiver poky's own recipes apply to
+# prebuilt binaries (python3-uv-build, linux-firmware).
+INSANE_SKIP:${PN} = "already-stripped"
+"""
+
 
 def _render_wheel_recipe(
     meta: PackageMetadata, yocto: YoctoVersion
@@ -1006,6 +1046,12 @@ def _render_wheel_recipe(
 
     lines.append(_WHEEL_INSTALL.rstrip())
     lines.append("")
+    # Every ELF in a vendored wheel came from upstream already stripped: this
+    # recipe unpacks, it never links. See _WHEEL_QA_SKIP for why that has to
+    # waive the QA check rather than be left to fail do_package.
+    if meta.ships_prebuilt_binaries:
+        lines.append(_WHEEL_QA_SKIP.rstrip())
+        lines.append("")
     lines.append('BBCLASSEXTEND = "native nativesdk"')
     lines.append("")
     lines.append(
@@ -1033,6 +1079,27 @@ def _render_wheel_recipe(
         f"only works while the target stays {yocto.runtime_label} and the "
         "wheel's tags match; publish an sdist if the target ever moves."
     )
+    if meta.build_backend_source:
+        # The backend is the one number that decides whether a from-source
+        # rebuild is worth attempting, and for a wheel there is no other source
+        # for it. Naming the provenance keeps it from being read as the
+        # release's own declaration.
+        warnings.append(
+            f"{meta.canonical_name} {meta.version}: the wheel carries no build "
+            f"config, so [build-system] was read from "
+            f"{meta.build_backend_source} - the project's default branch, which "
+            "describes the project today and not necessarily this release. If "
+            "upstream migrated its backend after the tag, this names the wrong "
+            "one; an sdist would settle it."
+        )
+    if meta.ships_prebuilt_binaries:
+        warnings.append(
+            f"{meta.canonical_name} {meta.version}: the wheel ships prebuilt "
+            "binaries that upstream already stripped, so the recipe waives "
+            "bitbake's fatal already-stripped QA check and no -dbg package is "
+            "produced. The symbols are not in the artifact; only a from-source "
+            "build can restore them."
+        )
     return "\n".join(lines), warnings
 
 

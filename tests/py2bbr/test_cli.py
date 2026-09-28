@@ -199,6 +199,63 @@ class TestMain:
         assert (out / "meta-black" / "conf" / "layer.conf").is_file()
         assert (out / "py2bbr.kas.yml").is_file()
 
+    def test_wheel_report_and_recipe_waive_the_strip_check(
+        self, tmp_path, monkeypatch, capsys, make_meta_fn
+    ):
+        # A vendored wheel carries no build config, so build_metadata read
+        # [build-system] from the project's repository; the report says where
+        # the answer came from instead of letting it read as the release's own
+        # declaration. And upstream shipped the extension modules already
+        # stripped, so the recipe waives bitbake's fatal already-stripped QA
+        # check - the reported do_package failure for pyvizionsdk.
+        meta = make_meta_fn(
+            name="pyvizionsdk",
+            canonical_name="pyvizionsdk",
+            version="26.9.1",
+            homepage="",
+            project_urls=[],
+            source_kind=SourceKind.WHEEL,
+            source_filename=(
+                "pyvizionsdk-26.9.1-cp312-cp312-manylinux_2_31_aarch64.whl"
+            ),
+            vendored=True,
+            ships_prebuilt_binaries=True,
+            build_backend="mesonpy",
+            build_backend_source="github.com/vizion/pyvizionsdk@pyproject.toml",
+        )
+        src_path = tmp_path / meta.source_filename
+        src_path.write_bytes(b"wheel payload")
+        src = FetchedSource(
+            src_path, SourceKind.WHEEL, "sha", meta.source_filename
+        )
+        monkeypatch.setattr(
+            cli, "build_metadata", _fake_build_metadata(meta, src)
+        )
+        rc = cli.main(
+            [
+                "pyvizionsdk",
+                "-o",
+                str(tmp_path / "out"),
+                "--check",
+                "structural",
+            ]
+        )
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "Build backend: mesonpy" in out
+        assert "(read from github.com/vizion/pyvizionsdk@pyproject.toml)" in out
+        assert "waives bitbake's fatal already-stripped QA check" in out
+        recipe = (
+            tmp_path
+            / "out"
+            / "meta-pyvizionsdk"
+            / "recipes-devtools"
+            / "python"
+            / "python3-pyvizionsdk_26.9.1.bb"
+        )
+        assert recipe.is_file()
+        assert 'INSANE_SKIP:${PN} = "already-stripped"' in recipe.read_text()
+
     def test_no_layer_quiet_keep_sources(
         self, tmp_path, monkeypatch, meta, capsys
     ):

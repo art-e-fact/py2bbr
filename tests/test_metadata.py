@@ -242,6 +242,27 @@ def _sdist_src(p: Path) -> FetchedSource:
     return FetchedSource(p, SourceKind.SDIST, "sha", p.name)
 
 
+#: Metadata for a wheel-only package whose repository is known. There is no
+#: sdist, so build_metadata has to read [build-system] from the repository.
+_WHEEL_META = """\
+Metadata-Version: 2.4
+Name: pyvizionsdk
+Version: 26.9.1
+Summary: A SDK that publishes only a binary wheel.
+Requires-Python: >=3.10
+Project-URL: Repository, https://github.com/vizion/pyvizionsdk
+"""
+
+
+def _wheel_src(tmp_path: Path, metadata: str = _WHEEL_META) -> FetchedSource:
+    """A stub for a vendored wheel: payload plus ``.dist-info/METADATA``."""
+    p = tmp_path / "pyvizionsdk-26.9.1-cp312-cp312-manylinux_2_31_aarch64.whl"
+    with zipfile.ZipFile(p, "w") as zf:
+        zf.writestr("pyvizionsdk/__init__.py", "")
+        zf.writestr("pyvizionsdk-26.9.1.dist-info/METADATA", metadata)
+    return FetchedSource(p, SourceKind.WHEEL, "sha", p.name)
+
+
 _FULL_MEMBERS = {
     "black-26.5.1/PKG-INFO": _PKG_INFO,
     "black-26.5.1/pyproject.toml": _PYPROJECT,
@@ -655,8 +676,11 @@ class TestArchiveReading:
         assert M.read_build_system(src) == ("", [])
 
     def test_build_system_no_pyproject(self, tmp_path):
+        # None, not ("", []): the artifact says nothing about its build system,
+        # which is what tells build_system_from_vcs the wheel case apart from an
+        # upstream that affirmatively means implicit setuptools.
         src = _sdist_src(_sdist(tmp_path, {"black-26.5.1/PKG-INFO": _PKG_INFO}))
-        assert M.read_build_system(src) == ("", [])
+        assert M.read_build_system(src) is None
 
     def test_build_system_nested_fallback(self, tmp_path):
         src = _sdist_src(
@@ -689,7 +713,9 @@ class TestArchiveReading:
         assert M.parse_metadata_file(src)["Version"] == "26.5.1"
         name, _md5 = M.find_license_file(src)
         assert name == "LICENSE"
-        assert M.read_build_system(src) == ("", [])
+        # A wheel is a build product: it has no pyproject.toml at all, which is
+        # exactly the case build_system_from_vcs is asked to cover.
+        assert M.read_build_system(src) is None
 
     def test_no_metadata_raises(self, tmp_path):
         p = tmp_path / "x.tar.gz"
@@ -1820,3 +1846,342 @@ class TestTargetArchitecturePinned:
         assert "--python-version 3.12" in message
         assert "--platform" not in message
         assert "carries nothing for aarch64" in message
+
+
+class TestWheelShipsPrebuiltBinaries:
+    """Whether a recipe must waive bitbake's fatal already-stripped QA check.
+
+    The reported failure: a wheel recipe for pyvizionsdk failed do_package with
+    ``QA Issue: File '.../pyVizionSDK.cpython-312-aarch64-linux-gnu.so' was
+    already stripped, this will prevent future debugging! [already-stripped]``.
+    Upstream strips the wheel before upload, so the check has to be waived - but
+    only where it would fire, or a pure-Python wheel recipe disables a check for
+    a file it does not ship.
+    """
+
+    def test_platform_tag_admits_prebuilt_binaries(self):
+        # What the failing case looks like: an extension-module wheel for one
+        # ABI and one CPU, plus an auditwheel sidecar set beside it.
+        assert M.wheel_ships_prebuilt_binaries(
+            "pyvizionsdk-26.9.1-cp312-cp312-manylinux_2_31_aarch64.whl"
+        )
+
+    @pytest.mark.parametrize(
+        "filename",
+        [
+            "black-26.5.1-py3-none-any.whl",
+            "packaging-26.3-py3-none-any.whl",
+        ],
+    )
+    def test_pure_python_wheel_keeps_the_check(self, filename):
+        # ``any`` is the promise that the payload is pure Python, so no ELF can
+        # be inside and the check must stay on.
+        assert not M.wheel_ships_prebuilt_binaries(filename)
+
+    def test_stable_abi_wheel_on_a_foreign_cpu(self):
+        # abi3 wheels are interpreter-portable but still CPU-specific.
+        assert M.wheel_ships_prebuilt_binaries(
+            "foo-1.0-cp38-abi3-manylinux_2_17_x86_64.whl"
+        )
+
+    def test_unparsable_name_keeps_the_check(self):
+        # Better to fail the build loudly on a name the tooling cannot classify
+        # than to waive a check that would have caught a real problem.
+        assert not M.wheel_ships_prebuilt_binaries("not-a-wheel.txt")
+        assert not M.wheel_ships_prebuilt_binaries("")
+
+
+class TestVcsBuildSystem:
+    """Recovering [build-system] from the repository when no sdist exists.
+
+    A wheel carries no build config, so without this every wheel-only package is
+    reported as an implicit setuptools build - a guess, and a wrong one for
+    exactly the packages that have moved to another backend.
+    """
+
+    @staticmethod
+    def _serve(monkeypatch, body: bytes | None, *, seen: list | None = None):
+        """Replace the network with a one-URL answer, recording the request."""
+
+        def fake(url, timeout):
+            if seen is not None:
+                seen.append(url)
+            return body
+
+        monkeypatch.setattr(M, "_fetch_bytes", fake)
+
+    def test_backend_is_read_from_the_project_repository(self, monkeypatch):
+        self._serve(
+            monkeypatch,
+            b'[build-system]\nrequires = ["meson-python>=0.13"]\n'
+            b'build-backend = "mesonpy"\n',
+        )
+        found = M.build_system_from_vcs(
+            [("Source", "https://github.com/vizion/pyvizionsdk")],
+        )
+        assert found == (
+            "mesonpy",
+            ["meson-python>=0.13"],
+            "github.com/vizion/pyvizionsdk@pyproject.toml",
+        )
+
+    def test_url_shapes_all_reduce_to_the_repository(self, monkeypatch):
+        # The metadata carries whatever shape the packager typed: a bare URL, a
+        # .git clone URL, a VCS requirement with an #egg fragment, or a deep
+        # link into one subdirectory. All four name the same repo.
+        seen: list[str] = []
+        self._serve(
+            monkeypatch,
+            b'[build-system]\nbuild-backend = "hatchling.build"\n',
+            seen=seen,
+        )
+        for url in (
+            "https://github.com/o/r",
+            "https://github.com/o/r.git",
+            "git+https://github.com/o/r.git@v1.0#egg=r",
+            "https://github.com/o/r/tree/main/sub/pkg",
+        ):
+            assert M.build_system_from_vcs([("Repository", url)]) is not None
+        assert (
+            seen
+            == ["https://raw.githubusercontent.com/o/r/HEAD/pyproject.toml"] * 4
+        )
+
+    def test_forged_host_is_not_read_as_the_real_forge(self, monkeypatch):
+        # A host that merely *ends* with github.com is someone else's server.
+        # Reading its file would silently report a build system the user never
+        # pointed py2bbr at.
+        assert M._vcs_repo("https://github.com.evil.example/o/r") is None
+        assert M._vcs_repo("https://notgithub.example/o/r") is None
+
+    def test_non_repository_paths_are_rejected(self):
+        # No netloc at all, and a forge root with a single segment: neither is
+        # a repository, so neither can name a raw-file endpoint.
+        assert M._vcs_repo("") is None
+        assert M._vcs_repo("https://github.com/just-owner") is None
+        assert M._vcs_repo("https://github.com") is None
+
+    @pytest.mark.parametrize(
+        ("url", "raw"),
+        [
+            (
+                "https://github.com/o/r",
+                "https://raw.githubusercontent.com/o/r/HEAD/pyproject.toml",
+            ),
+            (
+                "https://gitlab.com/g/o/r",
+                "https://gitlab.com/g/o/r/-/raw/HEAD/pyproject.toml",
+            ),
+            (
+                "https://bitbucket.org/o/r",
+                "https://bitbucket.org/o/r/raw/HEAD/pyproject.toml",
+            ),
+            (
+                "https://github.com/o/r/tree/main/sub",
+                "https://raw.githubusercontent.com/o/r/HEAD/pyproject.toml",
+            ),
+        ],
+    )
+    def test_forge_urls_map_to_their_raw_endpoint(self, monkeypatch, url, raw):
+        seen: list[str] = []
+        self._serve(
+            monkeypatch,
+            b'[build-system]\nbuild-backend = "hatchling.build"\n',
+            seen=seen,
+        )
+        assert M.build_system_from_vcs([("Repository", url)]) is not None
+        assert seen == [raw]
+
+    def test_fetch_bytes_network_calls(self, monkeypatch):
+        # The one piece of real HTTP in this feature: a 2xx body is returned,
+        # and anything else (a 404, a connection failure) is None - never an
+        # exception from the build-metadata path.
+        import urllib.error
+        import urllib.request
+
+        class _Response:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def read(self):
+                return b"pyproject"
+
+        def ok(request, timeout):
+            sent["url"] = request.full_url
+            return _Response()
+
+        sent: dict[str, str] = {}
+        monkeypatch.setattr(urllib.request, "urlopen", ok)
+        url = "https://raw.githubusercontent.com/o/r/HEAD/pyproject.toml"
+        assert M._fetch_bytes(url, 0.1) == b"pyproject"
+        assert sent["url"] == url
+
+        class _404:
+            status = 404
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def read(self):
+                raise AssertionError("must not read a 404 body")
+
+        monkeypatch.setattr(urllib.request, "urlopen", lambda r, **kw: _404())
+        assert M._fetch_bytes(url, 0.1) is None
+
+        def down(request, timeout):
+            raise urllib.error.URLError("connection refused")
+
+        monkeypatch.setattr(urllib.request, "urlopen", down)
+        assert M._fetch_bytes(url, 0.1) is None
+
+    def test_self_hosted_forge_is_skipped(self, monkeypatch):
+        seen: list[str] = []
+        self._serve(monkeypatch, b"x", seen=seen)
+        # The raw-file layout of a private Gitea/Gogs is not a fixed contract, so
+        # a URL is not guessed for it - better to report "unknown" than to 404.
+        assert (
+            M.build_system_from_vcs([("Repo", "https://git.corp/o/r")]) is None
+        )
+        assert seen == []
+
+    def test_labelled_url_beats_a_homepage_that_only_looks_like_a_repo(
+        self, monkeypatch
+    ):
+        seen: list[str] = []
+        self._serve(
+            monkeypatch,
+            b'[build-system]\nbuild-backend = "flit_core.buildapi"\n',
+            seen=seen,
+        )
+        M.build_system_from_vcs(
+            [("Homepage", "https://github.com/other/wrong")],
+            "https://github.com/right/right",
+        )
+        assert seen == [
+            "https://raw.githubusercontent.com/right/right/HEAD/pyproject.toml"
+        ]
+
+    def test_duplicate_urls_are_fetched_once(self, monkeypatch):
+        seen: list[str] = []
+        self._serve(
+            monkeypatch,
+            b'[build-system]\nbuild-backend = "hatchling.build"\n',
+            seen=seen,
+        )
+        M.build_system_from_vcs(
+            [
+                ("Repository", "https://github.com/o/r"),
+                ("Source", "https://github.com/o/r/tree/main"),
+            ]
+        )
+        assert len(seen) == 1
+
+    def test_an_unreachable_forge_is_not_an_error(self, monkeypatch):
+        # A down or proxy-blocked forge must leave the answer unknown, never
+        # fail a fetch that already succeeded.
+        monkeypatch.setattr(M, "_fetch_bytes", lambda url, timeout: None)
+        assert (
+            M.build_system_from_vcs([("Repo", "https://github.com/o/r")])
+            is None
+        )
+
+    def test_an_html_error_page_is_not_a_backend(self, monkeypatch):
+        # A 200 with an HTML body (a login wall, a renamed repo redirect) must
+        # not be parsed into a build system.
+        self._serve(monkeypatch, b"<!doctype html><html>404</html>")
+        assert (
+            M.build_system_from_vcs([("Repo", "https://github.com/o/r")])
+            is None
+        )
+
+    def test_file_without_build_system_is_weak_and_skipped(self, monkeypatch):
+        # "No [build-system]" is a real answer, but from the default branch it
+        # only says the project does not declare one *today*; keep looking for a
+        # repository that says more.
+        seen: list[str] = []
+        self._serve(
+            monkeypatch,
+            b"[project]\nname = 'r'\n",
+            seen=seen,
+        )
+        assert (
+            M.build_system_from_vcs(
+                [("Repo", "https://github.com/o/r")],
+            )
+            is None
+        )
+        assert len(seen) == 1
+
+    def test_metadata_records_the_provenance_it_used(
+        self, tmp_path, monkeypatch
+    ):
+        # build_backend_source is what stops the recovered backend from reading
+        # as the release's own declaration.
+        self._serve(
+            monkeypatch,
+            b'[build-system]\nbuild-backend = "mesonpy"\nrequires = ["cython"]\n',
+        )
+        monkeypatch.setattr(
+            M,
+            "fetch_source",
+            lambda *a, **kw: _wheel_src(tmp_path, _WHEEL_META),
+        )
+        meta, _source = M.build_metadata(
+            "pyvizionsdk", "26.9.1", PipOptions(), tmp_path
+        )
+        assert meta.build_backend == "mesonpy"
+        assert meta.build_deps[0].name == "cython"
+        assert meta.build_backend_source == (
+            "github.com/vizion/pyvizionsdk@pyproject.toml"
+        )
+
+    def test_wheel_that_declares_nothing_stays_unknown(
+        self, tmp_path, monkeypatch
+    ):
+        # No repository to ask (or nothing there): the backend stays empty, which
+        # downstream reads as the implicit-setuptools default rather than as a
+        # finding.
+        monkeypatch.setattr(M, "_fetch_bytes", lambda url, timeout: None)
+        monkeypatch.setattr(
+            M,
+            "fetch_source",
+            lambda *a, **kw: _wheel_src(tmp_path, _WHEEL_META),
+        )
+        meta, _source = M.build_metadata(
+            "pyvizionsdk", "26.9.1", PipOptions(), tmp_path
+        )
+        assert meta.build_backend == ""
+        assert meta.build_backend_source == ""
+
+    def test_legacy_sdist_is_not_answered_by_the_repository(
+        self, tmp_path, monkeypatch
+    ):
+        # An sdist with no pyproject.toml is a legacy setuptools project: the
+        # sdist itself is the truth, and the repository's default branch could
+        # name a backend the project migrated to after this release. The VCS
+        # recovery is therefore gated to wheels - a repository that answers
+        # must not be consulted, even when the metadata names one.
+        seen: list[str] = []
+        self._serve(
+            monkeypatch,
+            b'[build-system]\nbuild-backend = "mesonpy"\n',
+            seen=seen,
+        )
+        src = _sdist_src(
+            _sdist(tmp_path, {"pyvizionsdk-26.9.1/PKG-INFO": _WHEEL_META})
+        )
+        monkeypatch.setattr(M, "fetch_source", lambda *a, **kw: src)
+        meta, _source = M.build_metadata(
+            "pyvizionsdk", "26.9.1", PipOptions(), tmp_path
+        )
+        assert meta.build_backend == ""
+        assert meta.build_backend_source == ""
+        assert seen == []

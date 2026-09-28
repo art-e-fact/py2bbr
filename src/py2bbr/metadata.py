@@ -36,6 +36,7 @@ import tarfile
 import tempfile
 import tomllib
 import urllib.error
+import urllib.parse
 import urllib.request
 import zipfile
 from collections.abc import Callable
@@ -394,16 +395,19 @@ def _warn_sdist_unavailable(
     pip downloads an sdist by preparing its PEP 517 metadata in an isolated
     build env, which can fail for environmental reasons (e.g. ``ENOSPC`` on a
     full ``/tmp``) even though the sdist exists on the index. A wheel-based
-    recipe then silently loses ``[build-system]`` detection (backend,
-    build deps, bounds-relax), so the pip diagnostics must not be dropped.
+    recipe then has no ``[build-system]`` of its own to read (backend, build
+    deps, bounds-relax): :func:`build_system_from_vcs` may recover it from the
+    project's repository when the metadata names one, but the pip diagnostics
+    must not be dropped either way.
     """
     tail = "\n".join(
         f"  {line}"
         for line in (proc.stderr or proc.stdout or "").strip().splitlines()[-6:]
     )
     logger.warning(
-        "%s: sdist fetch failed; falling back to wheel (recipe loses "
-        "[build-system] detection). pip said:\n%s",
+        "%s: sdist fetch failed; falling back to wheel (the wheel carries "
+        "no [build-system] itself; the project's repository is consulted next "
+        "when the metadata names one). pip said:\n%s",
         requirement,
         tail or "  (no pip diagnostics)",
     )
@@ -867,19 +871,31 @@ def _parse_toml(data: bytes) -> dict | None:
     return result if isinstance(result, dict) else None
 
 
-def read_build_system(source: FetchedSource) -> tuple[str, list[str]]:
+def read_build_system(source: FetchedSource) -> tuple[str, list[str]] | None:
     """
-    Return ``(build_backend, build_requires)`` from the package's build config.
+    Return ``(build_backend, build_requires)`` from the package's build config,
+    or ``None`` when the artifact ships no ``pyproject.toml`` at all.
 
     The *top-level* ``pyproject.toml`` (exactly one path separator) is
     authoritative. An sdist can bundle many nested ``pyproject.toml`` files
     (test fixtures, docs), so we never fall back to those when a top-level file
     exists - a top-level file without ``[build-system]`` means the implicit
     setuptools backend.
+
+    The three outcomes are kept distinct on purpose, because only the third is
+    a gap worth looking elsewhere for:
+
+    * ``("mesonpy", ["meson-python>=0.13"])`` - a declared backend.
+    * ``("", [])`` - a ``pyproject.toml`` that declares none: upstream
+      affirmatively means the implicit setuptools backend, and reading a
+      *different* file could only contradict that.
+    * ``None`` - the artifact says nothing, which is the normal state of a
+      wheel (a built artifact carries no build config) and the case
+      :func:`build_system_from_vcs` exists to fill.
     """
     cands = _all_matching(source.path, lambda n: n.endswith("pyproject.toml"))
     if not cands:
-        return "", []
+        return None
     top = sorted(
         (c for c in cands if c[0].count("/") == 1), key=lambda nv: nv[0]
     )
@@ -914,6 +930,219 @@ def read_build_system(source: FetchedSource) -> tuple[str, list[str]]:
                 [str(r) for r in bs.get("requires", []) or []],
             )
     return "", []
+
+
+#: ``pyproject.toml`` at a public git forge, as ``(host, raw-file URL)``.
+#: ``HEAD`` is the default branch: a repository URL in package metadata rarely
+#: pins a ref, and a forge that serves raw files by ref also serves ``HEAD``,
+#: so one URL covers the case where the version was never tagged there.
+#:
+#: Only forges whose raw-file URL is a fixed, documented shape are listed. A
+#: self-hosted Gitea/Gogs instance is deliberately absent: guessing its layout
+#: would produce a URL that 404s for a different reason, and a 404 is
+#: indistinguishable from "no pyproject.toml" anyway.
+_VCS_RAW_URLS: dict[str, str] = {
+    "github.com": "https://raw.githubusercontent.com/{path}/HEAD/{name}",
+    "gitlab.com": "https://gitlab.com/{path}/-/raw/HEAD/{name}",
+    "bitbucket.org": "https://bitbucket.org/{path}/raw/HEAD/{name}",
+}
+
+#: ``Project-URL`` labels that denote the repository, in the order core
+#: metadata is read: a labelled "Repository" is a deliberate statement, while
+#: ``Home-page`` is only a fallback (a project homepage is often a docs site,
+#: not a checkout).
+_VCS_URL_LABELS = frozenset(
+    {
+        "repository",
+        "source",
+        "source code",
+        "code",
+        "github",
+        "gitlab",
+        "vcs",
+        "git",
+        "repo",
+        "bugs",
+    }
+)
+
+#: Path segments that end the repository part of a forge URL. Everything from
+#: one of these on names a file or a subdirectory *inside* the repo
+#: (``/tree/main/sub``, ``/-/blob/master/x``, ``/src/branch``,
+#: ``/issues/123``), not the repo. Longer markers first: ``/-/tree/`` contains
+#: ``/tree/`` as a substring, so a GitLab URL must be cut by the ``/-/`` form
+#: or the slice lands four characters too late.
+_VCS_SUBPAGE_MARKERS = (
+    "/-/tree/",
+    "/-/blob/",
+    "/-/src/",
+    "/-/issues/",
+    "/-/merge_requests/",
+    "/-/commits/",
+    "/-/releases/",
+    "/tree/",
+    "/blob/",
+    "/src/",
+    "/issues/",
+    "/pull/",
+    "/commits/",
+)
+
+
+def _vcs_repo_candidates(
+    project_urls: list[tuple[str, str]], homepage: str = ""
+) -> list[tuple[str, str]]:
+    """``(host, "owner/repo")`` for each repository URL, best first.
+
+    Deduplicated, and in the order the labels in :data:`_VCS_URL_LABELS` are
+    trusted, so a ``Project-URL: Source`` entry wins over a homepage that only
+    looks like a repository.
+    """
+    labelled: list[tuple[int, str]] = []
+    order = {label: rank for rank, label in enumerate(_VCS_URL_LABELS)}
+    for label, url in project_urls:
+        normalised = label.strip().lower()
+        if normalised in order:
+            labelled.append((order[normalised], url))
+    if homepage:
+        labelled.append((len(order) + 1, homepage))
+    labelled.sort(key=lambda item: item[0])
+
+    out: list[tuple[str, str]] = []
+    for _rank, url in labelled:
+        repo = _vcs_repo(url)
+        if repo is not None and repo not in out:
+            out.append(repo)
+    return out
+
+
+def _vcs_repo(url: str) -> tuple[str, str] | None:
+    """``(host, "owner/repo")`` for a repository URL, or None if unrecognised.
+
+    Reduces the many shapes a project URL comes in to what the forge needs:
+
+    * ``git+https://github.com/o/r.git@v1.0#egg=r`` (a VCS requirement, which
+      a tool-generated ``Requires-Dist`` may carry) and
+      ``https://github.com/o/r/tree/main/sub`` both become ``o/r``;
+    * a ``github.com.evil.example`` host does not match ``github.com``, so it is
+      not read as GitHub - a forged host must not redirect the fetch to
+      content the user never pointed at.
+
+    Returns None for a URL on a host not in :data:`_VCS_RAW_URLS`, which is the
+    signal to stop looking (see that mapping).
+    """
+    url = url.strip()
+    url = url.removeprefix("git+")
+    # ``#egg=``/``#subdirectory=`` fragments and any trailing path/query.
+    url = url.split("#", 1)[0].split("?", 1)[0]
+    parts = urllib.parse.urlsplit(url)
+    host = parts.netloc.rsplit("@", 1)[-1].split(":")[0].lower()
+    if not host:
+        return None
+    match = next(
+        (
+            known
+            for known in _VCS_RAW_URLS
+            if host == known or host.endswith("." + known)
+        ),
+        None,
+    )
+    if match is None:
+        return None
+    path = parts.path.strip("/")
+    # ``git+https://.../r.git@v1.0`` puts the ref in the path, not the netloc,
+    # once the ``#egg=`` fragment is gone (urlsplit cannot tell ``@v1.0`` from
+    # a directory, and a repo name cannot contain ``@`` on any of these
+    # forges). It is cut before the ``.git`` suffix so ``r.git@v1.0`` still
+    # reduces to ``r``.
+    path = path.split("@", 1)[0]
+    path = path.removesuffix(".git")
+    for marker in _VCS_SUBPAGE_MARKERS:
+        index = path.find(marker)
+        if index != -1:
+            path = path[:index]
+    segments = [s for s in path.split("/") if s]
+    if len(segments) < 2:
+        # A forge root or a single-segment path is not a repository.
+        return None
+    return match, "/".join(segments)
+
+
+def _fetch_bytes(url: str, timeout: float) -> bytes | None:
+    """GET ``url`` and return the body, or None on any failure.
+
+    One helper for the network-optional lookups in this module, so a probe
+    never raises into the fetch path: an unreachable forge must leave the
+    answer unknown, not fail the run.
+    """
+    request = urllib.request.Request(url, headers={"User-Agent": "py2bbr"})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            if not 200 <= response.status < 300:
+                return None
+            return response.read()
+    except (urllib.error.URLError, OSError, ValueError):
+        return None
+
+
+def build_system_from_vcs(
+    project_urls: list[tuple[str, str]],
+    homepage: str = "",
+    filename: str = "pyproject.toml",
+    timeout: float = 5.0,
+) -> tuple[str, list[str], str] | None:
+    """The project's declared ``[build-system]``, read from its own repository.
+
+    Returns ``(build_backend, build_requires, provenance)``, or None when no
+    candidate repository serves a readable ``filename``.
+
+    This exists for the package that publishes no sdist. The metadata of such a
+    package is all there is, and it names the repository but not the build
+    system - so without this, every such package is reported as an implicit
+    setuptools build, which is a *guess*, and a wrong one for exactly the
+    packages that are likeliest to have moved to another backend
+    (meson-python, maturin, hatchling, scikit-build-core). The guess then
+    propagates: it picks the build class, the build-time dependencies, and
+    whether a from-source rebuild would be feasible at all.
+
+    The provenance string is part of the return value because the answer is
+    only as good as the ref it came from: the default branch describes the
+    project *today*, and a project that migrated its backend after the release
+    will answer with the backend it no longer used when the wheel was built.
+    Callers must surface it rather than present the result as the release's own
+    declaration.
+
+    Best effort by construction - a forge that is down, rate-limiting, behind
+    a proxy, or serving a different layout is reported as "unknown", never as
+    an error. Losing a convenience lookup must not fail a fetch that already
+    succeeded.
+    """
+    for host, path in _vcs_repo_candidates(project_urls, homepage):
+        url = _VCS_RAW_URLS[host].format(path=path, name=filename)
+        data = _fetch_bytes(url, timeout)
+        if data is None:
+            logger.debug("no %s at %s", filename, url)
+            continue
+        parsed = _parse_toml(data)
+        if parsed is None:
+            # Answered, but not usable as build config: a 200 HTML error page is
+            # the usual cause. Do not report a "backend" from it.
+            logger.debug("unparsable %s at %s", filename, url)
+            continue
+        build_system = parsed.get("build-system", {}) or {}
+        if not build_system:
+            # A pyproject.toml without [build-system] is a real answer (the
+            # implicit setuptools backend), but from a ref that is not the
+            # release, so it stays a weak one - keep looking for a repo whose
+            # file says more.
+            logger.debug("no [build-system] in %s at %s", filename, url)
+            continue
+        return (
+            build_system.get("build-backend", ""),
+            [str(r) for r in build_system.get("requires", []) or []],
+            f"{host}/{path}@{filename}",
+        )
+    return None
 
 
 def marker_env(yocto: YoctoVersion | None) -> dict:
@@ -1076,6 +1305,43 @@ def _is_ignored_member(name: str) -> bool:
     return stem.startswith(("test_", "conftest")) or stem.endswith(
         ("_test", "_tests")
     )
+
+
+def wheel_ships_prebuilt_binaries(filename: str) -> bool:
+    """Whether a wheel's own tag admits prebuilt, architecture-specific code.
+
+    A wheel is upstream's build output, so a compiled one already carries
+    linked-and-stripped objects: the extension modules
+    (``pyVizionSDK.cpython-312-aarch64-linux-gnu.so``) and, from an auditwheel
+    build, the renamed system libraries bundled beside them
+    (``pyvizionsdk.libs/libblkid-e4a77f31.so.1.1.0``). Bitbake's
+    ``already-stripped`` QA error is raised on exactly those files, and a
+    recipe that installs such a wheel therefore has to waive the check.
+
+    The tag is the evidence, not a scan of the archive. PEP 427 makes the
+    platform field a promise about the payload: ``any`` (the
+    ``py3-none-any`` combination) means pure Python that runs anywhere, so no
+    ELF can be inside, while every other platform tag
+    (``manylinux_2_31_aarch64``, ``linux_aarch64``, even ``musllinux_1_2_*``)
+    is a claim about the *machine*, which pure-Python code has no reason to
+    make. That is the same distinction the build-for-target report draws when
+    it decides between "prebuilt wheel" and "pure-Python sdist", so the report
+    and the generated recipe cannot disagree.
+
+    Conservative in the right direction: the ``py3-none-<platform>`` shape (a
+    wheel pinning a platform while claiming to be pure Python) is treated as
+    possibly carrying binaries, so a needless waiver is possible but a
+    missing one is not.
+
+    An unparsable name is False, i.e. the check stays on: the recipe then
+    fails the QA check loudly, which is the right outcome for a name the
+    tooling cannot classify (see :func:`_wheel_rejection_reason`).
+    """
+    try:
+        _name, _version, _build, tags = parse_wheel_filename(filename)
+    except (InvalidWheelFilename, ValueError):
+        return False
+    return any(tag.platform != "any" for tag in tags)
 
 
 def detect_native_code(
@@ -1326,7 +1592,31 @@ def build_metadata(
     requires_python = _first(msg, "Requires-Python")
     requires_dist = list(msg.get_all("Requires-Dist", []) or [])
 
-    backend, build_requires = read_build_system(source)
+    declared = read_build_system(source)
+    build_backend_source = ""
+    if declared is None and source.kind is SourceKind.WHEEL:
+        # A wheel ships no build config, so ``declared`` being None is the
+        # normal case here and the build backend is otherwise a guess. The
+        # metadata names the repository, which does publish one, so ask it.
+        # Gated to wheels on purpose: an sdist without the file is a legacy
+        # setuptools project - the sdist is the truth (``setup.py``), and
+        # letting the repository's default branch override it could name a
+        # backend the project migrated to after this release.
+        found = build_system_from_vcs(project_urls, homepage)
+        if found is not None:
+            backend, build_requires, build_backend_source = found
+            logger.info(
+                "%s %s: no build config in the artifact; read [build-system] "
+                "from %s (the project's default branch, so this describes the "
+                "project today, not necessarily this release)",
+                meta_name,
+                meta_version,
+                build_backend_source,
+            )
+        else:
+            backend, build_requires = "", []
+    else:
+        backend, build_requires = declared if declared is not None else ("", [])
     lic = find_license_file(source)
     license_file, license_md5 = lic if lic else (None, None)
 
@@ -1393,6 +1683,11 @@ def build_metadata(
         source_sha256=source.sha256,
         vendored=vendored,
         build_backend=backend,
+        build_backend_source=build_backend_source,
+        ships_prebuilt_binaries=(
+            source.kind is SourceKind.WHEEL
+            and wheel_ships_prebuilt_binaries(source.filename)
+        ),
         requires_dist=list(requires_dist),
         has_native_code=has_native_code,
         native_code_evidence=native_evidence,

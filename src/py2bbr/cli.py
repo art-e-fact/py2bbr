@@ -416,6 +416,10 @@ def _print_report(
         print(f"License      : {meta.license or '(none detected)'}")
         print(f"Homepage     : {meta.homepage or '-'}")
         print(f"Build backend: {meta.build_backend or '(setuptools/setup.py)'}")
+        if meta.build_backend_source:
+            # Saying *where* the answer came from keeps it from reading as the
+            # release's own declaration: this is the project's default branch.
+            print(f"               (read from {meta.build_backend_source})")
         print(f"Runtime deps : {len(meta.runtime_deps)}")
         print(
             f"Dropped deps : {len(meta.dropped_deps)}"
