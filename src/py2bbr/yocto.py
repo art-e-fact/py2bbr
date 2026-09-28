@@ -5,16 +5,24 @@ The release -> series mapping is owned here (kas is data-driven and does not
 ship a release/branch table). ``kas`` is used to (a) validate the generated
 ``kas`` build file against the official JSON schema and (b) drive the optional
 ``--check build`` stage.
+
+The *target runtime* (Python version + CPU architecture) is resolved here too
+(:func:`resolve_target_runtime`): the series only says which Python it ships,
+and the machine py2bbr runs on is not the machine the image will boot, so both
+axes are overridable per run.
 """
 
 from __future__ import annotations
 
 import logging
+import platform
 import re
 import shutil
+import sys
+from dataclasses import replace
 from pathlib import Path
 
-from py2bbr.errors import YoctoVersionError
+from py2bbr.errors import TargetRuntimeError, YoctoVersionError
 from py2bbr.model import PackageMetadata, YoctoVersion
 from py2bbr.recipe import bitbake_pn, canonical_name, recipe_filename
 
@@ -112,6 +120,122 @@ def resolve_yocto_version(spec: str | None) -> YoctoVersion:
     )
 
 
+def current_python_version() -> str:
+    """``major.minor`` of the interpreter py2bbr itself runs under.
+
+    The default for ``--python-version``: the artifacts on PyPI a developer
+    machine resolves are the ones its own interpreter matches, so that is the
+    least surprising answer. A target that differs (an older PetaLinux on
+    Python 3.12, say) has to be named explicitly.
+    """
+    return f"{sys.version_info.major}.{sys.version_info.minor}"
+
+
+def current_platform_machine() -> str:
+    """``platform.machine()`` of the build host, lower-cased.
+
+    Falls back to ``x86_64`` - the build architecture py2bbr assumes
+    everywhere else - if the platform does not report one, so the
+    ``--target-arch`` default is never a value that has to be rejected. A host
+    that cannot say what it is is a host whose target gets named explicitly,
+    which is the situation anyway.
+    """
+    return platform.machine().strip().lower() or "x86_64"
+
+
+#: Spellings of one architecture that differ between the command line,
+#: ``platform.machine()`` and wheel platform tags. Normalising to the value PEP
+#: 508 markers use on the target is what makes ``--target-arch arm64`` evaluate
+#: ``platform_machine == "aarch64"`` the way the target's own Python would.
+#: Key: a non-canonical spelling; value: the canonical ``platform_machine``.
+_ARCH_ALIASES: dict[str, str] = {
+    "amd64": "x86_64",
+    "x64": "x86_64",
+    "x86-64": "x86_64",
+    "arm64": "aarch64",
+    "arm64-v8a": "aarch64",
+    "armv8": "aarch64",
+    "armv7": "armv7l",
+    "armv7hf": "armv7l",
+    "armhf": "armv7l",
+    "arm32": "armv7l",
+    "i386": "i686",
+    "i486": "i686",
+    "i586": "i686",
+    "x86": "i686",
+    "riscv": "riscv64",
+}
+
+
+def normalize_python_version(spec: str) -> str:
+    """Reduce a ``--python-version`` value to ``major.minor``.
+
+    ``3.12``, ``3.12.4`` and ``312`` all name 3.12. A patch component is
+    dropped on purpose: ``python_full_version`` is derived by appending
+    ``.0`` to this value, and bitbake/pypi name runtimes by major.minor.
+    """
+    raw = (spec or "").strip()
+    if not raw:
+        raise TargetRuntimeError(
+            "empty --python-version; expected a version like 3.12"
+        )
+    candidate = raw
+    if candidate.isdigit() and len(candidate) > 2:
+        # pip's dotted-or-not form: "312" -> "3.12".
+        candidate = f"{candidate[0]}.{candidate[1:]}"
+    match = re.fullmatch(r"(\d+)\.(\d+)(?:\.\d+)*", candidate)
+    if not match:
+        raise TargetRuntimeError(
+            f"invalid --python-version {spec!r}; expected a version like 3.12"
+        )
+    return f"{int(match.group(1))}.{int(match.group(2))}"
+
+
+def normalize_platform_machine(spec: str) -> str:
+    """Canonicalise a ``--target-arch`` value into a ``platform_machine``."""
+    raw = (spec or "").strip().lower()
+    if not raw:
+        raise TargetRuntimeError(
+            "empty --target-arch; expected an architecture like aarch64"
+        )
+    machine = _ARCH_ALIASES.get(raw, raw)
+    if not re.fullmatch(r"[a-z0-9_]+", machine):
+        raise TargetRuntimeError(
+            f"invalid --target-arch {spec!r}; expected an architecture like "
+            "aarch64 (as platform.machine() reports it)"
+        )
+    return machine
+
+
+def resolve_target_runtime(
+    yocto: YoctoVersion,
+    python_version: str | None = None,
+    platform_machine: str | None = None,
+) -> YoctoVersion:
+    """Return ``yocto`` with the target runtime the run asked for.
+
+    Both axes default to what py2bbr runs on (the machine doing the generating),
+    which is a guess about the image; ``--python-version`` / ``--target-arch``
+    replace it. The result is a plain :class:`YoctoVersion` copy, so every
+    downstream consumer - marker evaluation, the wheel the recipe installs, the
+    classifier pruning, the build-for-target report - sees one consistent target
+    without any of them having to know which flags were passed.
+
+    Raises :class:`~py2bbr.errors.TargetRuntimeError` on a value that is not a
+    version / architecture: silently falling back to the series' answer would
+    generate a layer for the wrong target, which is the failure this flag
+    exists to prevent.
+    """
+    changes: dict[str, str] = {}
+    if python_version is not None:
+        changes["python_version"] = normalize_python_version(python_version)
+    if platform_machine is not None:
+        changes["platform_machine"] = normalize_platform_machine(
+            platform_machine
+        )
+    return replace(yocto, **changes) if changes else yocto
+
+
 def layer_collection(layer_name: str) -> str:
     """Derive a safe ``BBFILE_COLLECTIONS`` name from a layer directory name."""
     name = re.sub(r"^[mM]eta[-_]?", "", layer_name)
@@ -158,7 +282,8 @@ def _layer_readme(meta: PackageMetadata, yocto: YoctoVersion) -> str:
         f"# py2bbr-generated layer\n"
         f"\n"
         f"Generated by py2bbr. This layer provides a Bitbake recipe for the\n"
-        f"Python package `{meta.name}` ({meta.version}) targeting {yocto.label}.\n"
+        f"Python package `{meta.name}` ({meta.version}) targeting\n"
+        f"{yocto.label}, {yocto.runtime_label}.\n"
         f"\n"
         f"Recipe: `recipes-devtools/python/{recipe_filename(bitbake_pn(meta.name, yocto.python_pn), meta.version)}`\n"
     )

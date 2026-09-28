@@ -225,6 +225,9 @@ class TargetReport:
     build_class: str = ""
     #: Architecture that builds the layer (the x86_64/-native side).
     build_host: str = "x86_64"
+    #: ``platform_machine`` of the architecture the recipe targets
+    # (``--target-arch``), i.e. the one row of the matrix the layer is for.
+    target_arch: str = ""
     #: True when the sdist ships no compiled code.
     pure_python: bool = True
     #: True when ``build_class`` compiles against the target toolchain.
@@ -251,7 +254,13 @@ class TargetReport:
         out = [
             (
                 f"Build for target (build class {self.build_class}, "
-                f"layer built on {self.build_host}):"
+                f"layer built on {self.build_host}"
+                + (
+                    f", target arch {self.target_arch}"
+                    if self.target_arch
+                    else ""
+                )
+                + "):"
             )
         ]
         for note in self.notes:
@@ -342,7 +351,9 @@ def evaluate(
     :attr:`TargetReport.notes`; only genuinely per-target findings repeat.
     """
     report = TargetReport(
-        build_class=build_class, pure_python=not meta.has_native_code
+        build_class=build_class,
+        pure_python=not meta.has_native_code,
+        target_arch=yocto.platform_machine,
     )
     targets = targets or KNOWN_TARGETS
 

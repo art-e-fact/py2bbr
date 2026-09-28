@@ -1878,6 +1878,18 @@ class TestVendoredWheelRecipe:
         _, warnings = render_recipe(self._wheel_meta(make_meta_fn), yocto)
         assert any("no source distribution" in w for w in warnings)
 
+    def test_names_the_runtime_the_wheel_must_match(self, make_meta_fn, yocto):
+        # A vendored wheel is a build product for one exact Python ABI *and*
+        # CPU, so the recipe has to say which pair it was picked for - and the
+        # warning has to name it, since that pair is what a later retarget has
+        # to reproduce.
+        target = replace(
+            yocto, python_version="3.12", platform_machine="aarch64"
+        )
+        text, warnings = render_recipe(self._wheel_meta(make_meta_fn), target)
+        assert "# Runtime: Python 3.12 on aarch64" in text
+        assert any("Python 3.12 on aarch64" in w for w in warnings)
+
     def test_explicit_build_class_is_reported_not_crashed(
         self, make_meta_fn, yocto
     ):

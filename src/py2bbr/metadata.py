@@ -7,11 +7,14 @@ Current approach
    / arbitrary ``--pip-arg``). This works against PyPI *and* private indexes.
 2. Prefer the **sdist** (what ``inherit pypi`` fetches, so its sha256 is the
    correct ``SRC_URI[sha256sum]``); fall back to a **wheel** if sdist is absent.
+   That fallback is pinned to the *target* runtime (Python version, and CPU
+   architecture when it differs from the build host's) so pip cannot answer with
+   an artifact built for the machine py2bbr happens to run on.
 3. Parse ``PKG-INFO`` / ``METADATA`` with the stdlib ``email`` parser.
 4. Read ``pyproject.toml`` ``[build-system]`` for the backend + build deps.
 5. Locate the license file and compute its MD5 (for ``LIC_FILES_CHKSUM``).
 6. Classify ``Requires-Dist`` into runtime / build / dropped using ``packaging``
-   marker evaluation against the target Yocto Python version.
+   marker evaluation against the target runtime (Python version and CPU).
 7. Inspect the sdist for code that has to be *compiled* and for build config
    that hard-codes an x86 assumption, so the generated recipe can be judged
    per target architecture (see ``py2bbr.targets``).
@@ -24,6 +27,7 @@ import email.message
 import hashlib
 import logging
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -199,6 +203,67 @@ def _pip_python_version(yocto: YoctoVersion | None) -> str | None:
     return f"3.{int(parts[1])}"
 
 
+#: glibc versions a ``manylinux_X_Y`` tag exists for. pip resolves a
+#: ``--platform`` value as a *literal* platform tag (it does not expand
+#: ``manylinux_2_17_aarch64`` into the manylinux family the way it derives the
+#: build host's own tags), so the family has to be spelled out for the target.
+#: The range is deliberately generous: a tag for a glibc that has not shipped
+#: yet costs nothing, since no wheel can carry it, while one that is missing
+#: would reject a perfectly good artifact. (glibc is still on its 2.x series;
+#: a 3.0 would need the major in here too.)
+_MANYLINUX_FIRST_MINOR = 5  # glibc 2.5, the oldest manylinux1 baseline
+_MANYLINUX_LAST_MINOR = 45  # past every glibc released so far
+
+#: The pre-PEP 600 manylinux aliases, the two musl releases, and the plain
+#: linux tag a project uses when it wheels against a hand-built toolchain.
+#: None of these exist for every architecture, which is harmless: pip only
+#: needs a tag some wheel could carry.
+_LEGACY_FAMILIES = (
+    "manylinux1",
+    "manylinux2010",
+    "manylinux2014",
+    "musllinux_1_1",
+    "musllinux_1_2",
+    "linux",
+)
+
+
+def _pip_platforms(yocto: YoctoVersion | None) -> list[str]:
+    """The ``--platform`` tags a wheel download is restricted to.
+
+    An empty list means "let pip decide", which is the right answer whenever
+    the target is the machine py2bbr runs on: pip then applies this host's own
+    tag set - the manylinux and musllinux baselines of the *host's* libc, this
+    interpreter's ABI, whatever else the host happens to support - and
+    enumerating a guessed family could only narrow that.
+
+    A *different* target architecture is the case pip cannot answer by itself:
+    its native tags describe the build host, so it hands over the host's
+    artifact (pyvizionsdk publishes a different version per architecture, so
+    the wrong wheel is the wrong *version*). The pin is then the only thing
+    that makes pip fetch the target's, and py2bbr goes on to record that exact
+    artifact's sha256 in ``SRC_URI[sha256sum]``.
+
+    The result mirrors what pip would accept on a machine of that CPU: every
+    manylinux glibc baseline, the legacy aliases, musllinux, and the bare
+    ``linux_<arch>``.
+    """
+    target = getattr(yocto, "platform_machine", "") or ""
+    host = platform.machine().strip().lower()
+    # An empty host architecture means "unknown", not "x86_64": pip's native
+    # tags stay in charge there, since they are the only ones that can be right
+    # about a machine that cannot say what it is. Naming the target explicitly
+    # is what opts into a pin.
+    if not target or not host or target == host:
+        return []
+    families = [
+        f"manylinux_2_{minor}"
+        for minor in range(_MANYLINUX_FIRST_MINOR, _MANYLINUX_LAST_MINOR + 1)
+    ]
+    families.extend(_LEGACY_FAMILIES)
+    return [f"{family}_{target}" for family in families]
+
+
 def _target_label(yocto: YoctoVersion | None) -> str:
     """Name the target a constraint came from, e.g. ``Yocto 5.0 (scarthgap)``.
 
@@ -219,6 +284,7 @@ def _run_pip_download(
     binary_mode: str,
     no_build_isolation: bool = False,
     python_version: str | None = None,
+    platform_tags: list[str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     cmd = (
         _pip_executable()
@@ -240,11 +306,18 @@ def _run_pip_download(
         # property of the machine running py2bbr, not of the target: a CPython
         # 3.12 layer generated from a 3.14 host would be handed a cp314 wheel
         # (and skip packages gated on ``Requires-Python >= 3.13``), so the
-        # generated layer would only work on the host that made it. The
-        # interpreter tag is the only axis that can be pinned this way -
-        # ``--platform`` would mean inventing a target architecture py2bbr
-        # does not know.
+        # generated layer would only work on the host that made it.
         cmd += ["--python-version", python_version]
+    if platform_tags:
+        # Same reasoning for the CPU: pip's platform tags describe the build
+        # host, so an x86_64 host is offered the x86_64 artifact for a target
+        # that runs aarch64. Only set for a target that *is* the build host's
+        # architecture away (see :func:`_pip_platforms`); pip requires
+        # ``--only-binary``/``--no-deps`` alongside it, both of which the
+        # caller passes. One comma-separated value: pip's ``--platform`` takes
+        # either form, and a single argument keeps the command readable in a
+        # debug log.
+        cmd += ["--platform", ",".join(platform_tags)]
     if no_build_isolation:
         # Build the sdist's metadata with the environment py2bbr runs in rather
         # than letting pip provision an isolated one from the index.
@@ -381,10 +454,13 @@ def _wheel_rejection_reason(
     3.8 onwards), so the mismatch is decidable here - rather than surfacing
     much later as a hard load error inside the target's Python.
 
-    The *platform* tag is deliberately not rejected: py2bbr does not know the
-    target architecture (see :func:`marker_env`), and ``any`` / ``linux_*`` /
-    ``manylinux_*`` are arch-agnostic. A wheel pinned to a foreign
-    architecture is reported as advice instead.
+    The *platform* tag is deliberately not rejected: it is a *choosing* problem
+    rather than a parsing one. A wheel built for a foreign CPU is answered by
+    the download itself - pip is pinned to the target architecture when it
+    differs from the build host's (see :func:`_pip_platforms`) - and whatever
+    still arrives is judged per target by the build-for-target report (see
+    ``py2bbr.targets``), which knows the whole architecture matrix rather than
+    only the one arch py2bbr was told about.
     """
     target = getattr(yocto, "python_version", "") or ""
     if not target.startswith("3."):
@@ -479,32 +555,45 @@ def fetch_source(
     if artifact is None:
         _warn_sdist_unavailable(requirement, proc)
         # No sdist: fall back to a wheel, which bitbake installs instead of
-        # building. Pin the *target's* interpreter so pip cannot answer with a
-        # wheel built for the version py2bbr runs under.
+        # building. Pin the *target's* runtime - interpreter and CPU - so pip
+        # cannot answer with an artifact built for the machine py2bbr runs on.
         pinned = _pip_python_version(yocto)
+        pinned_platform = _pip_platforms(yocto)
         proc = _run_pip_download(
             requirement,
             dest,
             pip_opts,
             "--only-binary=:all:",
             python_version=pinned,
+            platform_tags=pinned_platform,
         )
         artifact = _pick_artifact(dest, prefer_sdist=False)
     if artifact is None:
         tail = (proc.stderr or proc.stdout or "").strip().splitlines()[-6:]
-        # pip filters wheels by interpreter tag, so an index that carries only
-        # wheels for *other* Python versions reads as "no versions at all".
-        # Without the pin named, that is indistinguishable from a typo in the
-        # requirement or a wrong index URL.
-        hint = ""
+        # pip filters wheels by interpreter (and, when pinned, platform) tag,
+        # so an index that carries only artifacts for *other* targets reads as
+        # "no versions at all". Without the pins named, that is
+        # indistinguishable from a typo in the requirement or a wrong index URL.
+        restrictions = []
+        served_for = []
         if pinned:
+            restrictions.append(f"--python-version {pinned}")
+            served_for.append(f"CPython {pinned}")
+        if pinned_platform:
+            arch = getattr(yocto, "platform_machine", "") or "the target's"
+            # The full platform list is a wall of ~45 manylinux baselines; name
+            # the CPU it is built around, which is what a reader has to check.
+            restrictions.append(f"--platform '*_{arch}'")
+            served_for.append(f"{arch} wheels")
+        hint = ""
+        if restrictions:
             hint = (
-                f"\n  The wheel download was restricted to CPython {pinned}, "
-                f"the version {_target_label(yocto)} runs, so this also covers "
-                f"an index that serves wheels for other interpreters only. "
-                f"Check what it offers: `pip download {requirement} "
-                f"--only-binary=:all: --python-version {pinned} "
-                f"--no-deps <your index flags>`"
+                f"\n  The wheel download was restricted to "
+                f"{' and '.join(served_for)}, the runtime "
+                f"{_target_label(yocto)} runs, so this also covers an index that "
+                f"serves wheels for other targets only. Check what it offers: "
+                f"`pip download {requirement} --only-binary=:all: "
+                f"{' '.join(restrictions)} --no-deps <your index flags>`"
             )
         raise MetadataNotFoundError(
             f"could not download {requirement!r} from the configured index(es) "
@@ -814,14 +903,18 @@ def marker_env(yocto: YoctoVersion | None) -> dict:
     """
     A PEP 508 evaluation environment approximating the Yocto target.
 
-    We target a CPython on Linux; the Python version comes from the Yocto series
-    so that version-gated dependencies (``tomli; python_version < "3.11"``) are
-    classified correctly for the default Scarthgap/3.12 target.
+    We target a CPython on Linux; the Python version and the CPU come from the
+    resolved target runtime (the Yocto series, overridable with
+    ``--python-version`` / ``--target-arch``) so that version- and
+    architecture-gated dependencies (``tomli; python_version < "3.11"``) are
+    classified correctly for the image rather than for the machine py2bbr runs
+    on.
 
-    ``platform_machine`` is only a *guess* here (the build host's x86_64): the
-    real target is unknown when the metadata is parsed, which is exactly why
-    machine-gated requirements are split out (see :func:`machine_gated_deps`)
-    instead of being resolved against it.
+    ``platform_machine`` is the *target's* architecture and therefore still only
+    an approximation: the layer is cross-built, so the real answer belongs to
+    bitbake on the real target. Machine-gated requirements are split out (see
+    :func:`machine_gated_deps`) and rendered per ``MACHINEOVERRIDES`` token
+    rather than resolved against this value.
     """
     env = dict(default_environment())
     env.update(
@@ -829,7 +922,9 @@ def marker_env(yocto: YoctoVersion | None) -> dict:
             "sys_platform": "linux",
             "os_name": "linux",
             "platform_system": "Linux",
-            "platform_machine": "x86_64",
+            "platform_machine": (
+                getattr(yocto, "platform_machine", "") or "x86_64"
+            ),
             "implementation_name": "cpython",
             "extra": "",
         }

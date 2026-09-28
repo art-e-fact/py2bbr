@@ -1015,6 +1015,7 @@ def _render_wheel_recipe(
         f"# Target: {yocto.label} | source: {meta.source_filename} "
         f"({meta.source_kind})"
     )
+    lines.append(f"# Runtime: {yocto.runtime_label}")
     if meta.dropped_deps:
         lines.append(
             "# Dropped dependencies (optional extras / non-target markers):"
@@ -1028,9 +1029,9 @@ def _render_wheel_recipe(
         f"{meta.canonical_name} {meta.version} publishes no source "
         "distribution; the recipe vendors the wheel from the layer and installs "
         "it with pypa installer instead of building it. A wheel carries "
-        "prebuilt extension modules for one exact Python ABI, so this only "
-        "works while the target's Python and architecture match the wheel's "
-        "tags; publish an sdist if the target ever moves."
+        "prebuilt extension modules for one exact Python ABI and CPU, so this "
+        f"only works while the target stays {yocto.runtime_label} and the "
+        "wheel's tags match; publish an sdist if the target ever moves."
     )
     return "\n".join(lines), warnings
 
@@ -1419,6 +1420,7 @@ def render_recipe(
         f"# Target: {yocto.label} | source: {meta.source_filename} "
         f"({meta.source_kind})"
     )
+    lines.append(f"# Runtime: {yocto.runtime_label}")
     if meta.dropped_deps:
         lines.append(
             "# Dropped dependencies (optional extras / non-target markers):"

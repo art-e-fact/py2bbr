@@ -5,6 +5,7 @@ Usage examples (see README.md for more information):
 
     py2bbr black
     py2bbr "requests==2.34.2" --yocto-version 5.0
+    py2bbr pyvizionsdk --python-version 3.12 --target-arch aarch64
     py2bbr mytool --extra-index-url https://pypi.mycompany.com/simple \\
                  --trusted-host pypi.mycompany.com --check build
 """
@@ -35,8 +36,11 @@ from py2bbr.recipe import (
 )
 from py2bbr.yocto import (
     DEFAULT_KAS_VERSION,
+    current_platform_machine,
+    current_python_version,
     default_layer_name,
     render_kas_file,
+    resolve_target_runtime,
     resolve_yocto_version,
     validate_kas_file,
     write_layer,
@@ -192,6 +196,31 @@ def build_parser() -> argparse.ArgumentParser:
         "--yocto-version",
         default=DEFAULT_YOCTO_VERSION,
         help="Yocto version (e.g. 5.0) or codename (e.g. scarthgap).",
+    )
+    yocto.add_argument(
+        "--python-version",
+        metavar="X.Y",
+        default=current_python_version(),
+        help=(
+            "Python version the target image runs (e.g. 3.12). Overrides the "
+            "series' own version: it pins the artifact the recipe installs "
+            "(wheel ABI tag), judges Requires-Python, evaluates the "
+            "python_version PEP 508 markers and prunes the classifiers the "
+            "target's Python does not know."
+        ),
+    )
+    yocto.add_argument(
+        "--target-arch",
+        "--arch",
+        dest="target_arch",
+        metavar="ARCH",
+        default=current_platform_machine(),
+        help=(
+            "CPU architecture the target image runs, as platform.machine() "
+            "reports it (e.g. aarch64, armv7l, x86_64). A wheel download is "
+            "pinned to it when it differs from this machine's, so the recipe "
+            "installs the target's artifact and not the build host's."
+        ),
     )
     yocto.add_argument(
         "--build-class",
@@ -372,6 +401,7 @@ class _FetchProgress:
 def _print_report(
     args,
     meta,
+    yocto,
     recipe_path,
     layer_dir,
     kas_file,
@@ -381,9 +411,8 @@ def _print_report(
 ):
     if not args.quiet:
         print(f"Package      : {meta.name} {meta.version}")
-        print(
-            f"Target       : {resolve_yocto_version(args.yocto_version).label}"
-        )
+        print(f"Target       : {yocto.label}")
+        print(f"Runtime      : {yocto.runtime_label}")
         print(f"License      : {meta.license or '(none detected)'}")
         print(f"Homepage     : {meta.homepage or '-'}")
         print(f"Build backend: {meta.build_backend or '(setuptools/setup.py)'}")
@@ -613,7 +642,17 @@ def main(argv: list[str] | None = None) -> int:
     try:
         name, version = _parse_package_spec(args.package)
         yocto = resolve_yocto_version(args.yocto_version)
-        logger.debug("yocto target: %s (%s)", yocto.version, yocto.codename)
+        yocto = resolve_target_runtime(
+            yocto,
+            python_version=args.python_version,
+            platform_machine=args.target_arch,
+        )
+        logger.debug(
+            "yocto target: %s (%s), runtime: %s",
+            yocto.version,
+            yocto.codename,
+            yocto.runtime_label,
+        )
         pip_opts = PipOptions(
             index_url=args.index_url,
             extra_index_urls=list(args.extra_index_url),
@@ -816,6 +855,7 @@ def main(argv: list[str] | None = None) -> int:
         _print_report(
             args,
             meta,
+            yocto,
             recipe_path,
             layer_dir if not args.no_layer else None,
             kas_file,

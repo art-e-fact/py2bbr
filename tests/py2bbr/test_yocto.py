@@ -11,20 +11,26 @@ may only hard-depend on ``core``.
 
 from __future__ import annotations
 
+import platform
 import sys
 
 import pytest
 import yaml
 
-from py2bbr.errors import YoctoVersionError
+from py2bbr.errors import TargetRuntimeError, YoctoVersionError
 from py2bbr.recipe import bitbake_pn, recipe_filename
 from py2bbr.yocto import (
     _version_key,
+    current_platform_machine,
+    current_python_version,
     default_layer_name,
     known_versions,
     layer_collection,
+    normalize_platform_machine,
+    normalize_python_version,
     render_kas_file,
     render_layer,
+    resolve_target_runtime,
     resolve_yocto_version,
     validate_kas_file,
     write_layer,
@@ -131,6 +137,88 @@ class TestResolveVersion:
     def test_version_key(self):
         assert _version_key("6.0") == (6, 0)
         assert _version_key("weird") == (0,)
+
+
+class TestResolveTargetRuntime:
+    """--python-version / --target-arch override what the series implies.
+
+    The series only says which Python it ships, and says nothing at all about
+    the CPU: an older PetaLinux on Python 3.12 running aarch64 is a perfectly
+    ordinary target, and a layer generated for anything else installs an
+    artifact the image cannot load.
+    """
+
+    def test_defaults_to_the_running_interpreter(self):
+        assert current_python_version() == (
+            f"{sys.version_info.major}.{sys.version_info.minor}"
+        )
+        # The fallback keeps the default usable on a platform that does not
+        # report an architecture at all.
+        assert current_platform_machine() == (
+            platform.machine().lower() or "x86_64"
+        )
+
+    def test_overrides_both_axes(self):
+        y = resolve_target_runtime(
+            resolve_yocto_version("5.0"),
+            python_version="3.11",
+            platform_machine="aarch64",
+        )
+        assert (y.python_version, y.platform_machine) == ("3.11", "aarch64")
+        assert y.runtime_label == "Python 3.11 on aarch64"
+        # Everything else the series carries is untouched.
+        assert (y.version, y.codename) == ("5.0", "scarthgap")
+        assert y.python_pn == "python3"
+
+    def test_no_override_returns_the_series_itself(self):
+        y = resolve_yocto_version("5.0")
+        assert resolve_target_runtime(y) is y
+
+    def test_aliases_are_canonicalised(self):
+        # PEP 508 markers and platform tags use aarch64/x86_64; a user on an
+        # ARM mac, a docs page or a vendor sheet says arm64/amd64.
+        y = resolve_target_runtime(
+            resolve_yocto_version("5.0"), platform_machine="ARM64"
+        )
+        assert y.platform_machine == "aarch64"
+        assert (
+            resolve_target_runtime(
+                resolve_yocto_version("5.0"), platform_machine="amd64"
+            ).platform_machine
+            == "x86_64"
+        )
+        assert (
+            resolve_target_runtime(
+                resolve_yocto_version("5.0"), platform_machine="armv7"
+            ).platform_machine
+            == "armv7l"
+        )
+
+    @pytest.mark.parametrize(
+        ("spec", "expected"),
+        [
+            ("3.12", "3.12"),
+            ("3.12.4", "3.12"),
+            ("312", "3.12"),
+            (" 3.9 ", "3.9"),
+        ],
+    )
+    def test_python_version_is_reduced_to_major_minor(self, spec, expected):
+        # A patch component cannot survive: python_full_version is derived by
+        # appending .0, and pypi/bitbake name runtimes by major.minor.
+        assert normalize_python_version(spec) == expected
+
+    @pytest.mark.parametrize("spec", ["", "3", "3.x", "python", "3-12"])
+    def test_unparsable_python_version_is_rejected(self, spec):
+        # Silently falling back to the series' version would generate a layer
+        # for the wrong target, which is the failure the flag exists to prevent.
+        with pytest.raises(TargetRuntimeError, match="--python-version"):
+            normalize_python_version(spec)
+
+    @pytest.mark.parametrize("spec", ["", "a b", "aarch64/64", "--help"])
+    def test_unparsable_arch_is_rejected(self, spec):
+        with pytest.raises(TargetRuntimeError, match="--target-arch"):
+            normalize_platform_machine(spec)
 
 
 class TestWriteLayer:

@@ -26,7 +26,11 @@ from py2bbr.metadata import (
     detect_license,
 )
 from py2bbr.model import Dependency, DepKind, SourceKind
-from py2bbr.yocto import resolve_yocto_version
+from py2bbr.yocto import (
+    current_platform_machine,
+    resolve_target_runtime,
+    resolve_yocto_version,
+)
 
 
 def _msg(text: str) -> email.message.Message:
@@ -182,6 +186,23 @@ class TestMarkerEnv:
         env = _marker_env(None)
         assert env["sys_platform"] == "linux"
         assert "python_version" in env
+
+    def test_platform_machine_is_the_target_cpu(self):
+        # Markers are evaluated for the target, not for the machine that
+        # happened to run py2bbr: an x86_64 host generating for aarch64 has to
+        # see the aarch64 answer.
+        y = resolve_target_runtime(
+            resolve_yocto_version("5.0"), platform_machine="arm64"
+        )
+        assert _marker_env(y)["platform_machine"] == "aarch64"
+
+    def test_platform_machine_falls_back_to_the_legacy_default(self):
+        # A target that names no CPU (a hand-built YoctoVersion) keeps x86_64,
+        # the value this function has always assumed.
+        y = dataclasses.replace(
+            resolve_yocto_version("5.0"), platform_machine=""
+        )
+        assert _marker_env(y)["platform_machine"] == "x86_64"
 
 
 _PKG_INFO = """\
@@ -346,9 +367,36 @@ class TestRunPipDownload:
         cmd = self._capture(monkeypatch, tmp_path, mode="--only-binary=:all:")
         assert "--python-version" not in cmd
 
-    def test_platform_is_never_constrained(self, monkeypatch, tmp_path):
-        # --platform would mean inventing a target architecture py2bbr does not
-        # know; the platform tag is left to the layer's author.
+    def test_target_platform_is_pinned(self, monkeypatch, tmp_path):
+        # The platform pin is a list because pip resolves each --platform value
+        # as a literal tag (it does not expand manylinux_2_17_aarch64 into the
+        # manylinux family), so the whole family has to be named. One
+        # comma-separated value, which pip accepts and which keeps the command
+        # readable in a debug log.
+        cmd = self._capture(
+            monkeypatch,
+            tmp_path,
+            mode="--only-binary=:all:",
+            python_version="3.12",
+            platform_tags=["manylinux_2_17_aarch64", "linux_aarch64"],
+        )
+        assert self._values_after(cmd, "--platform") == [
+            "manylinux_2_17_aarch64,linux_aarch64"
+        ]
+
+    def test_abi_is_never_constrained(self, monkeypatch, tmp_path):
+        # The ABI is the one axis py2bbr cannot know: it belongs to the
+        # nativesdk sysroot, not to the target's Python release.
+        cmd = self._capture(
+            monkeypatch,
+            tmp_path,
+            mode="--only-binary=:all:",
+            python_version="3.12",
+            platform_tags=["manylinux_2_17_aarch64"],
+        )
+        assert "--abi" not in cmd
+
+    def test_no_platform_pin_without_one(self, monkeypatch, tmp_path):
         cmd = self._capture(
             monkeypatch,
             tmp_path,
@@ -356,7 +404,6 @@ class TestRunPipDownload:
             python_version="3.12",
         )
         assert "--platform" not in cmd
-        assert "--abi" not in cmd
 
 
 class TestPublicSdistUrl:
@@ -1643,3 +1690,104 @@ class TestTargetInterpreterPinned:
         monkeypatch.setattr(M, "_run_pip_download", fake)
         M.fetch_source("pkg", "1.0", PipOptions(), tmp_path)
         assert calls == [("--no-binary=:all:", None)]
+
+
+class TestTargetArchitecturePinned:
+    """py2bbr's own CPU must never decide what a layer ships either.
+
+    The reported failure: pyvizionsdk publishes one version per architecture,
+    so an x86_64 host resolving a wheel for a PetaLinux target that runs
+    aarch64 produced a layer installing a wheel the target cannot load (and
+    pinned the wrong upstream version to boot).
+    """
+
+    @staticmethod
+    def _cross(arch: str = "aarch64"):
+        return resolve_target_runtime(
+            resolve_yocto_version("5.0"), platform_machine=arch
+        )
+
+    def test_native_target_is_left_to_pip(self):
+        # The target *is* the machine running py2bbr: pip's own tags already
+        # describe it, and they are wider than anything enumerated here (real
+        # glibc version, musl, the interpreter's ABI). Pinning could only lose
+        # a wheel.
+        assert M._pip_platforms(self._cross(current_platform_machine())) == []
+        assert M._pip_platforms(None) == []
+
+    def test_family_is_named_for_the_target_cpu(self):
+        # pip resolves --platform values literally (a manylinux_2_17_aarch64
+        # value matches only wheels tagged exactly that), so the family has to
+        # be spelled out: every glibc baseline, the legacy aliases, musl, and
+        # the bare linux tag a hand-built toolchain produces.
+        platforms = M._pip_platforms(self._cross())
+        assert platforms == [
+            *(f"manylinux_2_{minor}_aarch64" for minor in range(5, 46)),
+            "manylinux1_aarch64",
+            "manylinux2010_aarch64",
+            "manylinux2014_aarch64",
+            "musllinux_1_1_aarch64",
+            "musllinux_1_2_aarch64",
+            "linux_aarch64",
+        ]
+        assert not any("_x86_64" in p for p in platforms)
+
+    def test_family_uses_the_canonical_cpu_name(self):
+        # arm64 is a spelling; aarch64 is what a Linux target's Python reports
+        # in platform_machine, and what PEP 508 markers compare against.
+        assert "linux_aarch64" in M._pip_platforms(self._cross("arm64"))
+
+    def test_host_that_cannot_name_its_cpu_leaves_pip_in_charge(
+        self, monkeypatch
+    ):
+        # An empty platform.machine() means "unknown", not "x86_64": pip's own
+        # tags are the only ones that can be right about such a host, so no
+        # pin is invented for it.
+        monkeypatch.setattr(M.platform, "machine", lambda: "")
+        assert M._pip_platforms(self._cross("aarch64")) == []
+        assert M._pip_platforms(self._cross("x86_64")) == []
+
+    def test_only_the_wheel_fallback_is_pinned(self, tmp_path, monkeypatch):
+        # The sdist attempts must not carry a platform pin: an sdist is
+        # architecture independent and bitbake builds it on the target.
+        calls: list[tuple[str, list[str] | None]] = []
+
+        def fake(requirement, dest, pip_opts, mode, *a, **kw):
+            calls.append((mode, kw.get("platform_tags")))
+            if mode == "--only-binary=:all:":
+                (dest / "pkg-1.0-py3-none-any.whl").write_bytes(b"data")
+            return subprocess.CompletedProcess([], 0, "", "")
+
+        monkeypatch.setattr(M, "_run_pip_download", fake)
+        M.fetch_source(
+            "pkg",
+            "1.0",
+            PipOptions(),
+            tmp_path,
+            yocto=self._cross(),
+        )
+        assert calls == [
+            ("--no-binary=:all:", None),
+            ("--no-binary=:all:", None),
+            ("--only-binary=:all:", M._pip_platforms(self._cross())),
+        ]
+
+    def test_failure_names_the_cpu_it_sought(self, tmp_path, monkeypatch):
+        # "No matching distribution" is what a pin produces when the index has
+        # wheels for other CPUs only. The message has to say so, or the run
+        # reads as a bad requirement or a wrong index URL.
+        monkeypatch.setattr(
+            M,
+            "_run_pip_download",
+            lambda *a, **kw: subprocess.CompletedProcess(
+                [], 1, "", "ERROR: No matching distribution found for pkg"
+            ),
+        )
+        with pytest.raises(MetadataNotFoundError) as exc:
+            M.fetch_source(
+                "pkg", "1.0", PipOptions(), tmp_path, yocto=self._cross()
+            )
+        message = str(exc.value)
+        assert "aarch64 wheels" in message
+        assert "--platform '*_aarch64'" in message
+        assert "--python-version 3.12" in message

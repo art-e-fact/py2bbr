@@ -3,6 +3,7 @@ Unit tests on CLI functions
 """
 
 import logging
+import platform
 import runpy
 import subprocess
 import sys
@@ -22,6 +23,7 @@ from py2bbr.model import (
     SourceKind,
 )
 from py2bbr.recipe import _TOOL_COMPANION_REQUIREMENTS, canonical_name
+from py2bbr.yocto import current_python_version
 
 
 class TestParsePackageSpec:
@@ -57,6 +59,15 @@ class TestBuildParser:
         assert not args.quiet and not args.verbose
         assert args.with_deps is True
 
+    def test_target_runtime_defaults_to_this_machine(self):
+        # The layer is built here and (usually) runs here, so the running
+        # interpreter and this machine's CPU are the least surprising answers.
+        args = cli.build_parser().parse_args(["black"])
+        assert args.python_version == (
+            f"{sys.version_info.major}.{sys.version_info.minor}"
+        )
+        assert args.target_arch == (platform.machine().lower() or "x86_64")
+
     def test_deps_flag(self):
         assert (
             cli.build_parser().parse_args(["black", "--no-deps"]).with_deps
@@ -91,6 +102,10 @@ class TestBuildParser:
                 "setuptools3",
                 "--machine",
                 "qemarmv7a",
+                "--python-version",
+                "3.12",
+                "--target-arch",
+                "aarch64",
                 "-o",
                 "out",
                 "--layer-name",
@@ -98,6 +113,8 @@ class TestBuildParser:
             ]
         )
         assert args.yocto_version == "6.0"
+        assert args.python_version == "3.12"
+        assert args.target_arch == "aarch64"
         assert args.check == "build"
         assert args.extra_index_url == ["https://i1", "https://i2"]
         assert args.trusted_host == ["h1"]
@@ -810,3 +827,133 @@ class TestTransitiveProvisioning:
             )
         assert rc == 0
         assert calls.count("meson-python") == 1
+
+
+class TestTargetRuntimeFlags:
+    """--python-version / --target-arch must reach the generated layer.
+
+    The series table only knows the Python a Yocto release ships, and nothing
+    at all about the CPU. Without these flags an x86_64 developer generating
+    for a PetaLinux board running aarch64 gets a layer pinned to the host's
+    wheel (pyvizionsdk publishes one version per architecture, so that is the
+    wrong upstream version, not just the wrong file).
+    """
+
+    def _run(self, tmp_path, monkeypatch, capsys, meta, *extra) -> str:
+        monkeypatch.setattr(
+            cli, "build_metadata", _fake_build_metadata(meta, _source(tmp_path))
+        )
+        rc = cli.main(
+            [
+                "black",
+                "-o",
+                str(tmp_path / "out"),
+                "--no-kas",
+                "--check",
+                "structural",
+                *extra,
+            ]
+        )
+        assert rc == 0
+        out = capsys.readouterr().out
+        return (
+            out
+            + (
+                tmp_path
+                / "out"
+                / "meta-black"
+                / "recipes-devtools"
+                / "python"
+                / "python3-black_26.5.1.bb"
+            ).read_text()
+            + (tmp_path / "out" / "meta-black" / "README").read_text()
+        )
+
+    def test_runtime_is_recorded_everywhere(
+        self, tmp_path, monkeypatch, capsys, meta
+    ):
+        text = self._run(
+            tmp_path,
+            monkeypatch,
+            capsys,
+            meta,
+            "--python-version",
+            "3.12",
+            "--target-arch",
+            "aarch64",
+        )
+        # The report header, the recipe's provenance comment and the layer
+        # README: an artifact built for one runtime must never be mistaken for
+        # one built for the machine that happened to run py2bbr.
+        assert "Runtime      : Python 3.12 on aarch64" in text
+        assert "# Runtime: Python 3.12 on aarch64" in text
+        assert "Python 3.12 on aarch64" in text.split("README")[-1]
+
+    def test_target_report_names_the_target_arch(
+        self, tmp_path, monkeypatch, capsys, make_meta_fn
+    ):
+        # The per-target matrix is judged for every machine of the family, so
+        # its header has to say which one the recipe is actually for.
+        out = self._run(
+            tmp_path,
+            monkeypatch,
+            capsys,
+            make_meta_fn(
+                has_native_code=True,
+                native_code_evidence=["C source (pkg/src/mod.c)"],
+            ),
+            "--target-arch",
+            "aarch64",
+        )
+        assert "target arch aarch64" in out
+
+    def test_default_runtime_is_this_machine(
+        self, tmp_path, monkeypatch, capsys, meta
+    ):
+        text = self._run(tmp_path, monkeypatch, capsys, meta)
+        assert f"Runtime      : Python {current_python_version()} on " in text
+
+    def test_python_version_drives_the_requires_python_verdict(
+        self, tmp_path, monkeypatch, capsys, make_meta_fn
+    ):
+        # black's metadata here requires >=3.13, which the series' own 3.12
+        # rejects and an explicitly targeted 3.13 accepts. The override has to
+        # reach the report, not just the comment.
+        meta = make_meta_fn(requires_python=">=3.13")
+        rejected = self._run(
+            tmp_path,
+            monkeypatch,
+            capsys,
+            meta,
+            "--python-version",
+            "3.12",
+        )
+        assert "INCOMPATIBLE" in rejected
+        accepted = self._run(
+            tmp_path,
+            monkeypatch,
+            capsys,
+            meta,
+            "--python-version",
+            "3.13",
+        )
+        assert "INCOMPATIBLE" not in accepted
+
+    @pytest.mark.parametrize(
+        ("flag", "value", "named"),
+        [
+            ("--python-version", "3", "--python-version"),
+            ("--python-version", "three", "--python-version"),
+            ("--target-arch", "a b", "--target-arch"),
+            # An alias is reported under the name that documents it.
+            ("--arch", "aarch64/64", "--target-arch"),
+        ],
+    )
+    def test_unparsable_value_is_a_clean_error(
+        self, tmp_path, capsys, flag, value, named
+    ):
+        # Not an argparse "invalid choice" traceback: the value is validated
+        # once the target is being resolved, and has to read as a message.
+        assert cli.main(["black", "-o", str(tmp_path), flag, value]) == 2
+        err = capsys.readouterr().err
+        assert f"error: invalid {named} '{value}'" in err

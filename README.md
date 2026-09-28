@@ -42,6 +42,9 @@ py2bbr pyserial
 # Pin a version, pick a Yocto series
 py2bbr "requests==2.34.2" --yocto-version 5.0
 
+# Name the target's runtime (defaults: this interpreter, this machine)
+py2bbr pyvizionsdk --python-version 3.12 --target-arch aarch64
+
 # Reach a package that is not on PyPI (private index)
 py2bbr mytool \
     --extra-index-url https://pypi.mycompany.com/simple \
@@ -80,6 +83,8 @@ providers.
 | Flag | Meaning |
 | --- | --- |
 | `--yocto-version` | Yocto version or codename (`5.0`, `scarthgap`, …). Default `5.0`. |
+| `--python-version` | Python version the target image runs (`3.12`). Default: the interpreter py2bbr itself runs under. See [Target runtime](#target-runtime-python-version--cpu). |
+| `--target-arch`, `--arch` | CPU the target image runs, as `platform.machine()` reports it (`aarch64`, `armv7l`, `x86_64`, `riscv64`; `arm64`/`amd64` are accepted and canonicalised). Default: this machine. See [Target runtime](#target-runtime-python-version--cpu). |
 | `--index-url`, `--extra-index-url`, `--trusted-host` | pip index options, forwarded to `pip download`. |
 | `--pip-arg` | Append any extra raw argument to `pip download` (repeatable). |
 | `--check {structural,parse,checklayer,build}` | Validation ceiling (default `parse`). |
@@ -95,6 +100,52 @@ providers.
 | `--jobs N` | Fetch closure dependencies in parallel (default `4`; `1` = sequential). Each in-flight fetch shows its own live progress bar on stderr (TTY only). The top package and its direct deps keep their order; deeper members always come after the member that discovered them, but members found by two concurrent parents can interleave at the same depth (order has no effect on the generated layer, since bitbake follows `RDEPENDS`). |
 | `-q`, `-v` | Logging: INFO stage progress lines on stderr (default); `-q` restricts to warnings/errors (and disables the live fetch progress bars); `-v` adds DEBUG detail (per-package fetch/parse summaries, public-PyPI reachability). |
 
+## Target runtime (Python version + CPU)
+
+A Yocto series only says which Python it ships, and says nothing at all about
+the CPU. Neither is the same as the machine running `py2bbr` once the layer is
+cross-built, so both are flags:
+
+```bash
+# An older PetaLinux image running CPython 3.12 on a 64-bit ARM CPU
+py2bbr pyvizionsdk --python-version 3.12 --target-arch aarch64
+```
+
+| | Default | Override with |
+| --- | --- | --- |
+| Python version | the interpreter `py2bbr` itself runs under | `--python-version 3.12` (`3.12.4` and `312` are accepted and reduced to `3.12`) |
+| CPU architecture | this machine (`platform.machine()`) | `--target-arch aarch64` (`--arch`; `arm64` → `aarch64`, `amd64` → `x86_64`, `armv7` → `armv7l`, …) |
+
+Both default to what you are running, because that is what "generate a layer for
+this machine" means; name the target explicitly whenever the image boots
+somewhere else. The resolved pair is reported (`Runtime : Python 3.12 on
+aarch64`) and recorded in the recipe, so an artifact is never mistaken for one
+built for the generating machine.
+
+It drives:
+
+* **the artifact a wheel recipe installs** — when a package publishes no sdist,
+  the wheel fallback is downloaded with pip pinned to the target's interpreter
+  *and* to the target's CPU (`--python-version 3.12 --platform
+  manylinux_2_5_aarch64,…,linux_aarch64`), so a package that ships one version
+  per architecture (`pyvizionsdk`) resolves to the target's, not the build
+  host's. pip resolves each `--platform` value as a literal tag, so the whole
+  manylinux/musllinux family is named for the target. The pin is only added
+  when the target's architecture differs from the build host's: for a
+  same-architecture target pip's own tags are already the right answer and
+  strictly wider (the host's real glibc, its ABI). Need something outside that
+  family? `--pip-arg=--platform=…` adds to it;
+* **`Requires-Python`** — the build-for-target report marks every target
+  `INCOMPATIBLE` when the target's Python is excluded;
+* **PEP 508 markers** — `python_version`/`python_full_version`/`platform_machine`
+  are evaluated for the target, so version-gated requirements are classified for
+  the image and not for the build host;
+* **classifier pruning** — the recipe drops the `Programming Language` lines the
+  target's Python does not know (a 3.12 target does not accept a `3.13` line).
+
+It does **not** change the kas `MACHINE` (the machine that *builds* the layer):
+`--machine` is for that, and it stays the build host by default.
+
 ## Building for the target (cross builds)
 
 A layer is built by the **build host** (usually x86_64) and the image runs on the
@@ -105,6 +156,9 @@ A layer is built by the **build host** (usually x86_64) and the image runs on th
   has to run on the machine doing the building;
 * the **package** must be compiled for the target, otherwise the image carries
   x86_64 extension modules the target cannot load.
+
+Which CPU that is comes from `--target-arch` (default: the build host's — see
+[Target runtime](#target-runtime-python-version--cpu)).
 
 py2bbr makes that explicit in two places.
 
@@ -124,7 +178,7 @@ why the build tools stay `-native`:
 Findings that hold for every target are printed once, then one line per target:
 
 ```
-Build for target (build class python_mesonpy, layer built on x86_64):
+Build for target (build class python_mesonpy, layer built on x86_64, target arch x86_64):
   - extension modules (C source (...), C++ source (...)) are compiled for the
     target: python_mesonpy exports the target toolchain (CC/LDSHARED,
     STAGING_INCDIR/STAGING_LIBDIR) and DEPENDS the target python3
@@ -175,13 +229,19 @@ Currently: **6.0 (Wayne)** and **5.0 (Scarthgap, default)** are supported. We ex
 commented out in code for now). Add entries in `src/py2bbr/yocto.py` to start
 supporting more.
 
+The series' Python is only a *default of last resort*: `--python-version`
+overrides it (default: the interpreter `py2bbr` runs under) — see
+[Target runtime](#target-runtime-python-version--cpu).
+
 Tests are currently conducted on 5.0 (the default), and the others are "experimental"
 for now using LLM generated code.
 
 ## How it works
 
 1. `pip download` the package (sdist preferred, wheel fallback) honouring your index
-   flags, into an isolated dir.
+   flags, into an isolated dir. The wheel fallback is pinned to the target
+   runtime (`--python-version`, and `--platform` for a foreign CPU), so the
+   artifact is the target's, not the build host's.
 2. Parse `PKG-INFO`/`METADATA` (stdlib `email`), read `pyproject.toml`
    `[build-system]` for the backend + build deps, locate the license file and compute
    its MD5, and compute the sdist SHA-256.

@@ -31,12 +31,26 @@ class YoctoVersion:
     The mapping is owned by py2bbr (kas is data-driven and does not ship a
     release->branch table). ``poky_branch`` is the poky git branch and is also
     the value used in the generated ``kas`` build file.
+
+    It doubles as the resolved *target runtime*: :attr:`python_version` and
+    :attr:`platform_machine` are what the image will actually run, and every
+    consumer downstream (marker evaluation, the artifact the recipe installs,
+    the build-for-target report) reads them from here. They default to the
+    series' own values, and ``--python-version`` / ``--target-arch`` override
+    them per run (see :func:`py2bbr.yocto.resolve_target_runtime`).
     """
 
     version: str
     codename: str
     poky_branch: str
     python_version: str
+    #: ``platform_machine`` value as Python reports it *on the target* (the CPU
+    #: the image runs on), e.g. ``aarch64``. Not part of the release: it
+    #: defaults to the build host's, which is only right when the image runs
+    #: there too, and ``--target-arch`` overrides it. Kept here so the PEP 508
+    #: evaluation environment, the wheel-tag checks and the report all describe
+    #: one single target.
+    platform_machine: str = "x86_64"
     #: Layer that provides the ``python3-*`` recipes we depend on.
     meta_python: str = "meta-python"
     #: Base URL of the poky repository (overridable for mirrors).
@@ -54,6 +68,15 @@ class YoctoVersion:
     @property
     def label(self) -> str:
         return f"Yocto {self.version} ({self.codename})"
+
+    @property
+    def runtime_label(self) -> str:
+        """The runtime the layer targets, e.g. ``Python 3.12 on aarch64``.
+
+        Recorded in the recipe and the layer README so the artifact is never
+        mistaken for one built for the machine that happened to run py2bbr.
+        """
+        return f"Python {self.python_version} on {self.platform_machine}"
 
 
 @dataclass(frozen=True)

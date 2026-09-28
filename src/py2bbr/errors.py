@@ -21,6 +21,10 @@ class YoctoVersionError(ConfigurationError):
     """An unknown or unresolvable ``--yocto-version`` was supplied."""
 
 
+class TargetRuntimeError(ConfigurationError):
+    """An unparsable ``--python-version`` / ``--target-arch`` was supplied."""
+
+
 class MetadataError(Py2BbrError):
     """The package metadata could not be fetched or parsed."""
 
