@@ -370,9 +370,7 @@ class TestRunPipDownload:
     def test_target_platform_is_pinned(self, monkeypatch, tmp_path):
         # The platform pin is a list because pip resolves each --platform value
         # as a literal tag (it does not expand manylinux_2_17_aarch64 into the
-        # manylinux family), so the whole family has to be named. One
-        # comma-separated value, which pip accepts and which keeps the command
-        # readable in a debug log.
+        # manylinux family), so the whole family has to be named.
         cmd = self._capture(
             monkeypatch,
             tmp_path,
@@ -381,8 +379,34 @@ class TestRunPipDownload:
             platform_tags=["manylinux_2_17_aarch64", "linux_aarch64"],
         )
         assert self._values_after(cmd, "--platform") == [
-            "manylinux_2_17_aarch64,linux_aarch64"
+            "manylinux_2_17_aarch64",
+            "linux_aarch64",
         ]
+
+    def test_platform_tags_are_never_comma_joined(self, monkeypatch, tmp_path):
+        # pip's --platform is action="append" and does NOT split its value on
+        # commas, so a single "a,b" argument is matched as the one literal tag
+        # "a,b" and rejects every wheel - including the exact aarch64 one the
+        # index serves (the reported pyvizionsdk failure). One flag per tag.
+        cross = (
+            "x86_64" if current_platform_machine() == "aarch64" else "aarch64"
+        )
+        platforms = M._pip_platforms(
+            resolve_target_runtime(
+                resolve_yocto_version("5.0"), platform_machine=cross
+            )
+        )
+        cmd = self._capture(
+            monkeypatch,
+            tmp_path,
+            mode="--only-binary=:all:",
+            python_version="3.12",
+            platform_tags=platforms,
+        )
+        values = self._values_after(cmd, "--platform")
+        assert values == platforms
+        assert not any("," in v for v in values)
+        assert all(v.endswith(f"_{cross}") for v in values)
 
     def test_abi_is_never_constrained(self, monkeypatch, tmp_path):
         # The ABI is the one axis py2bbr cannot know: it belongs to the
@@ -1789,5 +1813,10 @@ class TestTargetArchitecturePinned:
             )
         message = str(exc.value)
         assert "aarch64 wheels" in message
-        assert "--platform '*_aarch64'" in message
+        # The reproduction command must be pasteable: pip has no wildcard for
+        # --platform, so '*_aarch64' would itself fail and teach nothing. It
+        # keeps the interpreter pin and drops the platform one, which is what
+        # tells "no aarch64 wheel" apart from "no wheel at all".
         assert "--python-version 3.12" in message
+        assert "--platform" not in message
+        assert "carries nothing for aarch64" in message

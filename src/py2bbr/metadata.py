@@ -314,10 +314,16 @@ def _run_pip_download(
         # that runs aarch64. Only set for a target that *is* the build host's
         # architecture away (see :func:`_pip_platforms`); pip requires
         # ``--only-binary``/``--no-deps`` alongside it, both of which the
-        # caller passes. One comma-separated value: pip's ``--platform`` takes
-        # either form, and a single argument keeps the command readable in a
-        # debug log.
-        cmd += ["--platform", ",".join(platform_tags)]
+        # caller passes.
+        #
+        # One ``--platform`` per tag, never a comma-joined list: pip's option
+        # is ``action="append"`` and it does not split its value, so
+        # ``--platform a,b`` is matched as the single literal tag ``a,b`` and
+        # matches nothing at all (pip reports "no matching distribution" for an
+        # index that serves exactly the requested wheel). That is why the
+        # cross-arch fetch of pyvizionsdk found no aarch64 wheel.
+        for tag in platform_tags:
+            cmd += ["--platform", tag]
     if no_build_isolation:
         # Build the sdist's metadata with the environment py2bbr runs in rather
         # than letting pip provision an isolated one from the index.
@@ -583,15 +589,26 @@ def fetch_source(
             arch = getattr(yocto, "platform_machine", "") or "the target's"
             # The full platform list is a wall of ~45 manylinux baselines; name
             # the CPU it is built around, which is what a reader has to check.
-            restrictions.append(f"--platform '*_{arch}'")
             served_for.append(f"{arch} wheels")
         hint = ""
         if restrictions:
+            # The reproduction command keeps the interpreter pin but drops the
+            # platform one: pip has no wildcard for --platform, so quoting a
+            # single tag would be arbitrary and quoting all ~45 is unreadable.
+            # What that command settles is the question the reader actually has
+            # - does this index serve a wheel for this Python at all? A success
+            # means the index is fine and simply carries nothing for the CPU.
+            verdict = (
+                f" If this command finds a wheel, the index carries nothing "
+                f"for {arch}."
+                if pinned_platform
+                else ""
+            )
             hint = (
                 f"\n  The wheel download was restricted to "
                 f"{' and '.join(served_for)}, the runtime "
                 f"{_target_label(yocto)} runs, so this also covers an index that "
-                f"serves wheels for other targets only. Check what it offers: "
+                f"serves wheels for other targets only.{verdict} Check it with: "
                 f"`pip download {requirement} --only-binary=:all: "
                 f"{' '.join(restrictions)} --no-deps <your index flags>`"
             )
