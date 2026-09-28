@@ -12,6 +12,9 @@ Current approach
 5. Locate the license file and compute its MD5 (for ``LIC_FILES_CHKSUM``).
 6. Classify ``Requires-Dist`` into runtime / build / dropped using ``packaging``
    marker evaluation against the target Yocto Python version.
+7. Inspect the sdist for code that has to be *compiled* and for build config
+   that hard-codes an x86 assumption, so the generated recipe can be judged
+   per target architecture (see ``py2bbr.targets``).
 """
 
 from __future__ import annotations
@@ -20,6 +23,7 @@ import email
 import email.message
 import hashlib
 import logging
+import os
 import re
 import shutil
 import subprocess
@@ -32,7 +36,7 @@ import urllib.request
 import zipfile
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from packaging.markers import default_environment
 from packaging.requirements import InvalidRequirement, Requirement
@@ -42,10 +46,12 @@ from py2bbr.model import (
     DEFAULT_YOCTO_VERSION,
     Dependency,
     DepKind,
+    MachineDep,
     PackageMetadata,
     SourceKind,
     YoctoVersion,
 )
+from py2bbr.targets import KNOWN_TARGETS
 
 logger = logging.getLogger(__name__)
 
@@ -194,11 +200,19 @@ def _run_pip_download(
         ]
         + pip_opts.build_args()
     )
+    # pip's isolated metadata build unpacks the sdist into $TMPDIR, which may
+    # be an inode-starved tmpfs (ENOSPC mid-extraction); route pip's scratch
+    # onto the workdir filesystem (dest as parent), where it is deleted with dest.
+    scratch = dest / "pip-scratch"
+    scratch.mkdir(exist_ok=True)
+    env = os.environ.copy()
+    env["TMPDIR"] = str(scratch)
     return subprocess.run(
         cmd,
         capture_output=True,
         text=True,
         check=False,
+        env=env,
     )
 
 
@@ -597,6 +611,11 @@ def _marker_env(yocto: YoctoVersion | None) -> dict:
     We target a CPython on Linux; the Python version comes from the Yocto series
     so that version-gated dependencies (``tomli; python_version < "3.11"``) are
     classified correctly for the default Scarthgap/3.12 target.
+
+    ``platform_machine`` is only a *guess* here (the build host's x86_64): the
+    real target is unknown when the metadata is parsed, which is exactly why
+    machine-gated requirements are split out (see :func:`machine_gated_deps`)
+    instead of being resolved against it.
     """
     env = dict(default_environment())
     env.update(
@@ -613,6 +632,245 @@ def _marker_env(yocto: YoctoVersion | None) -> dict:
         env["python_version"] = yocto.python_version
         env["python_full_version"] = yocto.python_version + ".0"
     return env
+
+
+# --------------------------------------------------------------------------- #
+# build-for-target inspection (native code / x86 assumptions)
+# --------------------------------------------------------------------------- #
+
+#: Suffix -> language label. A member with one of these suffixes (outside the
+#: test/doc trees, see :func:`_is_ignored_member`) means the sdist ships code
+#: that has to be compiled for the target, so the recipe's build class must
+#: drive the target toolchain. Headers (``.h``) are not evidence on their own:
+#: every pure-Python sdist that vendors a C snippet for a build hook would
+#: otherwise look like a compiled package.
+_NATIVE_SUFFIX_KINDS: dict[str, str] = {
+    ".c": "C",
+    ".cc": "C++",
+    ".cpp": "C++",
+    ".cxx": "C++",
+    ".m": "Objective-C",
+    ".mm": "Objective-C++",
+    ".pyx": "Cython",
+    ".pxd": "Cython",
+    ".pxi": "Cython",
+    ".rs": "Rust",
+    ".go": "Go",
+    ".f": "Fortran",
+    ".f90": "Fortran",
+    ".f95": "Fortran",
+    ".cu": "CUDA",
+}
+
+#: Directories whose contents are never part of the installed/built package.
+_IGNORED_DIR_NAMES = frozenset(
+    {
+        "bench",
+        "benchmarks",
+        "ci",
+        "doc",
+        "docs",
+        "example",
+        "examples",
+        "test",
+        "test_data",
+        "testing",
+        "tests",
+    }
+)
+
+#: ``[build-system].requires`` entries that imply compiled code even when the
+#: sdist carries no source of that language (a generated one, typically).
+_NATIVE_BUILD_REQS = frozenset(
+    {
+        "cffi",
+        "cffi-rust",
+        "cython",
+        "maturin",
+        "pybind11",
+        "pyo3",
+        "setuptools-rust",
+    }
+)
+
+#: Build-config tokens that pin the build to an x86 CPU. Deliberately limited
+#: to *flag-shaped* tokens: a bare ``x86_64``/``amd64``/``i686`` string in a
+#: ``pyproject.toml`` is nearly always a cibuildwheel image name or a guarded
+#: ``platform_machine`` branch, not a hard-coded build, and flagging those
+#: buries the real hazard. A guarded machine test is fine; ``-march=native`` or
+#: ``-mavx2`` reaching the ARM compiler is not. Their presence does not prove
+#: the package is x86-only, so they only raise a RISK for non-x86 targets - with
+#: the file named, so the user can check it.
+_HOST_ISA_TOKENS = (
+    "-march=",
+    "-mtune=",
+    "-mcpu=",
+    "--cpu=",
+    "-mavx",
+    "-msse",
+    "-mfma",
+    "-mno-sse",
+    "-mno-avx",
+    "avx2",
+    "avx512",
+    "sse4_2",
+    "sse4.2",
+)
+
+_HOST_ISA_FILES = ("setup.py", "pyproject.toml", "setup.cfg", "meson.build")
+
+#: Cap on evidence strings so a huge vendored C tree cannot flood the report.
+_MAX_EVIDENCE = 4
+
+
+def _member_names(path: Path) -> list[str]:
+    """Every member name in the artifact (names only, no extraction)."""
+    if path.suffix in (".whl", ".zip"):
+        try:
+            with zipfile.ZipFile(path) as zf:
+                return zf.namelist()
+        except (OSError, zipfile.BadZipFile):
+            return []
+    try:
+        with tarfile.open(path, "r:*") as tf:
+            return tf.getnames()
+    except (OSError, tarfile.TarError):
+        return []
+
+
+def _is_ignored_member(name: str) -> bool:
+    """Whether a member lives in a test/doc/example tree or is a test file.
+
+    sdists routinely ship the CPython C-API test suite (``Lib/test/``) or a
+    Cython parser fixture; neither is compiled into the wheel.
+    """
+    parts = PurePosixPath(name).parts
+    if len(parts) < 2:
+        return True
+    for part in parts[1:-1]:
+        if part.lower() in _IGNORED_DIR_NAMES:
+            return True
+    stem = parts[-1].rsplit(".", 1)[0].lower()
+    return stem.startswith(("test_", "conftest")) or stem.endswith(
+        ("_test", "_tests")
+    )
+
+
+def detect_native_code(
+    source: FetchedSource, build_requires: list[str] = ()
+) -> tuple[bool, list[str]]:
+    """Whether the artifact ships code that must be compiled, plus evidence.
+
+    Evidence strings name the language and an example path (or the build
+    requirement that pulls in a compiler). A pure-Python sdist yields
+    ``(False, [])``; the recipe then needs no target toolchain and the target
+    report has nothing to warn about.
+    """
+    found: dict[str, str] = {}
+    for name in _member_names(source.path):
+        kind = _NATIVE_SUFFIX_KINDS.get(PurePosixPath(name).suffix.lower())
+        if kind is None or _is_ignored_member(name):
+            continue
+        found.setdefault(kind, name)
+    evidence = [
+        f"{kind} source ({path})" for kind, path in sorted(found.items())
+    ]
+
+    # ``[build-system].requires`` entries arrive as full PEP 508 requirements
+    # (``cython>=3.1``), so compare the parsed project name, not the raw string.
+    for req in build_requires:
+        try:
+            name = _canonical(Requirement(req).name)
+        except InvalidRequirement:
+            continue
+        if name in _NATIVE_BUILD_REQS:
+            evidence.append(f"build requires {name}")
+
+    if not evidence:
+        for _name, data in _all_matching(
+            source.path,
+            lambda n: n.count("/") == 1 and n.endswith("setup.py"),
+        ):
+            if b"ext_modules" in data or b"Extension(" in data:
+                evidence.append("setup.py declares ext_modules")
+                break
+
+    evidence = evidence[:_MAX_EVIDENCE]
+    return bool(evidence), evidence
+
+
+def detect_host_assumptions(source: FetchedSource) -> list[str]:
+    """Top-level build config lines that pin the build to an x86 host.
+
+    ``"<file>: <tokens>"`` per file, e.g. ``"setup.py: -march=, -mavx"``. Only
+    consulted for non-x86 targets, where such a flag either fails the compile
+    or silently disables an optimization.
+    """
+    out: list[str] = []
+    for name, data in _all_matching(
+        source.path,
+        lambda n: (
+            n.count("/") == 1 and PurePosixPath(n).name in _HOST_ISA_FILES
+        ),
+    ):
+        text = data.decode("utf-8", errors="replace").lower()
+        hits = [token for token in _HOST_ISA_TOKENS if token in text]
+        if not hits:
+            continue
+        out.append(f"{PurePosixPath(name).name}: {', '.join(hits[:3])}")
+    return out[:_MAX_EVIDENCE]
+
+
+def machine_gated_deps(
+    requires_dist: list[str], yocto: YoctoVersion | None
+) -> tuple[list[MachineDep], list[str]]:
+    """Split machine-specific requirements from the arch-independent ones.
+
+    ``foo; platform_machine == "aarch64"`` must not be resolved here: the layer
+    is cross-built, so the answer depends on the *target*, not on the host that
+    runs bitbake. Such entries are returned as :class:`MachineDep` (with the
+    target list they apply to) and the recipe renders them as machine-conditional
+    ``RDEPENDS:${PN}:append:<token>``; everything else is returned unchanged for
+    the normal marker classification.
+
+    A requirement no known target satisfies is dropped entirely (e.g.
+    ``win32``-only machine values cannot appear in a POSIX ``platform_machine``).
+    """
+    base = _marker_env(yocto)
+    # Several matrix entries share one platform_machine (aarch64 covers
+    # ZynqMP, Versal and the generic Cortex-A targets), so dedupe while keeping
+    # the matrix order: the recipe groups the deps per MACHINEOVERRIDES token.
+    machines_all = tuple(
+        dict.fromkeys(t.platform_machine for t in KNOWN_TARGETS)
+    )
+    gated: list[MachineDep] = []
+    plain: list[str] = []
+    for raw in requires_dist:
+        try:
+            req = Requirement(raw)
+        except InvalidRequirement:
+            plain.append(raw)
+            continue
+        marker = req.marker
+        if marker is None or "platform_machine" not in str(marker):
+            plain.append(raw)
+            continue
+        machines = tuple(
+            m
+            for m in machines_all
+            if marker.evaluate({**base, "platform_machine": m})
+        )
+        if not machines:
+            continue
+        gated.append(
+            MachineDep(
+                name=req.name,
+                requirement=raw,
+                marker=str(marker),
+                machines=machines,
+            )
+        )
+    return gated, plain
 
 
 def classify_requires_dist(
@@ -748,10 +1006,17 @@ def build_metadata(
     lic = find_license_file(source)
     license_file, license_md5 = lic if lic else (None, None)
 
+    # Machine-gated requirements are resolved by bitbake on the real target,
+    # not here (the host that runs bitbake is not the target).
+    machine_deps, plain_requires = machine_gated_deps(requires_dist, yocto)
     runtime, _build_from_rd, dropped = classify_requires_dist(
-        requires_dist, yocto
+        plain_requires, yocto
     )
     build_deps = _build_deps_from_requires(build_requires)
+    has_native_code, native_evidence = detect_native_code(
+        source, build_requires
+    )
+    host_assumptions = detect_host_assumptions(source)
 
     # Only sdists are fetched by the pypi class, so only they can hit its URL
     # 404; a wheel's recipe keeps its own fetch semantics.
@@ -766,13 +1031,16 @@ def build_metadata(
     elif source.public_reachable is True:
         logger.debug("%s: reachable on public PyPI", source.filename)
     logger.debug(
-        "%s==%s: license=%s backend=%s runtime_deps=%d build_deps=%d",
+        "%s==%s: license=%s backend=%s runtime_deps=%d build_deps=%d "
+        "native_code=%s machine_deps=%d",
         meta_name,
         meta_version,
         license_spdx or "-",
         backend or "setup.py",
         len(runtime),
         len(build_deps),
+        "yes" if has_native_code else "no",
+        len(machine_deps),
     )
 
     meta = PackageMetadata(
@@ -793,9 +1061,14 @@ def build_metadata(
         source_sha256=source.sha256,
         vendored=vendored,
         build_backend=backend,
+        requires_dist=list(requires_dist),
+        has_native_code=has_native_code,
+        native_code_evidence=native_evidence,
+        host_assumptions=host_assumptions,
         runtime_deps=runtime,
         build_deps=build_deps,
         dropped_deps=dropped,
+        machine_deps=machine_deps,
         resolved_from=(
             pip_opts.index_url
             or (
@@ -829,56 +1102,102 @@ def resolve_closure(
     intact, e.g. ``tomli>=1.0.2``) passed through verbatim so upstream
     bounds are honoured when picking versions.
 
-    With ``workers > 1`` the members of each BFS level are fetched in
-    parallel through one shared thread pool; ``executor.map`` preserves input
-    order, so the closure is identical to a sequential run. ``builder`` must
-    be thread-safe — the fetch path already is: every call downloads into its
+    With ``workers > 1`` fetches run in parallel through one shared thread
+    pool. A member's dependencies are unknowable until its own fetch has
+    completed, so instead of waiting for the whole BFS level to finish (a
+    level barrier that serialises deep or uneven dependency chains behind the
+    slowest member of each level), each completed fetch immediately hands its
+    newly discovered dependencies to the pool. ``builder`` must be
+    thread-safe — the fetch path already is: every call downloads into its
     own fresh subdirectory of ``workdir``.
 
-    Returns ``(closure, warnings)`` with ``closure[0]`` == ``top`` (top
-    recipe stays the kas target; bitbake follows RDEPENDS transitively).
-    Members are deduplicated by canonical name (cycle-safe); ``skip`` is a set
-    of canonical names to drop (the ``--skip-dep`` escape hatch for
-    distro-provided packages, e.g. ``numpy``); ``max_depth`` limits recursion
-    depth (``None`` = unlimited).
+    Closure order: ``closure[0]`` is always ``top`` (the kas target; bitbake
+    follows RDEPENDS transitively) and every other member appears after the
+    member that discovered it, in discovery order — so chain and
+    single-parent graphs match a sequential BFS exactly. With ``workers > 1``
+    members discovered by two *concurrent* parents can interleave at the same
+    depth; member order has no effect on the generated layer's build
+    correctness. Members are deduplicated by canonical name (cycle-safe);
+    ``skip`` is a set of canonical names to drop (the ``--skip-dep`` escape
+    hatch for distro-provided packages, e.g. ``numpy``); ``max_depth`` limits
+    recursion depth (``None`` = unlimited).
     """
-    from concurrent.futures import ThreadPoolExecutor
+    from concurrent.futures import (
+        FIRST_COMPLETED,
+        Future,
+        ThreadPoolExecutor,
+        wait,
+    )
 
     visited: set[str] = {_canonical(top.name)}
     skipped: set[str] = set()
     closure: list[PackageMetadata] = [top]
     warnings: list[str] = []
 
-    frontier: list[tuple[PackageMetadata, int]] = [(top, 0)]
-    pool = ThreadPoolExecutor(max_workers=workers) if workers > 1 else None
-    try:
+    def _discover(
+        meta: PackageMetadata, depth: int
+    ) -> list[tuple[str, Dependency, int]]:
+        """The unvisited, unskipped deps of ``meta`` at ``depth + 1``."""
+        if max_depth is not None and depth >= max_depth:
+            return []
+        newly: list[tuple[str, Dependency, int]] = []
+        for dep in meta.runtime_deps:
+            canonical = _canonical(dep.name)
+            if canonical in visited:
+                continue
+            if canonical in skip:
+                skipped.add(canonical)
+                continue
+            visited.add(canonical)
+            newly.append((canonical, dep, depth + 1))
+        return newly
+
+    if workers <= 1:
+        # Sequential FIFO BFS: deterministic, same order every run.
+        frontier: list[tuple[PackageMetadata, int]] = [(top, 0)]
         while frontier:
             depth = frontier[0][1]
-            if max_depth is not None and depth >= max_depth:
-                break
-            batch: list[Dependency] = []
-            for meta, _depth in frontier:
-                for dep in meta.runtime_deps:
-                    canonical = _canonical(dep.name)
-                    if canonical in visited:
-                        continue
-                    if canonical in skip:
-                        skipped.add(canonical)
-                        continue
-                    visited.add(canonical)
-                    batch.append(dep)
+            batch: list[Dependency] = [
+                dep
+                for meta, _depth in frontier
+                for _c, dep, _d in _discover(meta, _depth)
+            ]
             if not batch:
                 break
-            if pool is not None:
-                fetched = list(pool.map(builder, batch))
-            else:
-                fetched = [builder(dep) for dep in batch]
+            fetched = [builder(dep) for dep in batch]
             members = [member for member, _source in fetched]
             closure.extend(members)
             frontier = [(member, depth + 1) for member in members]
-    finally:
-        if pool is not None:
-            pool.shutdown(wait=True)
+    else:
+        # Greedy parallel: a completed fetch releases its deps into the pool
+        # immediately, so a deep chain keeps every worker busy instead of
+        # stalling behind the slowest member of each BFS level.
+        seq = 0
+        discovered: list[Future] = []  # submission order (== discovery order)
+
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            # future -> (submission sequence, the member's own depth)
+            pending: dict[Future, tuple[int, int]] = {}
+
+            def _submit(dep: Dependency, own_depth: int) -> None:
+                nonlocal seq
+                seq += 1
+                fut = pool.submit(builder, dep)
+                pending[fut] = (seq, own_depth)
+                discovered.append(fut)
+
+            for _c, dep, depth in _discover(top, 0):
+                _submit(dep, depth)
+
+            while pending:
+                done, _ = wait(pending, return_when=FIRST_COMPLETED)
+                for fut in sorted(done, key=lambda f: pending[f][0]):
+                    member, _source = fut.result()
+                    own_depth = pending.pop(fut)[1]
+                    for _name, dep, depth in _discover(member, own_depth):
+                        _submit(dep, depth)
+
+            closure.extend(fut.result()[0] for fut in discovered)
 
     for canonical in sorted(skip):
         if canonical not in visited and canonical not in skipped:

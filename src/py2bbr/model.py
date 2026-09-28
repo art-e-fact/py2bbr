@@ -79,6 +79,56 @@ class Dependency:
         return self.name
 
 
+#: ``platform.machine()`` -> the ``MACHINEOVERRIDES`` tokens poky guarantees
+#: for that architecture (see ``meta/conf/machine/include/*/arch-*.inc``:
+#: ``arch-x86.inc`` adds ``x86``/``x86_64``, ``arch-armv7a.inc`` ``armv7a``,
+#: ``arch-arm64.inc`` ``aarch64``). They are the override suffixes a recipe may
+#: use in ``RDEPENDS:${PN}:append:<token>``, so a recipe stays correct on every
+#: machine of the family instead of only on the machine py2bbr ran on.
+MACHINE_OVERRIDE_TOKENS: dict[str, tuple[str, ...]] = {
+    "aarch64": ("aarch64",),
+    "aarch64_be": ("aarch64",),
+    "amd64": ("x86_64",),
+    "arm64": ("aarch64",),
+    "armv7a": ("armv7a",),
+    "armv7l": ("armv7a",),
+    "armv8l": ("armv7a", "armv8a"),
+    "i386": ("x86",),
+    "i486": ("x86",),
+    "i586": ("x86",),
+    "i686": ("x86",),
+    "riscv64": ("riscv64",),
+    "x86_64": ("x86_64",),
+}
+
+
+def machine_override_tokens(machine: str) -> tuple[str, ...]:
+    """``MACHINEOVERRIDES`` tokens for a ``platform_machine`` value."""
+    return MACHINE_OVERRIDE_TOKENS.get(machine.lower(), (machine.lower(),))
+
+
+@dataclass(frozen=True)
+class MachineDep:
+    """A runtime dependency gated on the target's ``platform_machine``.
+
+    ``Requires-Dist`` markers such as ``foo; platform_machine == "x86_64"``
+    must not be baked into the recipe's unconditional RDEPENDS: the layer is
+    cross-built (x86_64 host) for a different target CPU, and baking the
+    *host* machine's answer in ships the wrong dependency set (and drops the
+    one the target actually needs). Such deps are rendered as
+    ``RDEPENDS:${PN}:append:<MACHINEOVERRIDES token>`` instead, so the
+    selection happens inside bitbake on the real target.
+    """
+
+    name: str
+    #: Original PEP 508 requirement string.
+    requirement: str = ""
+    #: The marker as written upstream, e.g. ``platform_machine == "aarch64"``.
+    marker: str = ""
+    #: ``platform_machine`` values on which the dependency applies.
+    machines: tuple[str, ...] = ()
+
+
 @dataclass
 class PackageMetadata:
     """Authoritative metadata for one Python package version."""
@@ -110,11 +160,31 @@ class PackageMetadata:
     vendored: bool = False
     #: PEP 517 ``[build-system].build-backend`` (e.g. ``setuptools.build_meta``).
     build_backend: str = ""
+    #: Every ``Requires-Dist`` entry as published, before marker evaluation
+    #: (the target compatibility report re-evaluates them per architecture).
+    requires_dist: list[str] = field(default_factory=list)
+
+    # --- build-for-target shape -------------------------------------------
+    #: True when the sdist ships code that must be *compiled* (C/C++/Cython/
+    #: Rust/Go/Fortran/... sources, or an explicit ``ext_modules``). Such a
+    #: package only works on a foreign architecture if the recipe drives the
+    #: target toolchain; a backend that runs under ``nativepython3`` produces
+    #: host binaries otherwise.
+    has_native_code: bool = False
+    #: Human-readable evidence for :attr:`has_native_code` (paths / build
+    #: requirements), empty for a pure-Python sdist.
+    native_code_evidence: list[str] = field(default_factory=list)
+    #: Build-config lines that hard-code an x86 assumption (``-march=native``,
+    #: ``avx2``, ``x86_64``), i.e. code that may not compile for ARM.
+    host_assumptions: list[str] = field(default_factory=list)
 
     # --- dependencies ----------------------------------------------------
     runtime_deps: list[Dependency] = field(default_factory=list)
     build_deps: list[Dependency] = field(default_factory=list)
     dropped_deps: list[Dependency] = field(default_factory=list)
+    #: Runtime deps whose ``platform_machine`` marker makes them target
+    #: specific; rendered as machine-conditional RDEPENDS.
+    machine_deps: list[MachineDep] = field(default_factory=list)
 
     # --- provenance ------------------------------------------------------
     #: The index/base URL the package was resolved from (best effort).

@@ -279,6 +279,35 @@ class TestRunPipDownload:
         ]
         assert cmd[-3:] == ["--index-url", "https://i", "--x"]
 
+    def test_routes_pip_scratch_under_dest(self, monkeypatch, tmp_path):
+        # pip's PEP 517 metadata build unpacks the sdist into $TMPDIR; the
+        # ambient /tmp may be an inode-starved tmpfs (ENOSPC mid-extraction,
+        # cf. numpy's vendored meson), so pip's scratch must land next to the
+        # artifact on the workdir filesystem instead.
+        captured: dict = {}
+
+        def fake_run(cmd, **kw):
+            captured["cmd"] = cmd
+            captured["env"] = kw.get("env", {})
+            return subprocess.CompletedProcess(cmd, 0, "ok", "")
+
+        monkeypatch.setattr(M, "_pip_executable", lambda: ["fake", "pip"])
+        monkeypatch.setattr(M.subprocess, "run", fake_run)
+        M._run_pip_download(
+            "black==26.5.1",
+            tmp_path,
+            PipOptions(),
+            "--no-binary=:all:",
+        )
+        scratch = Path(captured["env"]["TMPDIR"])
+        assert scratch.is_relative_to(tmp_path)
+        assert scratch.exists() and scratch.is_dir()
+        # The scratch dir must be usable for new files (inode budget), on the
+        # same filesystem as the download destination.
+        probe = scratch / "probe"
+        probe.write_text("x")
+        assert probe.stat().st_dev == tmp_path.stat().st_dev
+
 
 class TestPublicSdistUrl:
     """S6: packages absent from public PyPI need vendoring, not a pypi fetch.
@@ -882,3 +911,358 @@ class TestResolveClosure:
         assert [m.name for m in closure] == ["black", "a", "b", "c"]
         assert warnings == []
         assert max_active >= 2
+
+    def test_parallel_releases_children_before_sibling_finishes(
+        self, make_meta_fn, tmp_path
+    ):
+        import threading
+
+        top = make_meta_fn(
+            runtime_deps=[
+                Dependency("a", DepKind.RUNTIME),
+                Dependency("slow", DepKind.RUNTIME),
+            ]
+        )
+        a = make_meta_fn(
+            name="a",
+            canonical_name="a",
+            version="1",
+            runtime_deps=[Dependency("b", DepKind.RUNTIME)],
+        )
+        b = make_meta_fn(
+            name="b", canonical_name="b", version="1", runtime_deps=[]
+        )
+        slow = make_meta_fn(
+            name="slow", canonical_name="slow", version="1", runtime_deps=[]
+        )
+        registry = {"a": a, "b": b, "slow": slow}
+        slow_release = threading.Event()
+        b_started = threading.Event()
+
+        def _builder(dep):
+            if dep.name == "slow":
+                assert slow_release.wait(timeout=5), "slow never released"
+            elif dep.name == "b":
+                b_started.set()
+            return (
+                registry[dep.name],
+                _sdist_src(tmp_path / f"{dep.name}.tar.gz"),
+            )
+
+        def _run():
+            return M.resolve_closure(top, _builder, workers=2)
+
+        import threading as _t
+
+        result_holder: list = []
+        t = _t.Thread(target=lambda: result_holder.append(_run()))
+        t.start()
+        # Greedy: a finishes, its child b must be fetched while slow is
+        # still blocked. A level barrier would wait for slow first.
+        assert b_started.wait(timeout=5), "b never started before slow finished"
+        slow_release.set()
+        t.join(timeout=10)
+        assert not t.is_alive()
+        closure, warnings = result_holder[0]
+        assert [m.name for m in closure] == ["black", "a", "slow", "b"]
+        assert warnings == []
+
+
+class TestDetectNativeCode:
+    def _src(self, tmp_path, members):
+        return _sdist_src(_sdist(tmp_path, members))
+
+    def test_c_source(self, tmp_path):
+        src = self._src(
+            tmp_path,
+            {
+                "black-26.5.1/PKG-INFO": _PKG_INFO,
+                "black-26.5.1/src/x.c": "int x;",
+            },
+        )
+        native, evidence = M.detect_native_code(src)
+        assert native is True
+        assert evidence[0].startswith("C source")
+        assert "src/x.c" in evidence[0]
+
+    def test_one_evidence_per_language(self, tmp_path):
+        src = self._src(
+            tmp_path,
+            {
+                "p-1.0/a.c": "1",
+                "p-1.0/b.cpp": "2",
+                "p-1.0/d.cpp": "3",
+                "p-1.0/mod.pyx": "4",
+            },
+        )
+        _native, evidence = M.detect_native_code(src)
+        assert len(evidence) == 3
+        assert any(e.startswith("C++") for e in evidence)
+        assert any(e.startswith("Cython") for e in evidence)
+
+    def test_pure_python(self, tmp_path):
+        src = self._src(
+            tmp_path,
+            {"black-26.5.1/PKG-INFO": _PKG_INFO, "black-26.5.1/x.py": "x = 1"},
+        )
+        assert M.detect_native_code(src) == (False, [])
+
+    def test_headers_alone_are_not_evidence(self, tmp_path):
+        # A vendored header is not a compiled artifact; flagging every sdist
+        # that ships one would drown the real signal.
+        src = self._src(tmp_path, {"p-1.0/api.h": "int x;"})
+        assert M.detect_native_code(src) == (False, [])
+
+    @pytest.mark.parametrize(
+        "member",
+        [
+            "p-1.0/tests/test_x.c",
+            "p-1.0/Lib/test/test_x.c",
+            "p-1.0/src/test_thing.c",
+            "p-1.0/src/thing_test.c",
+            "p-1.0/conftest.c",
+            "p-1.0/docs/example.c",
+            "p-1.0/examples/demo.cpp",
+            "p-1.0/benchmarks/bench.rs",
+            "top.c",
+        ],
+    )
+    def test_test_and_doc_trees_are_ignored(self, tmp_path, member):
+        src = self._src(tmp_path, {member: "x"})
+        assert M.detect_native_code(src) == (False, [])
+
+    def test_build_requirement_is_evidence(self, tmp_path):
+        src = self._src(tmp_path, {"p-1.0/PKG-INFO": _PKG_INFO})
+        native, evidence = M.detect_native_code(
+            src, ["setuptools", "cython>=3"]
+        )
+        assert native is True
+        assert "build requires cython" in evidence
+
+    def test_unparseable_build_requirement_is_ignored(self, tmp_path):
+        src = self._src(tmp_path, {"p-1.0/PKG-INFO": _PKG_INFO})
+        assert M.detect_native_code(src, ["this is not a requirement"]) == (
+            False,
+            [],
+        )
+
+    def test_rust_build_requirement(self, tmp_path):
+        src = self._src(tmp_path, {"p-1.0/PKG-INFO": _PKG_INFO})
+        _native, evidence = M.detect_native_code(src, ["setuptools-rust"])
+        assert "build requires setuptools-rust" in evidence
+
+    def test_setup_py_ext_modules(self, tmp_path):
+        src = self._src(
+            tmp_path,
+            {
+                "p-1.0/PKG-INFO": _PKG_INFO,
+                "p-1.0/setup.py": "ext_modules=[Extension('a', ['a.c'])]",
+            },
+        )
+        _native, evidence = M.detect_native_code(src)
+        assert "setup.py declares ext_modules" in evidence
+
+    def test_nested_setup_py_does_not_count(self, tmp_path):
+        # Only the top-level setup.py describes the built extension.
+        src = self._src(
+            tmp_path,
+            {
+                "p-1.0/PKG-INFO": _PKG_INFO,
+                "p-1.0/sub/setup.py": "ext_modules=[]",
+            },
+        )
+        assert M.detect_native_code(src) == (False, [])
+
+    def test_evidence_is_capped(self, tmp_path):
+        members = {f"p-1.0/d{i}.c": "x" for i in range(12)}
+        members["p-1.0/a.pyx"] = "x"
+        members["p-1.0/a.rs"] = "x"
+        members["p-1.0/a.f90"] = "x"
+        _native, evidence = M.detect_native_code(
+            self._src(tmp_path, members), ["cython", "cffi", "maturin"]
+        )
+        assert len(evidence) == M._MAX_EVIDENCE
+
+    def test_wheel_members_count(self, tmp_path):
+        path = tmp_path / "pkg-1.0-cp312-cp312-manylinux_2_17_x86_64.whl"
+        with zipfile.ZipFile(path, "w") as zf:
+            zf.writestr("pkg/_core.cpython-312-x86_64-linux-gnu.so", b"\0")
+        native, _ = M.detect_native_code(
+            FetchedSource(path, SourceKind.WHEEL, "sha", path.name)
+        )
+        # A compiled extension module has no source extension, but the .so
+        # is not ignored either way: the wheel check reports the tag instead.
+        assert native is False
+
+    def test_unreadable_archive(self, tmp_path):
+        path = tmp_path / "black-26.5.1.tar.gz"
+        path.write_bytes(b"not a tarball")
+        src = FetchedSource(path, SourceKind.SDIST, "sha", path.name)
+        assert M._member_names(path) == []
+        assert M.detect_native_code(src) == (False, [])
+
+    def test_unreadable_zip(self, tmp_path):
+        path = tmp_path / "pkg-1.0-py3-none-any.whl"
+        path.write_bytes(b"not a zip")
+        assert M._member_names(path) == []
+
+
+class TestDetectHostAssumptions:
+    def _src(self, tmp_path, members):
+        return _sdist_src(_sdist(tmp_path, members))
+
+    def test_march_native(self, tmp_path):
+        src = self._src(
+            tmp_path,
+            {"p-1.0/setup.py": 'extra_compile_args=["-march=native"]'},
+        )
+        assert M.detect_host_assumptions(src) == ["setup.py: -march="]
+
+    def test_avx_flags(self, tmp_path):
+        src = self._src(
+            tmp_path, {"p-1.0/setup.py": 'cflags = "-O3 -mavx2 -mfma"'}
+        )
+        assert M.detect_host_assumptions(src) == [
+            "setup.py: -mavx, -mfma, avx2"
+        ]
+
+    def test_machine_name_alone_is_not_flagged(self, tmp_path):
+        # numpy's pyproject only mentions x86_64 in cibuildwheel image names;
+        # flagging that would be noise on every cross build.
+        src = self._src(
+            tmp_path,
+            {
+                "p-1.0/pyproject.toml": 'skip = ["*_i686"]\n'
+                'manylinux-x86_64-image = "manylinux_2_28"\n',
+            },
+        )
+        assert M.detect_host_assumptions(src) == []
+
+    def test_guarded_machine_test_is_not_flagged(self, tmp_path):
+        src = self._src(
+            tmp_path,
+            {
+                "p-1.0/setup.py": 'if platform.machine() == "x86_64":\n'
+                "    pass\n"
+            },
+        )
+        assert M.detect_host_assumptions(src) == []
+
+    def test_only_top_level_files(self, tmp_path):
+        src = self._src(
+            tmp_path,
+            {"p-1.0/vendor/pyproject.toml": 'cflags = "-march=native"'},
+        )
+        assert M.detect_host_assumptions(src) == []
+
+    def test_each_file_is_reported_once(self, tmp_path):
+        src = self._src(
+            tmp_path,
+            {
+                "p-1.0/setup.py": 'x = "-march=native -mavx"',
+                "p-1.0/pyproject.toml": 'y = "-msse4.2"',
+            },
+        )
+        assert M.detect_host_assumptions(src) == [
+            "setup.py: -march=, -mavx",
+            "pyproject.toml: -msse, sse4.2",
+        ]
+
+    def test_capped(self, tmp_path):
+        members = {
+            f"p-1.0/{name}": 'x = "-march=native"'
+            for name in (
+                "setup.py",
+                "setup.cfg",
+                "pyproject.toml",
+                "meson.build",
+            )
+        }
+        members["p-1.0/extra.c"] = ""
+        assert len(M.detect_host_assumptions(self._src(tmp_path, members))) <= (
+            M._MAX_EVIDENCE
+        )
+
+
+class TestMachineGatedDeps:
+    def test_split_aarch64_marker(self):
+        gated, plain = M.machine_gated_deps(
+            [
+                'arm-only>=1; platform_machine == "aarch64"',
+                "click>=8",
+            ],
+            resolve_yocto_version("5.0"),
+        )
+        assert plain == ["click>=8"]
+        assert [g.name for g in gated] == ["arm-only"]
+        assert gated[0].machines == ("aarch64",)
+        assert 'platform_machine == "aarch64"' in gated[0].marker
+
+    def test_x86_marker_only_matches_x86(self):
+        gated, _plain = M.machine_gated_deps(
+            ['x; platform_machine == "x86_64"'], resolve_yocto_version("5.0")
+        )
+        assert gated[0].machines == ("x86_64",)
+
+    def test_disjunction_covers_both_families(self):
+        gated, _plain = M.machine_gated_deps(
+            [
+                'both; platform_machine in "x86_64 aarch64"',
+            ],
+            resolve_yocto_version("5.0"),
+        )
+        assert set(gated[0].machines) == {"x86_64", "aarch64"}
+
+    def test_negated_marker(self):
+        gated, _plain = M.machine_gated_deps(
+            [
+                'not-aarch64; platform_machine != "aarch64"',
+            ],
+            resolve_yocto_version("5.0"),
+        )
+        assert "aarch64" not in gated[0].machines
+        assert "x86_64" in gated[0].machines
+
+    def test_combined_with_python_version(self):
+        gated, _plain = M.machine_gated_deps(
+            [
+                'n; platform_machine == "aarch64" and python_version >= "3.11"',
+            ],
+            resolve_yocto_version("5.0"),
+        )
+        assert gated[0].machines == ("aarch64",)
+
+    def test_marker_no_target_satisfies_is_dropped(self):
+        gated, plain = M.machine_gated_deps(
+            ['win; platform_machine == "windows"'], resolve_yocto_version("5.0")
+        )
+        assert gated == []
+        assert plain == []
+
+    def test_no_marker_is_plain(self):
+        gated, plain = M.machine_gated_deps(["click>=8"], None)
+        assert gated == []
+        assert plain == ["click>=8"]
+
+    def test_other_markers_stay_plain(self):
+        # sys_platform markers are arch-independent: dropping them against the
+        # POSIX assumption is correct and needs no recipe-level override.
+        gated, plain = M.machine_gated_deps(
+            ['colorama; sys_platform == "win32"'], resolve_yocto_version("5.0")
+        )
+        assert gated == []
+        assert plain == ['colorama; sys_platform == "win32"']
+
+    def test_unparseable_requirement_stays_plain(self):
+        gated, plain = M.machine_gated_deps(
+            ["this is not a requirement"], resolve_yocto_version("5.0")
+        )
+        assert gated == []
+        assert plain == ["this is not a requirement"]
+
+    def test_without_yocto_keeps_host_python(self):
+        # No target Python: only the machine part of the marker decides.
+        gated, _plain = M.machine_gated_deps(
+            ['x; platform_machine == "aarch64"'], None
+        )
+        assert gated[0].machines == ("aarch64",)

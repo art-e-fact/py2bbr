@@ -30,6 +30,7 @@ from py2bbr.recipe import (
     canonical_name,
     recipe_filename,
     render_recipe_to_path,
+    sysroot_tool_version,
 )
 from py2bbr.yocto import (
     DEFAULT_KAS_VERSION,
@@ -201,6 +202,14 @@ def build_parser() -> argparse.ArgumentParser:
         default="qemux86-64",
         help="MACHINE for the generated kas build file.",
     )
+    yocto.add_argument(
+        "--targets",
+        default=None,
+        help="Comma-separated target keys for the build-for-target report "
+        "(default: all known targets: "
+        "x86, x86_64, cortex-a53, cortex-a57, cortex-a72, cortex-a53-64, "
+        "cortex-a72-64, zynqmp, versal, riscv64).",
+    )
 
     pipg = p.add_argument_group("pip index (forwarded to 'pip download')")
     pipg.add_argument(
@@ -254,13 +263,43 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def _configure_logging(args) -> None:
+class _RichLogHandler(logging.Handler):
+    """Logging handler that prints records through a rich ``Console``.
+
+    When the fetch progress bars are live on the same console, rich prints
+    the line *above* the live progress region and redraws the bars underneath.
+    Without this, plain stderr lines would be written into the middle of the
+    live region and the bars' ``\\r``/cursor-up control sequences would erase
+    them (the log output lost its newlines).
+    """
+
+    def __init__(self, console):
+        super().__init__()
+        self._console = console
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            self._console.print(
+                self.format(record),
+                markup=False,
+                highlight=False,
+                soft_wrap=True,
+            )
+        except Exception:  # noqa: BLE001 - logging must never raise
+            self.handleError(record)
+
+
+def _configure_logging(args, console=None) -> None:
     """Route py2bbr stage progress to stderr: INFO by default, -q->WARNING, -v->DEBUG.
 
     The level is set on the ``py2bbr`` logger (its ``py2bbr.*`` children
     inherit it), so unrelated libraries are untouched. The stderr handler is
     attached only when none exists yet, keeping the call idempotent across
     repeated ``main()`` invocations (tests call it many times in one process).
+
+    ``console`` is the rich Console shared with the fetch progress bars; when
+    given, records are routed through it (see :class:`_RichLogHandler`) so
+    log lines and the live bars cooperate on one stream.
     """
     level = (
         logging.DEBUG
@@ -272,7 +311,10 @@ def _configure_logging(args) -> None:
     lg = logging.getLogger("py2bbr")
     lg.setLevel(level)
     if not lg.handlers:
-        handler = logging.StreamHandler(sys.stderr)
+        if console is not None:
+            handler: logging.Handler = _RichLogHandler(console)
+        else:
+            handler = logging.StreamHandler(sys.stderr)
         handler.setFormatter(
             logging.Formatter("[py2bbr] %(levelname)s %(message)s")
         )
@@ -288,10 +330,9 @@ class _FetchProgress:
     tests) or under ``-q``; every call site stays unconditional and no-ops.
     """
 
-    def __init__(self, enabled: bool):
+    def __init__(self, enabled: bool, console=None):
         self._progress = None
         if enabled:
-            from rich.console import Console
             from rich.progress import (
                 BarColumn,
                 Progress,
@@ -303,7 +344,7 @@ class _FetchProgress:
                 TextColumn("[progress.description]{task.description}"),
                 BarColumn(),
                 TimeElapsedColumn(),
-                console=Console(stderr=True),
+                console=console,
                 transient=True,
             )
 
@@ -328,7 +369,14 @@ class _FetchProgress:
 
 
 def _print_report(
-    args, meta, recipe_path, layer_dir, kas_file, warnings, results
+    args,
+    meta,
+    recipe_path,
+    layer_dir,
+    kas_file,
+    warnings,
+    results,
+    target_report,
 ):
     if not args.quiet:
         print(f"Package      : {meta.name} {meta.version}")
@@ -358,6 +406,8 @@ def _print_report(
         for w in warnings:
             print(f"  - {w}")
 
+    _print_target_report(target_report)
+
     print("\nChecks:")
     for r in results:
         icon = {
@@ -372,11 +422,108 @@ def _print_report(
             print(f"        - {name}: {status.value} {detail}")
 
 
+def _select_targets(spec: str | None, warnings: list[str]):
+    """Resolve ``--targets`` into a :class:`py2bbr.targets.Target` tuple.
+
+    Empty spec means "the whole known matrix". An unknown key is reported and
+    ignored rather than failing the run: a typo in a convenience flag should not
+    cost the user the recipe they asked for.
+    """
+    from py2bbr.targets import KNOWN_TARGETS, target_by_key
+
+    if not spec:
+        return KNOWN_TARGETS
+    keys = [k.strip() for k in spec.split(",") if k.strip()]
+    selected = []
+    for key in keys:
+        target = target_by_key(key)
+        if target is None:
+            warnings.append(
+                f"unknown target '{key}' in --targets; known targets: "
+                + ", ".join(t.key for t in KNOWN_TARGETS)
+            )
+            continue
+        if target not in selected:
+            selected.append(target)
+    return tuple(selected) or KNOWN_TARGETS
+
+
+def _build_target_report(meta, yocto, args, warnings):
+    """Build the build-for-target verdict for the rendered build class.
+
+    The layer is cross-built: build tools are host binaries, the package itself
+    must be compiled for the target CPU. The report says which targets the
+    generated recipe can serve and what breaks where.
+    """
+    from py2bbr.recipe import effective_build_class
+    from py2bbr.targets import evaluate
+
+    targets = _select_targets(getattr(args, "targets", None), warnings)
+    return evaluate(
+        meta,
+        effective_build_class(meta, args.build_class),
+        yocto,
+        targets=targets,
+    )
+
+
+def _shadow_warning(shadowed: list[str]) -> str:
+    """Warn that provisioned build tools took over a distro RPROVIDER.
+
+    ``python3-flit-core`` and ``python3-meson-python`` are the ones that bite:
+    poky ships both, and py2bbr provisions a newer copy when a
+    ``build-system.requires`` floor demands one. Bitbake keys tasks by recipe
+    name, not version, so the swap drops the previous version's sstate
+    manifests; a signature-locked cache (PetaLinux's ``SIGGEN_LOCKEDSIGS`` with
+    ``SSTATE_EXISTS_CHECK = "none"``) keeps honouring the old setscene stamps,
+    so the manifests are never rewritten and every recipe needing that sysroot
+    fails in ``do_prepare_recipe_sysroot`` - a recipe that has nothing to do
+    with the change.
+    """
+    names = ", ".join(shadowed)
+    tasks = " ".join(f"{pn}-native" for pn in shadowed)
+    return (
+        f"these shadow the recipe(s) the target Yocto already ships ({names}): "
+        f"every consumer now resolves the layer's copy of "
+        f"{', '.join(f'{pn}-native' for pn in shadowed)}. In a tree that "
+        "already built the distro's copy, the swap invalidates its sstate "
+        "manifests while a signature-locked cache (PetaLinux "
+        "SIGGEN_LOCKEDSIGS) keeps its setscene stamps valid, so the next "
+        'build fails in an unrelated recipe with "The sstate manifest for '
+        "task '<recipe>-native:populate_sysroot' could not be found\". "
+        f"Rebuild those tasks once: petalinux-build -c cleansstate {tasks}"
+    )
+
+
+def _print_target_report(report) -> None:
+    """Print the target report, compactly when nothing is flagged."""
+    if report is None:
+        return
+    if report.ok:
+        kind = (
+            "pure Python"
+            if report.pure_python
+            else "cross-compiled for the target"
+        )
+        print(
+            f"\nBuild for target: OK on {len(report.verdicts)} target(s) "
+            f"(build class {report.build_class}, {kind})"
+        )
+        return
+    for line in report.render():
+        print(line)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    _configure_logging(args)
-    progress = _FetchProgress(enabled=sys.stderr.isatty() and not args.quiet)
+    console = None
+    if sys.stderr.isatty() and not args.quiet:
+        from rich.console import Console
+
+        console = Console(stderr=True)
+    _configure_logging(args, console=console)
+    progress = _FetchProgress(enabled=console is not None, console=console)
     progress.start()
 
     try:
@@ -498,6 +645,16 @@ def main(argv: list[str] | None = None) -> int:
                     "demands): "
                     + ", ".join(sorted(canonical_name(g.name) for g in gaps))
                 )
+                shadowed = sorted(
+                    pn
+                    for pn in (
+                        bitbake_pn(g.name, yocto.python_pn)
+                        for g in gaps
+                        if sysroot_tool_version(yocto, g.name)
+                    )
+                )
+                if shadowed:
+                    warnings_extra.append(_shadow_warning(shadowed))
 
         # 2. Render + write the recipe (and optionally a full layer).
         layer_name = args.layer_name or default_layer_name(meta.canonical_name)
@@ -585,6 +742,12 @@ def main(argv: list[str] | None = None) -> int:
         )
 
         # 5. Report.
+        target_report = _build_target_report(meta, yocto, args, warnings)
+        if not target_report.buildable:
+            warnings.append(
+                "the generated recipe cannot build for at least one target in "
+                "the matrix; see the build-for-target report"
+            )
         _print_report(
             args,
             meta,
@@ -593,6 +756,7 @@ def main(argv: list[str] | None = None) -> int:
             kas_file,
             warnings,
             results,
+            target_report,
         )
 
         if args.keep_sources:

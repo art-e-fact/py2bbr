@@ -46,18 +46,37 @@ assignment line and survive such passes intact.
   its bundled trove list, and ``build_wheel`` aborts on unknown ones (xmod
   1.10.0 under PetaLinux). The entries are metadata-only, so the same
   ``do_configure:append`` drops them.
+
+* PEP 517 bootstrap chain tools (``flit-core``, ``build``, ``installer``,
+  ``pyproject-hooks``) render with poky's own bootstrap recipe shape
+  (``inherit pypi python_flit_core`` + the loop-breaking
+  ``DEPENDS:remove:class-native`` / manual-build lines) instead of the generic
+  ``python_pep517`` shape. The generic class appends ``" python3-build-native
+  python3-installer-native"`` to DEPENDS, while poky's build/installer/
+  pyproject-hooks DEPEND (via ``python_flit_core``) on
+  ``python3-flit-core-native``: provisioning a newer flit-core (e.g. ``3.12.0``
+  for a build requirement of ``flit_core>=3.12``) shadows poky's ``3.9.0`` and
+  re-closes that native dependency loop (PetaLinux reported hundreds of
+  circular create-spdx dependencies). The bootstrap shape breaks it exactly as
+  poky's own recipes do. An explicit ``--build-class`` override opts out.
 """
 
 from __future__ import annotations
 
 import re
 import shutil
+import textwrap
 
 from packaging.requirements import InvalidRequirement, Requirement
 from packaging.specifiers import InvalidSpecifier, SpecifierSet
 from packaging.version import InvalidVersion, Version
 
-from py2bbr.model import Dependency, PackageMetadata, YoctoVersion
+from py2bbr.model import (
+    Dependency,
+    PackageMetadata,
+    YoctoVersion,
+    machine_override_tokens,
+)
 
 
 def canonical_name(name: str) -> str:
@@ -82,11 +101,150 @@ _EXTERNAL_BUILD_BACKENDS = frozenset({"uv-build"})
 # ``-native`` deps into the consuming recipe's sysroot, so the recipe must name
 # the tools itself. Key: canonical (PEP 503) build-backend name as found in
 # ``[build-system].build-backend``; value: literal OE-native packages to add to
-# DEPENDS (all shipped by poky core for the supported series).
+# DEPENDS (all shipped by poky core for the supported series). The mesonpy
+# backend's ``get_requires_for_build_wheel`` appends ``patchelf>=0.11.0`` on
+# every Linux wheel build even when the project's metadata omits it (meson-
+# python 0.21.1's own pyproject does not), so patchelf-native is part of the
+# backend tool deps, exactly as poky's meson-python recipe hardcodes it.
 _BUILD_BACKEND_TOOL_DEPS: dict[str, str] = {
-    "mesonpy": "meson-native ninja-native",
-    "meson-python": "meson-native ninja-native",
+    "mesonpy": "meson-native ninja-native patchelf-native",
+    "meson-python": "meson-native ninja-native patchelf-native",
     "scikit-build-core": "cmake-native ninja-native",
+}
+
+
+# Non-Python tool recipes poky core ships WITHOUT the ``python3-`` prefix:
+# ``meson`` / ``meson-native`` (meta/recipes-devtools/meson), ``ninja``,
+# ``cmake`` and ``patchelf``. A dependency on them must render as the bare
+# name (``meson`` in RDEPENDS, ``meson-native`` in DEPENDS): the ``python3-``
+# prefix yields ``python3-meson``, which the native-variant rename (from
+# ``BBCLASSEXTEND = "native nativesdk"``) turns into the unprovidable
+# ``python3-meson-native`` ("Nothing RPROVIDES", seen for the provisioned
+# python3-meson-python_0.21.1.bb under PetaLinux). poky's own scarthgap
+# python3-meson-python recipe renders exactly these bare names.
+_OE_BARE_TOOL_PROVIDERS = frozenset({"meson", "ninja", "cmake", "patchelf"})
+
+
+# Build classes that compile extension modules against the *target* toolchain.
+# All of them inherit ``setuptools3-base``, which exports the target compiler
+# and sysroot into the build environment and DEPENDS the target interpreter;
+# ``python_mesonpy`` additionally runs meson with the target cross file. The
+# generic ``python_pep517`` class does not - its PEP 517 frontend is driven by
+# ``nativepython3`` (a build-host tool, which is correct: the frontend has to
+# run on the machine doing the building) - so a package with compiled code that
+# lands on it is cross-built only if its backend picks up the exported
+# toolchain. See ``py2bbr.targets`` for the per-target report, which reuses
+# these sets.
+CROSS_CAPABLE_CLASSES = frozenset(
+    {
+        "python_flit_core",
+        "python_mesonpy",
+        "python_setuptools_build_meta",
+        "setuptools3",
+    }
+)
+
+#: Classes that run the PEP 517 frontend under the *host* interpreter. Usable
+#: for pure-Python packages; for compiled code the outcome depends on the
+#: backend honouring the exported target toolchain, so they earn a RISK.
+HOST_ONLY_CLASSES = frozenset({"python_pep517"})
+
+
+# PEP 517 bootstrap-tool recipes that must mirror poky's own bootstrap shape.
+#
+# These four tools are the native build chain python_pep517 recipes pull in:
+# python_pep517.bbclass appends ``DEPENDS += " python3-build-native
+# python3-installer-native"``, while poky's build/installer/pyproject-hooks all
+# ``inherit python_flit_core``, whose class adds ``DEPENDS += "python3
+# python3-flit-core-native"`` (scarthgap; walnascar drops the bare ``python3``).
+# When py2bbr provisions a *newer* flit-core (e.g. ``3.12.0`` because a package
+# demands ``flit_core>=3.12`` while Scarthgap ships ``3.9.0``), the provisioned
+# recipe shadows poky's and closes the loop
+# ``flit-core -> build/installer-native -> flit-core-native`` (the SPDX-task
+# cycle do_create_spdx <-> do_collect_spdx_deps PetaLinux reported). Poky breaks
+# the knot in its own recipes by inheriting ``python_flit_core`` and
+# overriding the *class-native* compile/install to build by hand, removing the
+# self-referential class-native DEPENDS. py2bbr mirrors those shapes verbatim
+# (minus poky's ``PYPI_PACKAGE = "flit"`` tarball trick: the provisioned sdist
+# is the standalone ``flit_core`` artifact, so the generic PYPI_PACKAGE logic
+# already pins the underscore name).
+#
+# Key: canonical (PEP 503) distribution name; value: recipe lines emitted in
+# place of the inherit-time DEPENDS block (the class provides
+# ``python3-flit-core-native`` itself, so no extra_* DEPENDS is rendered).
+_BOOTSTRAP_TOOL_SHAPES: dict[str, tuple[str, ...]] = {
+    "flit-core": (
+        (
+            "# flit-core is the deepest knot of the PEP 517 bootstrap chain: "
+            "poky's build/installer/pyproject-hooks all DEPEND on "
+            "python3-flit-core-native (via python_flit_core.bbclass), while "
+            "python_pep517.bbclass appends python3-build-native "
+            "python3-installer-native. A newer provisioned flit-core would close "
+            "the loop flit-core -> build/installer-native -> flit-core-native; "
+            "mirror poky's own bootstrap recipe: build/install by hand and drop "
+            "the class-native build/installer deps."
+        ),
+        'DEPENDS:remove:class-native = " python3-build-native python3-installer-native"',
+        'DEPENDS:append:class-native = " unzip-native"',
+        "",
+        "do_compile:class-native () {",
+        "    python_flit_core_do_manual_build",
+        "}",
+        "",
+        "do_install:class-native () {",
+        "    python_pep517_do_bootstrap_install",
+        "}",
+    ),
+    "build": (
+        (
+            "# Bootstrap knot: build's class-native do_compile runs `python3 -m "
+            "build --no-isolation` on this source tree, but must not depend on "
+            "build (or its own deps); PYTHONPATH resolves the imported `build` "
+            "module back to ${S}/src and --skip-dependency-check disables the "
+            "recursive dependency demand. python3-flit-core-native comes from "
+            "python_flit_core.bbclass."
+        ),
+        'DEPENDS += "python3-pyproject-hooks-native"',
+        'DEPENDS:remove:class-native = "python3-build-native"',
+        'PEP517_BUILD_OPTS:class-native = "--skip-dependency-check"',
+        "",
+        "do_compile:prepend:class-native() {",
+        '    export PYTHONPATH="${S}/src"',
+        "}",
+    ),
+    "installer": (
+        (
+            "# Bootstrap knot: installer's class-native do_compile is the manual "
+            "flit_core wheel build (building the installer wheel must not require "
+            "pypa/build), and the un-overridden class-native do_install runs "
+            "`python3 -m installer` with PYTHONPATH pointing at this source tree. "
+            "python3-flit-core-native comes from python_flit_core.bbclass."
+        ),
+        'DEPENDS:remove:class-native = "python3-build-native python3-installer-native"',
+        'INSTALL_WHEEL_COMPILE_BYTECODE:class-native = "--no-compile-bytecode"',
+        "",
+        "do_compile:class-native () {",
+        "    python_flit_core_do_manual_build",
+        "}",
+        "",
+        "do_install:prepend:class-native() {",
+        '    export PYTHONPATH="${S}/src"',
+        "}",
+    ),
+    "pyproject-hooks": (
+        (
+            "# Bootstrap knot: pyproject-hooks' class-native do_compile is the "
+            "manual flit_core wheel build (building it must not require pypa/"
+            "build); it keeps the installer-native DEPENDS for its un-overridden "
+            "class-native do_install. python3-flit-core-native comes from "
+            "python_flit_core.bbclass."
+        ),
+        'DEPENDS:remove:class-native = "python3-build-native"',
+        "",
+        "do_compile:class-native () {",
+        "    python_flit_core_do_manual_build",
+        "}",
+    ),
 }
 
 
@@ -143,15 +301,34 @@ def _yocto_license_expr(expr: str) -> str:
     return expr
 
 
+def _comment_block(text: str, width: int = 74) -> list[str]:
+    """Render ``text`` as a wrapped ``# ...`` BitBake comment block.
+
+    Comments are the only multi-line construct the recipe may carry (the
+    structural checks reject continuations), and a hand-wrapped comment block
+    is unreadable the moment the text changes: the words drift across the
+    fragments. Wrapping one logical string keeps the sentence intact.
+    """
+    return [f"# {line}" for line in textwrap.wrap(text, width=width)]
+
+
 def _bitbake_deps(names: list[str], prefix: str) -> list[str]:
     """Render dependency names as ``<prefix><canonical name>``, deduplicated.
 
     ``prefix`` is the literal package prefix (e.g. ``python3-``) — never a
-    ``${...}`` reference, see the module docstring.
+    ``${...}`` reference, see the module docstring. Non-Python tool recipes
+    poky ships bare (``meson``/``ninja``/``cmake``/``patchelf``) render
+    unprefixed so the native-variant rename still resolves (``meson`` ->
+    ``meson-native``), matching poky's own recipes.
     """
     seen: dict[str, str] = {}
     for n in names:
-        var = f"{prefix}{canonical_name(n)}"
+        canonical = canonical_name(n)
+        var = (
+            canonical
+            if canonical in _OE_BARE_TOOL_PROVIDERS
+            else f"{prefix}{canonical}"
+        )
         seen.setdefault(var, n)
     return list(seen.keys())
 
@@ -252,6 +429,16 @@ def pick_build_class(backend: str) -> tuple[str, bool]:
     ``python_setuptools_build_meta`` and ``python_pep517`` both exist in
     Scarthgap and drive PEP 517 builds, with the backend package supplied via
     DEPENDS.
+
+    Every class named here except ``python_pep517`` inherits ``setuptools3-base``
+    and therefore exports the *target* toolchain (``CC``/``LDSHARED``,
+    ``STAGING_INCDIR``/``STAGING_LIBDIR``, target ``python3`` on the sysroot),
+    so a package with C extensions is cross-compiled for the image's CPU. That
+    is why the class choice is also a cross-build decision; the generic
+    ``python_pep517`` runs the PEP 517 frontend under ``nativepython3`` instead,
+    which is fine for pure Python and conditional for compiled code (the backend
+    has to pick up the exported toolchain), so :func:`render_recipe` warns when
+    the sdist ships native code.
     """
     backend = (backend or "").lower()
     if not backend:
@@ -356,6 +543,23 @@ _BUNDLED_TOOL_VERSIONS: dict[str, dict[str, str]] = {
 }
 
 
+def sysroot_tool_version(yocto: YoctoVersion, name: str) -> str | None:
+    """Version of a build tool the target series' native sysroot ships.
+
+    ``None`` for a tool no series table lists. The caller uses it to tell a
+    provisioning that *adds* a provider (the distro has no recipe) from one that
+    *shadows* an existing ``RPROVIDER`` (the distro ships one): tasks are keyed
+    by recipe name, not version, so the swap invalidates the sstate manifests
+    the previous version left behind, and a signature-locked cache
+    (``SIGGEN_LOCKEDSIGS``) keeps the old setscene stamps, so bitbake never
+    rewrites them. The build then fails in an unrelated recipe with "The sstate
+    manifest for task '<recipe>-native:populate_sysroot' could not be found".
+    """
+    return _BUNDLED_TOOL_VERSIONS.get(yocto.version, {}).get(
+        canonical_name(name)
+    )
+
+
 def _minimum_version(specifier: str) -> Version | None:
     """Lowest version a PEP 508 specifier set demands, or ``None``.
 
@@ -392,17 +596,45 @@ def build_version_gaps(
     setuptools and wheel are exempt: the build classes always satisfy them
     with the sysroot copies (bounds are relaxed in ``render_recipe``), and
     provisioning newer ones would churn every recipe's build environment.
+
+    The four PEP 517 bootstrap tools (flit-core, build, installer,
+    pyproject-hooks) are exempt too: poky ships them at signature-locked
+    versions, consumers' ``[build-system]`` bounds are relaxed in
+    ``render_recipe``, and provisioning a newer copy shadows poky's own locked
+    recipe - PetaLinux then reports SIGGEN_LOCKEDSIGS mismatch warnings for
+    the native variant (blessed 1.50.0's ``flit_core>=3.11,<4`` vs Scarthgap's
+    3.9.0). The sysroot copies are authoritative for the build.
     """
     bundled = _BUNDLED_TOOL_VERSIONS.get(yocto.version, {})
     gaps: list[Dependency] = []
     for dep in meta.build_deps:
         name = canonical_name(dep.name)
-        if name in ("setuptools", "wheel") or name not in bundled:
+        if (
+            name in ("setuptools", "wheel")
+            or name in _BOOTSTRAP_TOOL_SHAPES
+            or name not in bundled
+        ):
             continue
         needed = _minimum_version(dep.specifier)
         if needed is not None and needed > Version(bundled[name]):
             gaps.append(dep)
     return gaps
+
+
+def effective_build_class(
+    meta: PackageMetadata, build_class: str | None = None
+) -> str:
+    """The class the recipe inherits: the override, the bootstrap knot shape,
+    or the one detected from the declared backend.
+
+    Shared with ``py2bbr.targets`` so the build-for-target report judges the
+    class that is actually rendered, not a re-derived guess.
+    """
+    if build_class:
+        return build_class
+    if meta.canonical_name in _BOOTSTRAP_TOOL_SHAPES:
+        return "python_flit_core"
+    return pick_build_class(meta.build_backend)[0]
 
 
 def render_recipe(
@@ -417,8 +649,18 @@ def render_recipe(
     """
     warnings: list[str] = []
 
-    detected_class, warn_backend = pick_build_class(meta.build_backend)
-    build_class = build_class or detected_class
+    warn_backend = pick_build_class(meta.build_backend)[1]
+    bootstrap_lines = (
+        None
+        if build_class is not None
+        else _BOOTSTRAP_TOOL_SHAPES.get(meta.canonical_name)
+    )
+    build_class = effective_build_class(meta, build_class)
+    if bootstrap_lines is not None:
+        # PEP 517 bootstrap knot: inherit poky's python_flit_core class, whose
+        # class-native overrides build/install these tools by hand (a generic
+        # python_pep517 recipe would re-close the native dependency loop).
+        warn_backend = False
     external_backend = (
         canonical_name(meta.build_backend or "") in _EXTERNAL_BUILD_BACKENDS
     )
@@ -439,6 +681,63 @@ def render_recipe(
                 f"uses the generic PEP 517 class '{build_class}' and adds the backend "
                 f"to DEPENDS. Verify the backend package (e.g. python3-hatchling) is "
                 f"available in your Yocto environment, or override with --build-class."
+            )
+
+    # Cross-build note. Compiled packages must be built for the *target* CPU
+    # while the layer is built by the (usually x86_64) build host, so record
+    # which mechanism gets the target toolchain into the build: the class
+    # inheriting setuptools3-base (target CC/LDSHARED + target STAGING_* +
+    # target python3 on the sysroot), meson's cross file, or - for the generic
+    # PEP 517 class - the backend honouring that exported environment.
+    cross_lines: list[str] = []
+    if meta.has_native_code:
+        evidence = ", ".join(meta.native_code_evidence[:2]) or "native code"
+        if build_class == "python_mesonpy":
+            note = (
+                f"Cross-build: this sdist ships compiled code ({evidence}). "
+                f"{build_class} runs meson with the target cross file, so the "
+                "extension modules are compiled for the target CPU even though "
+                "the layer is built on the (usually x86_64) build host. The "
+                "pypa installer step runs natively and is architecture "
+                "independent."
+            )
+        elif build_class in CROSS_CAPABLE_CLASSES:
+            note = (
+                f"Cross-build: this sdist ships compiled code ({evidence}). "
+                f"{build_class} inherits setuptools3-base, which exports the "
+                "target toolchain (CC/LDSHARED, STAGING_INCDIR/STAGING_LIBDIR) "
+                "and DEPENDS the target python3, so extension modules are "
+                "compiled for the target CPU. Build tools stay -native (host "
+                "binaries) because the PEP 517 frontend has to run on the "
+                "build host."
+            )
+        else:
+            note = (
+                f"Cross-build: this sdist ships compiled code ({evidence}), but "
+                f"the generic {build_class} class drives the PEP 517 frontend "
+                "with nativepython3. It still cross-builds when the backend "
+                "uses the toolchain setuptools3-base exports (CC/LDSHARED, "
+                "STAGING_*); a backend that resolves its own compiler would "
+                "produce build-host binaries. Verify the installed .so files "
+                "on the target."
+            )
+            warnings.append(
+                f"{meta.canonical_name} ships compiled code "
+                f"({', '.join(meta.native_code_evidence[:2])}) and is built with "
+                f"'{build_class}', whose PEP 517 frontend runs under "
+                f"nativepython3. The recipe pairs it with setuptools3-base, which "
+                f"exports the target toolchain, so the build cross-compiles as long "
+                f"as the backend uses that environment; confirm the target .so files "
+                f"if the build fails to link."
+            )
+        cross_lines = _comment_block(note)
+        if meta.host_assumptions:
+            warnings.append(
+                "build config passes x86-specific CPU/ISA flags ("
+                + ", ".join(meta.host_assumptions[:2])
+                + "): the compile for ARM targets (aarch64 / armv7a) may fail "
+                "or silently lose an optimization; check the build log on the "
+                "target."
             )
 
     lines: list[str] = []
@@ -495,10 +794,23 @@ def render_recipe(
         lines.append(f"# Upstream requires Python {meta.requires_python}")
     lines.append("")
 
+    # The generic python_pep517 class inherits nothing on its own (poky's
+    # wrapper classes python_flit_core / python_setuptools_build_meta /
+    # python_mesonpy / setuptools3 all inherit setuptools3-base instead), so
+    # pair it with setuptools3-base: that class defines PYTHON_SITEPACKAGES_DIR
+    # (via python3native <- python3-dir) and ships the install payload with
+    # FILES:${PN} += "${PYTHON_SITEPACKAGES_DIR}". Without it do_package fails
+    # with "installed but not shipped" for every site-packages file (xmod /
+    # inquirer / blessed / editor under PetaLinux).
+    inherit_classes = (
+        "python_pep517 setuptools3-base"
+        if build_class == "python_pep517"
+        else build_class
+    )
     if meta.vendored:
-        lines.append(f"inherit {build_class}")
+        lines.append(f"inherit {inherit_classes}")
     else:
-        lines.append(f"inherit pypi {build_class}")
+        lines.append(f"inherit pypi {inherit_classes}")
         pypi_name = _pypi_package_name(meta.source_filename, meta.version)
         if pypi_name and pypi_name != meta.canonical_name:
             # The pypi class derives PYPI_PACKAGE from BPN (e.g. ``async-pyserial``),
@@ -508,30 +820,46 @@ def render_recipe(
             lines.append(f'PYPI_PACKAGE = "{pypi_name}"')
     lines.append("")
 
+    if cross_lines:
+        lines.extend(cross_lines)
+        lines.append("")
+
     # Build-time deps: the build class already provides setuptools + wheel as
     # ``-native``. Add any *extra* PEP 517 build requirements as ``-native``
     # variants (e.g. python3-setuptools-scm-native, python3-hatchling-native).
     # External dev tooling (uv-build) is excluded: it has no -native provider
     # in the target Yocto, and the do_configure rewrite below points the build
     # at the always-present setuptools.build_meta instead.
-    extra_build = [
-        d.name
-        for d in meta.build_deps
-        if d.name.lower() not in ("setuptools", "wheel")
-        and canonical_name(d.name) not in _EXTERNAL_BUILD_BACKENDS
-    ]
-    tools = _BUILD_BACKEND_TOOL_DEPS.get(
-        canonical_name(meta.build_backend or "")
-    )
-    deps = [
-        f"{var}-native"
-        for var in _bitbake_deps(extra_build, f"{yocto.python_pn}-")
-    ]
-    if tools:
-        deps.append(tools)
-    if deps:
-        lines.append(f'DEPENDS += "{" ".join(deps)}"')
+    #
+    # Bootstrap knots (flit-core/build/installer/pyproject-hooks) instead emit
+    # poky's own loop-breaking lines verbatim: the python_flit_core class
+    # provides python3-flit-core-native itself and the class-native variants
+    # build/install by hand, so no extra_* DEPENDS is rendered at all.
+    if bootstrap_lines is not None:
+        lines.extend(bootstrap_lines)
         lines.append("")
+    else:
+        extra_build = [
+            d.name
+            for d in meta.build_deps
+            if d.name.lower() not in ("setuptools", "wheel")
+            and canonical_name(d.name) not in _EXTERNAL_BUILD_BACKENDS
+        ]
+        tools = _BUILD_BACKEND_TOOL_DEPS.get(
+            canonical_name(meta.build_backend or "")
+        )
+        deps = [
+            f"{var}-native"
+            for var in _bitbake_deps(extra_build, f"{yocto.python_pn}-")
+        ]
+        if tools:
+            deps.extend(tools.split())
+        # A bare-tool build dep (e.g. meson) already maps to meson-native, so
+        # it can duplicate the backend's tool deps; keep each name once.
+        deps = list(dict.fromkeys(deps))
+        if deps:
+            lines.append(f'DEPENDS += "{" ".join(deps)}"')
+            lines.append("")
 
     if meta.runtime_deps:
         deps = " ".join(
@@ -540,6 +868,28 @@ def render_recipe(
             )
         )
         lines.append(f'RDEPENDS:${{PN}} += "{deps}"')
+        lines.append("")
+
+    # Machine-gated runtime deps (``foo; platform_machine == "aarch64"``) must
+    # be selected by bitbake on the real target, not on the host that runs
+    # bitbake: baking the build host's answer in would ship the wrong
+    # dependency set for a cross build. The override suffix is a token poky's
+    # ``meta/conf/machine/include/*/arch-*.inc`` files add to MACHINEOVERRIDES
+    # (``x86``, ``x86_64``, ``armv7a``, ``aarch64``, ``riscv64``, ...), so the
+    # same recipe stays correct on every machine of the family.
+    if meta.machine_deps:
+        lines.append(
+            "# Machine-gated dependencies (Requires-Dist platform_machine "
+            "markers):"
+        )
+        by_token: dict[str, list[str]] = {}
+        for dep in meta.machine_deps:
+            for machine in dep.machines:
+                for token in machine_override_tokens(machine):
+                    by_token.setdefault(token, []).append(dep.name)
+        for token, names in by_token.items():
+            deps = " ".join(_bitbake_deps(names, f"{yocto.python_pn}-"))
+            lines.append(f'RDEPENDS:${{PN}}:append:{token} += "{deps}"')
         lines.append("")
 
     sed_programs: list[str] = []

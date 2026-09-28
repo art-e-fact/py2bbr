@@ -217,6 +217,21 @@ class TestKasFile:
         del cfg["header"]
         assert validate_kas_file(cfg)
 
+    def test_validate_reports_a_broken_validator(self, monkeypatch):
+        # A broken/odd jsonschema must not take the run down: the schema error
+        # becomes a warning the user can act on.
+        import jsonschema
+
+        def boom(_self, _config):
+            raise jsonschema.SchemaError("broken schema")
+
+        monkeypatch.setattr(
+            jsonschema.Draft7Validator, "iter_errors", boom, raising=True
+        )
+        assert validate_kas_file({"header": {"version": 5}}) == [
+            "kas schema validation raised: broken schema"
+        ]
+
     def test_validate_fallback(self, monkeypatch):
         monkeypatch.setitem(sys.modules, "jsonschema", None)
         assert validate_kas_file({}) == ["kas config missing required 'header'"]

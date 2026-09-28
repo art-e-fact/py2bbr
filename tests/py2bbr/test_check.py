@@ -343,3 +343,66 @@ class TestRunChecks:
         results = check.run_checks(_meta(), p, None, None, level="checklayer")
         assert results[2].status is Status.SKIP
         assert "no layer" in results[2].detail
+
+
+class TestRunChecksAvailable:
+    """When a tool *is* available, the stage has to actually run it.
+
+    The skipped branches are cheap to reach (monkeypatch the probe to say
+    "unavailable"), so the running branches need their own tests - a stage that
+    silently skips whenever bitbake/kas/check-layer exist would report success
+    without validating anything.
+    """
+
+    def _run(self, tmp_path, monkeypatch, level, **kwargs):
+        monkeypatch.setattr(
+            check, "_bitbake_available", lambda: (True, "bitbake found")
+        )
+        monkeypatch.setattr(
+            check, "_checklayer_available", lambda: (True, "check-layer found")
+        )
+        monkeypatch.setattr(check, "_kas_available", lambda f: (True, "kas"))
+        monkeypatch.setattr(check, "_run_cmd", lambda *a, **k: (0, "ok"))
+        return check.run_checks(
+            _meta(),
+            _write(tmp_path, _CLEAN),
+            tmp_path / "layer",
+            tmp_path / "py2bbr.kas.yml",
+            level=level,
+            workdir=tmp_path / "wd",
+            **kwargs,
+        )
+
+    def test_parse_runs_bitbake(self, tmp_path, monkeypatch):
+        results = self._run(tmp_path, monkeypatch, "parse")
+        assert results[1].status is Status.PASS
+        assert "bitbake parsed" in results[1].detail
+
+    def test_checklayer_runs_the_tool(self, tmp_path, monkeypatch):
+        results = self._run(tmp_path, monkeypatch, "checklayer")
+        assert results[2].status is Status.PASS
+        assert "check-layer" in results[2].detail
+
+    def test_build_runs_kas(self, tmp_path, monkeypatch):
+        results = self._run(tmp_path, monkeypatch, "build")
+        assert results[3].status is Status.PASS
+        assert "kas build" in results[3].detail
+
+
+class TestRunCmdEnv:
+    def test_extra_env_is_merged(self, monkeypatch):
+        seen = {}
+
+        def fake_run(cmd, cwd, env, **kwargs):
+            seen.update(env)
+            return subprocess.CompletedProcess(cmd, 0, "out", "")
+
+        monkeypatch.setattr(check.subprocess, "run", fake_run)
+        monkeypatch.setenv("PY2BBR_SENTINEL", "from-parent")
+        code, out = check._run_cmd(
+            ["true"], cwd=None, timeout=5, extra_env={"BB_ENV_PY2BBR": "extra"}
+        )
+        assert (code, out) == (0, "out")
+        # The caller's overrides win over the inherited environment.
+        assert seen["BB_ENV_PY2BBR"] == "extra"
+        assert seen["PY2BBR_SENTINEL"] == "from-parent"
