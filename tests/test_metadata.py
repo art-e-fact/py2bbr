@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import email
 import gzip
 import hashlib
@@ -307,6 +308,55 @@ class TestRunPipDownload:
         probe = scratch / "probe"
         probe.write_text("x")
         assert probe.stat().st_dev == tmp_path.stat().st_dev
+
+    @staticmethod
+    def _capture(monkeypatch, tmp_path, **kw) -> list[str]:
+        captured: dict = {}
+
+        def fake_run(cmd, **run_kw):
+            captured["cmd"] = cmd
+            return subprocess.CompletedProcess(cmd, 0, "ok", "")
+
+        monkeypatch.setattr(M, "_pip_executable", lambda: ["fake", "pip"])
+        monkeypatch.setattr(M.subprocess, "run", fake_run)
+        M._run_pip_download(
+            "pkg==1.0", tmp_path, PipOptions(), kw.pop("mode"), **kw
+        )
+        return captured["cmd"]
+
+    @staticmethod
+    def _values_after(cmd: list[str], flag: str) -> list[str]:
+        return [cmd[n + 1] for n in range(len(cmd) - 1) if cmd[n] == flag]
+
+    def test_target_interpreter_is_pinned(self, monkeypatch, tmp_path):
+        # Without --python-version, pip resolves wheels against the interpreter
+        # py2bbr itself runs under. That is a property of the machine running
+        # py2bbr, not of the target: a CPython 3.12 layer generated on a 3.14
+        # host got handed a cp314 wheel, so the layer only worked on the host
+        # that produced it.
+        cmd = self._capture(
+            monkeypatch,
+            tmp_path,
+            mode="--only-binary=:all:",
+            python_version="3.12",
+        )
+        assert self._values_after(cmd, "--python-version") == ["3.12"]
+
+    def test_omitted_without_a_target_version(self, monkeypatch, tmp_path):
+        cmd = self._capture(monkeypatch, tmp_path, mode="--only-binary=:all:")
+        assert "--python-version" not in cmd
+
+    def test_platform_is_never_constrained(self, monkeypatch, tmp_path):
+        # --platform would mean inventing a target architecture py2bbr does not
+        # know; the platform tag is left to the layer's author.
+        cmd = self._capture(
+            monkeypatch,
+            tmp_path,
+            mode="--only-binary=:all:",
+            python_version="3.12",
+        )
+        assert "--platform" not in cmd
+        assert "--abi" not in cmd
 
 
 class TestPublicSdistUrl:
@@ -1423,11 +1473,48 @@ class TestWheelTagCompatibility:
                 yocto=resolve_yocto_version("5.0"),
             )
         message = str(excinfo.value)
-        assert "publishes no source distribution" in message
+        assert "serves no artifact the target can use" in message
         assert "cp314-cp314" in message
+        # Says what was actually checked: the download is already restricted to
+        # the target's interpreter, so the verdict is about the index, not about
+        # whatever py2bbr's own interpreter would have accepted.
+        assert "3.12" in message
+        # Names the target, so the reader knows which constraint applied.
+        assert "Yocto 5.0" in message
         # Actionable: name the fix rather than just the symptom.
         assert "--sdist" in message
         assert "--index-url" in message
+
+    def test_wheel_miss_names_the_pin(self, tmp_path, monkeypatch):
+        # pip filters wheels by interpreter tag, so an index carrying only
+        # wheels for other Python versions reports "from versions: none". The
+        # message has to name the pin, or a reader cannot tell that apart from
+        # a bad requirement or a wrong --index-url.
+        proc = subprocess.CompletedProcess(
+            [], 1, "", "ERROR: No matching distribution found for multi==1.0"
+        )
+        monkeypatch.setattr(M, "_run_pip_download", lambda *a, **kw: proc)
+        with pytest.raises(MetadataNotFoundError) as excinfo:
+            M.fetch_source(
+                "multi",
+                "1.0",
+                PipOptions(index_url="https://i"),
+                tmp_path,
+                yocto=resolve_yocto_version("5.0"),
+            )
+        message = str(excinfo.value)
+        assert "restricted to CPython 3.12" in message
+        assert "--python-version 3.12" in message
+        assert "No matching distribution" in message
+
+    def test_wheel_miss_without_a_target_says_nothing_about_a_pin(
+        self, tmp_path, monkeypatch
+    ):
+        proc = subprocess.CompletedProcess([], 1, "", "ERROR: nope")
+        monkeypatch.setattr(M, "_run_pip_download", lambda *a, **kw: proc)
+        with pytest.raises(MetadataNotFoundError) as excinfo:
+            M.fetch_source("multi", "1.0", PipOptions(), tmp_path)
+        assert "python-version" not in str(excinfo.value)
 
     def test_fetch_source_accepts_a_serving_wheel(self, tmp_path, monkeypatch):
         def fake(requirement, dest, *a, **kw):
@@ -1443,3 +1530,116 @@ class TestWheelTagCompatibility:
             yocto=resolve_yocto_version("5.0"),
         )
         assert src.kind is SourceKind.WHEEL
+
+
+class TestTargetInterpreterPinned:
+    """py2bbr's own interpreter must never decide what a layer ships.
+
+    The reported failure: py2bbr ran under CPython 3.14, pip resolved the wheel
+    for *that* interpreter, and the CPython 3.12 target was declared unusable.
+    Artifact selection has to be driven by the target, which is the only
+    interpreter the generated layer will ever meet.
+    """
+
+    def test_major_minor_only(self):
+        # pip's --python-version takes a major.minor spec. YoctoVersion carries
+        # one, but a patch component must not silently disable the pin.
+        yocto = dataclasses.replace(
+            resolve_yocto_version("5.0"), python_version="3.12.6"
+        )
+        assert M._pip_python_version(yocto) == "3.12"
+
+    @pytest.mark.parametrize("version", ["", "3", "2.7", "python"])
+    def test_unpinnable_target_version(self, version):
+        yocto = dataclasses.replace(
+            resolve_yocto_version("5.0"), python_version=version
+        )
+        assert M._pip_python_version(yocto) is None
+
+    def test_unknown_target_is_unpinned(self):
+        assert M._pip_python_version(None) is None
+
+    @pytest.mark.parametrize(
+        ("version", "codename", "expected"),
+        [
+            ("5.0", "scarthgap", "Yocto 5.0 (scarthgap)"),
+            # A series named after its own codename must not read "5.0 (5.0)".
+            ("scarthgap", "scarthgap", "Yocto scarthgap"),
+            ("", "", "the Yocto target"),
+        ],
+    )
+    def test_target_label(self, version, codename, expected):
+        yocto = dataclasses.replace(
+            resolve_yocto_version("5.0"), version=version, codename=codename
+        )
+        assert M._target_label(yocto) == expected
+
+    def test_target_label_without_a_target(self):
+        assert M._target_label(None) == "the Yocto target"
+
+    def test_only_the_wheel_fallback_is_pinned(self, tmp_path, monkeypatch):
+        # The sdist attempts must not be pinned: pip resolves them by building
+        # metadata, and the target interpreter plays no part in that.
+        calls: list[tuple[str, str | None]] = []
+
+        def fake(requirement, dest, pip_opts, mode, *a, **kw):
+            calls.append((mode, kw.get("python_version")))
+            if mode == "--no-binary=:all:":
+                # Fail the first sdist attempt so the no-build-isolation
+                # retry and then the wheel fallback both run.
+                if len([c for c in calls if c[0] == mode]) == 1:
+                    return subprocess.CompletedProcess([], 1, "", "no sdist")
+                (dest / "pkg-1.0.tar.gz").write_bytes(b"data")
+                return subprocess.CompletedProcess([], 0, "", "")
+            (dest / "pkg-1.0-py3-none-any.whl").write_bytes(b"data")
+            return subprocess.CompletedProcess([], 0, "", "")
+
+        monkeypatch.setattr(M, "_run_pip_download", fake)
+        M.fetch_source(
+            "pkg",
+            "1.0",
+            PipOptions(),
+            tmp_path,
+            yocto=resolve_yocto_version("5.0"),
+        )
+        assert calls == [
+            ("--no-binary=:all:", None),
+            ("--no-binary=:all:", None),
+        ]
+
+    def test_wheel_fallback_is_pinned(self, tmp_path, monkeypatch):
+        # The one attempt that has to be pinned: a wheel is picked by
+        # interpreter tag, so the answer depends on the target's version.
+        calls: list[tuple[str, str | None]] = []
+
+        def fake(requirement, dest, pip_opts, mode, *a, **kw):
+            calls.append((mode, kw.get("python_version")))
+            if mode == "--only-binary=:all:":
+                (dest / "pkg-1.0-py3-none-any.whl").write_bytes(b"data")
+            return subprocess.CompletedProcess([], 0, "", "")
+
+        monkeypatch.setattr(M, "_run_pip_download", fake)
+        M.fetch_source(
+            "pkg",
+            "1.0",
+            PipOptions(),
+            tmp_path,
+            yocto=resolve_yocto_version("5.0"),
+        )
+        assert calls == [
+            ("--no-binary=:all:", None),
+            ("--no-binary=:all:", None),
+            ("--only-binary=:all:", "3.12"),
+        ]
+
+    def test_unpinned_when_target_is_unknown(self, tmp_path, monkeypatch):
+        calls: list[tuple[str, str | None]] = []
+
+        def fake(requirement, dest, pip_opts, mode, *a, **kw):
+            calls.append((mode, kw.get("python_version")))
+            (dest / "pkg-1.0.tar.gz").write_bytes(b"data")
+            return subprocess.CompletedProcess([], 0, "", "")
+
+        monkeypatch.setattr(M, "_run_pip_download", fake)
+        M.fetch_source("pkg", "1.0", PipOptions(), tmp_path)
+        assert calls == [("--no-binary=:all:", None)]

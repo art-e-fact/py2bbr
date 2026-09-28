@@ -184,12 +184,41 @@ def _pip_executable() -> list[str]:
     return [sys.executable, "-m", "pip"]
 
 
+def _pip_python_version(yocto: YoctoVersion | None) -> str | None:
+    """The ``<major>.<minor>`` to hand pip as ``--python-version``, or None.
+
+    pip only understands a major.minor spec. ``YoctoVersion.python_version`` is
+    major.minor by contract, but a patch component must not silently disable the
+    pin (that failure mode is invisible: the download just resolves for the
+    wrong interpreter again).
+    """
+    target = getattr(yocto, "python_version", "") or ""
+    parts = target.split(".")
+    if len(parts) < 2 or parts[0] != "3" or not parts[1].isdigit():
+        return None
+    return f"3.{int(parts[1])}"
+
+
+def _target_label(yocto: YoctoVersion | None) -> str:
+    """Name the target a constraint came from, e.g. ``Yocto 5.0 (scarthgap)``.
+
+    Without it these messages say "the target", and a reader has no way to tell
+    which of several targets in one layer the verdict applies to.
+    """
+    version = getattr(yocto, "version", "") or ""
+    codename = getattr(yocto, "codename", "") or ""
+    if version and codename and version != codename:
+        return f"Yocto {version} ({codename})"
+    return f"Yocto {version}" if version else "the Yocto target"
+
+
 def _run_pip_download(
     requirement: str,
     dest: Path,
     pip_opts: PipOptions,
     binary_mode: str,
     no_build_isolation: bool = False,
+    python_version: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
     cmd = (
         _pip_executable()
@@ -205,6 +234,17 @@ def _run_pip_download(
         ]
         + pip_opts.build_args()
     )
+    if python_version:
+        # Pin the interpreter the artifact has to run on, or pip resolves
+        # against the interpreter py2bbr itself happens to run under. That is a
+        # property of the machine running py2bbr, not of the target: a CPython
+        # 3.12 layer generated from a 3.14 host would be handed a cp314 wheel
+        # (and skip packages gated on ``Requires-Python >= 3.13``), so the
+        # generated layer would only work on the host that made it. The
+        # interpreter tag is the only axis that can be pinned this way -
+        # ``--platform`` would mean inventing a target architecture py2bbr
+        # does not know.
+        cmd += ["--python-version", python_version]
     if no_build_isolation:
         # Build the sdist's metadata with the environment py2bbr runs in rather
         # than letting pip provision an isolated one from the index.
@@ -337,9 +377,9 @@ def _wheel_rejection_reason(
     there is nothing left for bitbake to build. It is still the right artifact
     when a package publishes no sdist, because the target runs the same Python
     the wheel was compiled against. Those tags live in the file name
-    (``pyvizionsdk-26.9.1-cp314-cp314-manylinux_2_31_x86_64.whl`` is CPython
-    3.14), so the mismatch is decidable here - rather than surfacing much later
-    as a hard load error inside the target's Python.
+    (``pyvizionsdk-26.9.1-cp38-abi3-manylinux_2_17_x86_64.whl`` is CPython
+    3.8 onwards), so the mismatch is decidable here - rather than surfacing
+    much later as a hard load error inside the target's Python.
 
     The *platform* tag is deliberately not rejected: py2bbr does not know the
     target architecture (see :func:`marker_env`), and ``any`` / ``linux_*`` /
@@ -357,8 +397,8 @@ def _wheel_rejection_reason(
         return None
     offered = ", ".join(sorted(f"{t}-{a}" for t, a in tags)) or "(none)"
     return (
-        f"the only artifact published is {filename}, built for {offered}, but "
-        f"the target {getattr(yocto, 'label', 'Yocto')} runs CPython {target}. "
+        f"{filename} is built for {offered}, but "
+        f"{_target_label(yocto)} runs CPython {target}. "
         "A wheel ships prebuilt extension modules for one exact ABI and cannot "
         "be rebuilt for another interpreter, so no recipe can install it on the "
         "target."
@@ -396,9 +436,10 @@ def fetch_source(
     alphabetically-first artifact already present, and a reused per-package
     dir would keep picking a stale version from an earlier run).
 
-    Raises :class:`MetadataNotFoundError` if no artifact is available, and
-    also when the only artifact is a wheel whose Python tag cannot run on the
-    target (``yocto`` enables that check).
+    Raises :class:`MetadataNotFoundError` if no artifact is available, and as a
+    backstop for a wheel whose ABI tag cannot run on the target (``yocto``
+    enables that check; the wheel download itself is already restricted to the
+    target's interpreter).
     """
     requirement = requirement or (f"{name}=={version}" if version else name)
     parent = workdir / "download"
@@ -437,31 +478,59 @@ def fetch_source(
         artifact = _pick_artifact(dest, prefer_sdist=True, sdists_only=True)
     if artifact is None:
         _warn_sdist_unavailable(requirement, proc)
+        # No sdist: fall back to a wheel, which bitbake installs instead of
+        # building. Pin the *target's* interpreter so pip cannot answer with a
+        # wheel built for the version py2bbr runs under.
+        pinned = _pip_python_version(yocto)
         proc = _run_pip_download(
-            requirement, dest, pip_opts, "--only-binary=:all:"
+            requirement,
+            dest,
+            pip_opts,
+            "--only-binary=:all:",
+            python_version=pinned,
         )
         artifact = _pick_artifact(dest, prefer_sdist=False)
     if artifact is None:
         tail = (proc.stderr or proc.stdout or "").strip().splitlines()[-6:]
+        # pip filters wheels by interpreter tag, so an index that carries only
+        # wheels for *other* Python versions reads as "no versions at all".
+        # Without the pin named, that is indistinguishable from a typo in the
+        # requirement or a wrong index URL.
+        hint = ""
+        if pinned:
+            hint = (
+                f"\n  The wheel download was restricted to CPython {pinned}, "
+                f"the version {_target_label(yocto)} runs, so this also covers "
+                f"an index that serves wheels for other interpreters only. "
+                f"Check what it offers: `pip download {requirement} "
+                f"--only-binary=:all: --python-version {pinned} "
+                f"--no-deps <your index flags>`"
+            )
         raise MetadataNotFoundError(
             f"could not download {requirement!r} from the configured index(es) "
             f"{' '.join(pip_opts.describe()) or '(default PyPI)'}.\n"
             + "\n".join(f"  {line}" for line in tail)
+            + hint
         )
-    # Only reachable when the index has no sdist at all. A wheel has to be
-    # installed rather than built, so its interpreter tag decides whether the
-    # target can run it; report that now, not as a target-side load failure
-    # after a long cross build.
+    # Backstop for the case pip's own target-interpreter filter cannot cover:
+    # a wheel it considers compatible still has to name an ABI the target runs.
+    # Report that now, not as a target-side load failure after a long cross
+    # build.
     if artifact.suffix == ".whl" and (
         reason := _wheel_rejection_reason(artifact.name, yocto)
     ):
         raise MetadataNotFoundError(
-            f"{_canonical(name)} {requirement} publishes no source "
-            f"distribution: {reason}\n"
-            "  Build and publish an sdist upstream "
+            f"{_canonical(name)} {requirement}: the index serves no artifact "
+            f"the target can use. {reason}\n"
+            f"  The download was already restricted to CPython "
+            f"{getattr(yocto, 'python_version', '') or '?'} (the version "
+            f"{_target_label(yocto)} runs), so this means the upstream project "
+            f"publishes neither an sdist nor a wheel for it, or this index is "
+            f"missing those files.\n"
+            f"  Build and publish an sdist upstream "
             f"(`python -m build --sdist {name}`), or point --index-url at "
-            "an index that serves one. A recipe cannot cross-build a wheel: it "
-            "is a finished artifact, not source."
+            f"an index that serves one. A recipe cannot cross-build a wheel: "
+            f"it is a finished artifact, not source."
         )
 
     public_reachable: bool | None = None
