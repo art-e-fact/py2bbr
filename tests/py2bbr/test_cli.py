@@ -4,11 +4,12 @@ Unit tests on CLI functions
 
 import logging
 import runpy
+import subprocess
 import sys
 
 import pytest
 
-from py2bbr import cli
+from py2bbr import __version__, cli
 from py2bbr import metadata as M
 from py2bbr.errors import MetadataNotFoundError, Py2BbrError
 from py2bbr.metadata import FetchedSource
@@ -215,12 +216,30 @@ class TestMain:
         monkeypatch.setattr(cli, "build_metadata", boom)
         assert cli.main(["black", "-o", str(tmp_path)]) == 130
 
-    def test_module_entry_points(self, monkeypatch):
+    def test_module_entry_point(self, monkeypatch):
+        # ``python -m py2bbr`` goes through py2bbr/__main__.py. runpy can
+        # re-execute that here: the target is the package itself, so nothing
+        # is shadowed and runpy stays quiet.
         monkeypatch.setattr(sys, "argv", ["py2bbr", "--version"])
-        for mod in ("py2bbr", "py2bbr.cli"):
-            with pytest.raises(SystemExit) as exc:
-                runpy.run_module(mod, run_name="__main__")
-            assert exc.value.code == 0
+        with pytest.raises(SystemExit) as exc:
+            runpy.run_module("py2bbr", run_name="__main__")
+        assert exc.value.code == 0
+
+    def test_submodule_entry_point(self):
+        # ``python -m py2bbr.cli`` cannot be checked with runpy in-process:
+        # this test module has already imported py2bbr.cli, and re-executing
+        # that source under the name __main__ here is not what -m does (it
+        # imports it fresh). runpy warns about exactly that ("found in
+        # sys.modules after import of package ... but prior to execution"),
+        # and the warning is right - a subprocess is the faithful check.
+        proc = subprocess.run(
+            [sys.executable, "-m", "py2bbr.cli", "--version"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout.strip() == f"py2bbr {__version__}"
 
     def test_jobs_passed_to_resolve_closure(
         self, tmp_path, monkeypatch, meta, make_meta_fn
