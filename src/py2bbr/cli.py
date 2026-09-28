@@ -23,7 +23,7 @@ from py2bbr import __version__
 from py2bbr.check import DEFAULT_LEVEL, STAGES, run_checks
 from py2bbr.errors import MetadataNotFoundError, Py2BbrError
 from py2bbr.metadata import PipOptions, build_metadata
-from py2bbr.model import DEFAULT_YOCTO_VERSION
+from py2bbr.model import DEFAULT_YOCTO_VERSION, Dependency
 from py2bbr.recipe import (
     bitbake_pn,
     build_version_gaps,
@@ -31,6 +31,7 @@ from py2bbr.recipe import (
     recipe_filename,
     render_recipe_to_path,
     sysroot_tool_version,
+    tool_companion_gaps,
 )
 from py2bbr.yocto import (
     DEFAULT_KAS_VERSION,
@@ -448,6 +449,24 @@ def _select_targets(spec: str | None, warnings: list[str]):
     return tuple(selected) or KNOWN_TARGETS
 
 
+def _rendered_build_class(meta, build_class: str | None) -> str:
+    """The build class the recipe is actually rendered with.
+
+    Shares :func:`py2bbr.recipe.render_recipe`'s dispatch, so the report cannot
+    describe a class the recipe does not use. A vendored wheel renders as a
+    wheel install with no build class at all, which is reported as
+    ``wheel-install`` (installing a prebuilt artifact is trivially portable -
+    the wheel's own tags are what constrain it, and the rejection for those
+    already happened at fetch time).
+    """
+    from py2bbr.model import SourceKind
+    from py2bbr.recipe import effective_build_class
+
+    if meta.vendored and meta.source_kind is SourceKind.WHEEL:
+        return "wheel-install"
+    return effective_build_class(meta, build_class)
+
+
 def _build_target_report(meta, yocto, args, warnings):
     """Build the build-for-target verdict for the rendered build class.
 
@@ -455,13 +474,12 @@ def _build_target_report(meta, yocto, args, warnings):
     must be compiled for the target CPU. The report says which targets the
     generated recipe can serve and what breaks where.
     """
-    from py2bbr.recipe import effective_build_class
     from py2bbr.targets import evaluate
 
     targets = _select_targets(getattr(args, "targets", None), warnings)
     return evaluate(
         meta,
-        effective_build_class(meta, args.build_class),
+        _rendered_build_class(meta, args.build_class),
         yocto,
         targets=targets,
     )
@@ -493,6 +511,72 @@ def _shadow_warning(shadowed: list[str]) -> str:
         "task '<recipe>-native:populate_sysroot' could not be found\". "
         f"Rebuild those tasks once: petalinux-build -c cleansstate {tasks}"
     )
+
+
+def _provision_build_tools(
+    closure: list,
+    gaps: list[Dependency],
+    closure_sources: dict[str, Path],
+    warnings_extra: list[str],
+    progress,
+    pip_opts,
+    workdir: Path,
+    yocto,
+    args,
+) -> set[str]:
+    """Add a recipe for every build tool the target sysroot is too old for.
+
+    Returns the canonical names actually provisioned. The worklist is processed
+    to a fixpoint because a provisioned tool is itself built in the native
+    sysroot and can drag in further gaps, from two directions:
+
+    * its own ``[build-system].requires`` floors (``build_version_gaps``) - a
+      tool built by meson-python needs meson/ninja that the sysroot may be too
+      old for, exactly like the original consumer did;
+    * the native packages it imports at run time
+      (:func:`tool_companion_gaps`) - meson-python 0.18.0+ calls
+      ``StandardMetadata.from_pyproject`` with the ``metadata_version`` argument
+      that ``pyproject-metadata`` only accepts from 0.8.0, and declares that
+      companion unversioned so no floor is visible.
+
+    A single pass would emit a meson-python recipe that still cannot build, so
+    the loop re-evaluates each tool it pulls in.
+    """
+    have = {canonical_name(m.name) for m in closure}
+    queued: list[Dependency] = list(gaps)
+    provisioned: set[str] = set()
+    while queued:
+        dep = queued.pop(0)
+        cname = canonical_name(dep.name)
+        if cname in have:
+            continue
+        logger.info(
+            "provisioning %s (sysroot of %s ships an older build dep)",
+            dep.name,
+            yocto.label,
+        )
+        try:
+            with progress.fetch(dep.requirement):
+                member, msource = build_metadata(
+                    dep.name,
+                    None,
+                    pip_opts,
+                    workdir,
+                    yocto=yocto,
+                    keep=args.keep_sources,
+                    requirement=dep.requirement,
+                    check_public=True,
+                )
+        except MetadataNotFoundError as exc:
+            warnings_extra.append(f"could not provision {dep.name}: {exc}")
+            continue
+        closure.append(member)
+        closure_sources[member.canonical_name] = msource.path
+        have.add(cname)
+        provisioned.add(cname)
+        queued.extend(build_version_gaps(member, yocto))
+        queued.extend(tool_companion_gaps(member, yocto))
+    return provisioned
 
 
 def _print_target_report(report) -> None:
@@ -609,48 +693,29 @@ def main(argv: list[str] | None = None) -> int:
                     "layer is generated to hold a newer recipe (use --with-deps)."
                 )
         else:
-            for dep in gaps:
-                if canonical_name(dep.name) in {
-                    canonical_name(m.name) for m in closure
-                }:
-                    continue
-                logger.info(
-                    "provisioning %s (sysroot of %s ships an older build dep)",
-                    dep.name,
-                    yocto.label,
-                )
-                try:
-                    with progress.fetch(dep.requirement):
-                        member, msource = build_metadata(
-                            dep.name,
-                            None,
-                            pip_opts,
-                            workdir,
-                            yocto=yocto,
-                            keep=args.keep_sources,
-                            requirement=dep.requirement,
-                            check_public=True,
-                        )
-                except MetadataNotFoundError as exc:
-                    warnings_extra.append(
-                        f"could not provision {dep.name}: {exc}"
-                    )
-                    continue
-                closure.append(member)
-                closure_sources[member.canonical_name] = msource.path
-            if gaps:
+            provisioned = _provision_build_tools(
+                closure,
+                gaps,
+                closure_sources,
+                warnings_extra,
+                progress,
+                pip_opts,
+                workdir,
+                yocto,
+                args,
+            )
+            if provisioned:
                 warnings_extra.append(
                     "provisioned newer build-backend recipe(s) into the layer "
                     "(the sysroot ships older than build-system.requires "
-                    "demands): "
-                    + ", ".join(sorted(canonical_name(g.name) for g in gaps))
+                    "demands): " + ", ".join(sorted(provisioned))
                 )
                 shadowed = sorted(
                     pn
                     for pn in (
-                        bitbake_pn(g.name, yocto.python_pn)
-                        for g in gaps
-                        if sysroot_tool_version(yocto, g.name)
+                        bitbake_pn(name, yocto.python_pn)
+                        for name in provisioned
+                        if sysroot_tool_version(yocto, name)
                     )
                 )
                 if shadowed:

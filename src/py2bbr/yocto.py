@@ -217,10 +217,11 @@ def write_layer(
     """Write the layer tree under ``layer_dir``; return the top recipe path.
 
     ``vendor_sources`` maps recipe file names (e.g. ``python3-x_1.0.bb``) to
-    the sdist each vendored recipe must ship; each is copied into the layer's
-    ``recipes-devtools/python/files/`` so the ``file://`` SRC_URI resolves
-    through FILESPATH. A vendored recipe without its source is an error: the
-    generated recipe would reference a file the layer does not carry.
+    the artifact each vendored recipe must ship; each is copied into the
+    layer's ``recipes-devtools/python/files/`` so the ``file://`` SRC_URI
+    resolves through FILESPATH. A vendored recipe without its source is an
+    error: the generated recipe would reference a file the layer does not
+    carry.
     """
     layer_dir = Path(layer_dir)
     files = render_layer(

@@ -1266,3 +1266,180 @@ class TestMachineGatedDeps:
             ['x; platform_machine == "aarch64"'], None
         )
         assert gated[0].machines == ("aarch64",)
+
+
+class TestSdistDownloadRetry:
+    """A failed sdist attempt is retried without pip's build isolation.
+
+    pip prepares an sdist's PEP 517 metadata in an isolated build env, which it
+    populates *from the index*. An index that carries the package but not the
+    declared backend (or one reached through a narrower credential) then fails
+    the download even though the sdist is right there. py2bbr's own environment
+    can build that metadata, so the second attempt drops the isolation instead
+    of falling through to a wheel.
+    """
+
+    def test_retry_drops_build_isolation(self, tmp_path, monkeypatch):
+        seen: list[dict] = []
+
+        def fake(requirement, dest, pip_opts, binary_mode, **kw):
+            seen.append({"mode": binary_mode, **kw})
+            if len(seen) == 1:
+                return subprocess.CompletedProcess([], 1, "", "no backend")
+            (dest / "pkg-1.0.tar.gz").write_bytes(b"sdist")
+            return subprocess.CompletedProcess([], 0, "", "")
+
+        monkeypatch.setattr(M, "_run_pip_download", fake)
+        src = M.fetch_source("pkg", "1.0", PipOptions(), tmp_path)
+        assert src.kind is SourceKind.SDIST
+        assert len(seen) == 2
+        assert seen[0].get("no_build_isolation") is not True
+        assert seen[1]["no_build_isolation"] is True
+        # The retry still demands an sdist: a wheel is not a successful sdist
+        # fetch, it is the fallback the retry exists to avoid.
+        assert seen[1]["mode"] == "--no-binary=:all:"
+
+    def test_no_retry_when_the_sdist_arrives(self, tmp_path, monkeypatch):
+        calls = {"n": 0}
+
+        def fake(requirement, dest, *a, **kw):
+            calls["n"] += 1
+            (dest / "pkg-1.0.tar.gz").write_bytes(b"sdist")
+            return subprocess.CompletedProcess([], 0, "", "")
+
+        monkeypatch.setattr(M, "_run_pip_download", fake)
+        M.fetch_source("pkg", "1.0", PipOptions(), tmp_path)
+        assert calls["n"] == 1
+
+    def test_wheel_on_a_no_binary_attempt_is_not_an_sdist(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        # pip was told --no-binary and still produced only a wheel. Accepting
+        # it would skip both the fallback and the warning about the lost
+        # [build-system] detection that a wheel payload cannot carry.
+        def fake(requirement, dest, *a, **kw):
+            (dest / "pkg-1.0-py3-none-any.whl").write_bytes(b"data")
+            return subprocess.CompletedProcess([], 0, "", "")
+
+        monkeypatch.setattr(M, "_run_pip_download", fake)
+        with caplog.at_level("WARNING", logger="py2bbr.metadata"):
+            src = M.fetch_source("pkg", "1.0", PipOptions(), tmp_path)
+        assert src.kind is SourceKind.WHEEL
+        assert "sdist fetch failed" in caplog.text
+
+
+class TestWheelTagCompatibility:
+    """A wheel is only installable if its tags can run on the target.
+
+    A wheel is a build product for one exact ABI, so a mismatch is a hard load
+    error on the target - decidable from the file name, and worth reporting
+    before a long cross build rather than after it.
+    """
+
+    @pytest.mark.parametrize(
+        "filename",
+        [
+            "pkg-1.0-py3-none-any.whl",
+            "pkg-1.0-py2.py3-none-any.whl",
+            "pkg-1.0-py312-none-any.whl",
+            "pkg-1.0-cp312-cp312-linux_aarch64.whl",
+            # Stable ABI: compiled once against the limited API, valid on every
+            # later CPython 3.
+            "pkg-1.0-cp38-abi3-manylinux_2_17_aarch64.whl",
+            "pkg-1.0-cp312-abi3-manylinux_2_17_aarch64.whl",
+        ],
+    )
+    def test_serves_the_target(self, filename):
+        assert (
+            M._wheel_rejection_reason(filename, resolve_yocto_version("5.0"))
+            is None
+        )
+
+    @pytest.mark.parametrize(
+        "filename",
+        [
+            # The reported pyvizionsdk artifact: built for CPython 3.14.
+            "pyvizionsdk-26.9.1-cp314-cp314-manylinux_2_31_x86_64.whl",
+            "pkg-1.0-py2-none-any.whl",
+            "pkg-1.0-cp311-cp311-linux_aarch64.whl",
+            "pkg-1.0-pp39-pypy39_pp73-linux_x86_64.whl",
+        ],
+    )
+    def test_cannot_serve_the_target(self, filename):
+        reason = M._wheel_rejection_reason(
+            filename, resolve_yocto_version("5.0")
+        )
+        assert reason is not None
+        assert filename in reason
+        assert "3.12" in reason
+
+    def test_unparsable_name_is_left_to_the_build(self):
+        # Guessing from a name we cannot read would produce a wrong verdict;
+        # let the build report the real problem.
+        assert M._wheel_rejection_reason("not-a-wheel.txt", None) is None
+        assert (
+            M._wheel_rejection_reason(
+                "not-a-wheel.txt", resolve_yocto_version("5.0")
+            )
+            is None
+        )
+
+    def test_non_cpython_target_is_not_checked(self):
+        # No target Python to compare against, so nothing is decidable.
+        assert (
+            M._wheel_rejection_reason("pkg-1.0-cp314-cp314-any.whl", None)
+            is None
+        )
+
+    def test_platform_tag_alone_does_not_reject(self):
+        # py2bbr does not know the target architecture, so a foreign platform
+        # tag is advice, not a hard failure: ``any``/``linux_*``/
+        # ``manylinux_*`` are the only shapes it accepts as plausible.
+        assert (
+            M._wheel_rejection_reason(
+                "pkg-1.0-cp312-cp312-manylinux_2_31_x86_64.whl",
+                resolve_yocto_version("5.0"),
+            )
+            is None
+        )
+
+    def test_fetch_source_rejects_an_unusable_wheel(
+        self, tmp_path, monkeypatch
+    ):
+        def fake(requirement, dest, *a, **kw):
+            (
+                dest
+                / "pyvizionsdk-26.9.1-cp314-cp314-manylinux_2_31_x86_64.whl"
+            ).write_bytes(b"data")
+            return subprocess.CompletedProcess([], 0, "", "")
+
+        monkeypatch.setattr(M, "_run_pip_download", fake)
+        with pytest.raises(MetadataNotFoundError) as excinfo:
+            M.fetch_source(
+                "pyvizionsdk",
+                "26.9.1",
+                PipOptions(),
+                tmp_path,
+                yocto=resolve_yocto_version("5.0"),
+            )
+        message = str(excinfo.value)
+        assert "publishes no source distribution" in message
+        assert "cp314-cp314" in message
+        # Actionable: name the fix rather than just the symptom.
+        assert "--sdist" in message
+        assert "--index-url" in message
+
+    def test_fetch_source_accepts_a_serving_wheel(self, tmp_path, monkeypatch):
+        def fake(requirement, dest, *a, **kw):
+            (dest / "pkg-1.0-py3-none-any.whl").write_bytes(b"data")
+            return subprocess.CompletedProcess([], 0, "", "")
+
+        monkeypatch.setattr(M, "_run_pip_download", fake)
+        src = M.fetch_source(
+            "pkg",
+            "1.0",
+            PipOptions(),
+            tmp_path,
+            yocto=resolve_yocto_version("5.0"),
+        )
+        assert src.kind is SourceKind.WHEEL

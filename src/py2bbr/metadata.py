@@ -40,6 +40,7 @@ from pathlib import Path, PurePosixPath
 
 from packaging.markers import default_environment
 from packaging.requirements import InvalidRequirement, Requirement
+from packaging.utils import InvalidWheelFilename, parse_wheel_filename
 
 from py2bbr.errors import MetadataError, MetadataNotFoundError
 from py2bbr.model import (
@@ -184,7 +185,11 @@ def _pip_executable() -> list[str]:
 
 
 def _run_pip_download(
-    requirement: str, dest: Path, pip_opts: PipOptions, binary_mode: str
+    requirement: str,
+    dest: Path,
+    pip_opts: PipOptions,
+    binary_mode: str,
+    no_build_isolation: bool = False,
 ) -> subprocess.CompletedProcess[str]:
     cmd = (
         _pip_executable()
@@ -200,6 +205,10 @@ def _run_pip_download(
         ]
         + pip_opts.build_args()
     )
+    if no_build_isolation:
+        # Build the sdist's metadata with the environment py2bbr runs in rather
+        # than letting pip provision an isolated one from the index.
+        cmd.append("--no-build-isolation")
     # pip's isolated metadata build unpacks the sdist into $TMPDIR, which may
     # be an inode-starved tmpfs (ENOSPC mid-extraction); route pip's scratch
     # onto the workdir filesystem (dest as parent), where it is deleted with dest.
@@ -281,6 +290,81 @@ def _warn_sdist_unavailable(
     )
 
 
+def _wheel_tags(filename: str) -> set[tuple[str, str]] | None:
+    """The ``(interpreter, abi)`` tag pairs a wheel filename claims.
+
+    ``None`` when the name is not a parsable wheel filename, so callers can
+    let the build report the real problem instead of guessing here.
+    """
+    try:
+        _name, _version, _build, tags = parse_wheel_filename(filename)
+    except (InvalidWheelFilename, ValueError):
+        return None
+    return {(tag.interpreter, tag.abi) for tag in tags}
+
+
+def _tag_serves(
+    target_major: str, target_minor: str, tag: str, abi: str
+) -> bool:
+    """Whether one wheel tag runs on CPython ``target_major.target_minor``.
+
+    The stable ABI (``abi3``) is the case that needs care: a ``cp38-abi3`` wheel
+    is compiled once against the limited API and installs on every later CPython
+    3, so it is *not* version-locked to the 3.8 it was named after. Rejecting it
+    would be wrong. A version-specific ABI (``cp312``) is locked.
+    """
+    if tag in (f"py{target_major}", f"py{target_major}{target_minor}"):
+        return True
+    if tag == f"cp{target_major}{target_minor}":
+        return True
+    if abi != "abi3":
+        return False
+    if tag == f"cp{target_major}":
+        return True
+    # cpXY-abi3: usable from the minor it names onwards.
+    if not tag.startswith(f"cp{target_major}"):
+        return False
+    built = tag[len(f"cp{target_major}") :]
+    return built.isdigit() and int(built) <= int(target_minor)
+
+
+def _wheel_rejection_reason(
+    filename: str, yocto: YoctoVersion | None
+) -> str | None:
+    """Why a wheel cannot serve the target interpreter, or None if it can.
+
+    A wheel is a *build product* for one exact ABI and platform, not source:
+    there is nothing left for bitbake to build. It is still the right artifact
+    when a package publishes no sdist, because the target runs the same Python
+    the wheel was compiled against. Those tags live in the file name
+    (``pyvizionsdk-26.9.1-cp314-cp314-manylinux_2_31_x86_64.whl`` is CPython
+    3.14), so the mismatch is decidable here - rather than surfacing much later
+    as a hard load error inside the target's Python.
+
+    The *platform* tag is deliberately not rejected: py2bbr does not know the
+    target architecture (see :func:`marker_env`), and ``any`` / ``linux_*`` /
+    ``manylinux_*`` are arch-agnostic. A wheel pinned to a foreign
+    architecture is reported as advice instead.
+    """
+    target = getattr(yocto, "python_version", "") or ""
+    if not target.startswith("3."):
+        return None  # not a CPython 3 target: nothing to compare against
+    tags = _wheel_tags(filename)
+    if tags is None:
+        return None  # unparsable name: let the build report it
+    major, _, minor = target.partition(".")
+    if any(_tag_serves(major, minor, tag, abi) for tag, abi in tags):
+        return None
+    offered = ", ".join(sorted(f"{t}-{a}" for t, a in tags)) or "(none)"
+    return (
+        f"the only artifact published is {filename}, built for {offered}, but "
+        f"the target {getattr(yocto, 'label', 'Yocto')} runs CPython {target}. "
+        "A wheel ships prebuilt extension modules for one exact ABI and cannot "
+        "be rebuilt for another interpreter, so no recipe can install it on the "
+        "target."
+    )
+
+
 def fetch_source(
     name: str,
     version: str | None,
@@ -290,6 +374,7 @@ def fetch_source(
     *,
     requirement: str | None = None,
     check_public: bool = False,
+    yocto: YoctoVersion | None = None,
 ) -> FetchedSource:
     """Download the package (sdist preferred) into ``workdir``.
 
@@ -311,16 +396,45 @@ def fetch_source(
     alphabetically-first artifact already present, and a reused per-package
     dir would keep picking a stale version from an earlier run).
 
-    Raises :class:`MetadataNotFoundError` if no artifact is available.
+    Raises :class:`MetadataNotFoundError` if no artifact is available, and
+    also when the only artifact is a wheel whose Python tag cannot run on the
+    target (``yocto`` enables that check).
     """
     requirement = requirement or (f"{name}=={version}" if version else name)
     parent = workdir / "download"
     parent.mkdir(parents=True, exist_ok=True)
     dest = Path(tempfile.mkdtemp(prefix=f"{_canonical(name)}-", dir=parent))
 
-    # Prefer sdist so the sha256 matches what `inherit pypi` fetches.
+    # Prefer sdist so the sha256 matches what `inherit pypi` fetches. Both
+    # attempts demand an sdist explicitly: a wheel surfacing here means the
+    # sdist is not obtainable, which is what the fallback below (and its
+    # warning) exists to report.
     proc = _run_pip_download(requirement, dest, pip_opts, "--no-binary=:all:")
-    artifact = _pick_artifact(dest, prefer_sdist=True)
+    artifact = _pick_artifact(dest, prefer_sdist=True, sdists_only=True)
+    if artifact is None:
+        # Retry without pip's build isolation. Building the sdist's metadata
+        # in isolation means pip first downloads the declared build backend
+        # from the index, which an index that carries only the package itself
+        # (or one reached through a narrow credential) cannot serve - and the
+        # download then fails even though the sdist is right there. py2bbr's own
+        # environment can build the metadata, so the second attempt drops the
+        # isolation and gets the sdist instead of falling through to a wheel.
+        logger.debug(
+            "%s: sdist download failed, retrying without build isolation",
+            requirement,
+        )
+        # ``proc`` deliberately keeps the *first* attempt's output: that is the
+        # root cause the retry works around, and it is the one whose diagnostic
+        # is specific (a transient tmpfs failure reads very differently from
+        # "no sdist published"). The retry is the mitigation, not the news.
+        _run_pip_download(
+            requirement,
+            dest,
+            pip_opts,
+            "--no-binary=:all:",
+            no_build_isolation=True,
+        )
+        artifact = _pick_artifact(dest, prefer_sdist=True, sdists_only=True)
     if artifact is None:
         _warn_sdist_unavailable(requirement, proc)
         proc = _run_pip_download(
@@ -333,6 +447,21 @@ def fetch_source(
             f"could not download {requirement!r} from the configured index(es) "
             f"{' '.join(pip_opts.describe()) or '(default PyPI)'}.\n"
             + "\n".join(f"  {line}" for line in tail)
+        )
+    # Only reachable when the index has no sdist at all. A wheel has to be
+    # installed rather than built, so its interpreter tag decides whether the
+    # target can run it; report that now, not as a target-side load failure
+    # after a long cross build.
+    if artifact.suffix == ".whl" and (
+        reason := _wheel_rejection_reason(artifact.name, yocto)
+    ):
+        raise MetadataNotFoundError(
+            f"{_canonical(name)} {requirement} publishes no source "
+            f"distribution: {reason}\n"
+            "  Build and publish an sdist upstream "
+            f"(`python -m build --sdist {name}`), or point --index-url at "
+            "an index that serves one. A recipe cannot cross-build a wheel: it "
+            "is a finished artifact, not source."
         )
 
     public_reachable: bool | None = None
@@ -353,7 +482,9 @@ def fetch_source(
     )
 
 
-def _pick_artifact(dest: Path, prefer_sdist: bool) -> Path | None:
+def _pick_artifact(
+    dest: Path, prefer_sdist: bool, sdists_only: bool = False
+) -> Path | None:
     # ``Path.suffix`` only returns the last suffix (``.gz``), so match the full
     # sdist extension via ``name.endswith``.
     sdists = [
@@ -364,6 +495,12 @@ def _pick_artifact(dest: Path, prefer_sdist: bool) -> Path | None:
     wheels = [p for p in dest.iterdir() if p.suffix == ".whl"]
     if prefer_sdist and sdists:
         return min(sdists)
+    if sdists_only:
+        # A ``--no-binary=:all:`` attempt that produced only a wheel did *not*
+        # succeed: a wheel carries no pyproject.toml, so accepting it here
+        # would skip the fallback and the warning about the lost
+        # [build-system] detection.
+        return None
     if wheels:
         return min(wheels)
     if sdists:
@@ -604,7 +741,7 @@ def read_build_system(source: FetchedSource) -> tuple[str, list[str]]:
     return "", []
 
 
-def _marker_env(yocto: YoctoVersion | None) -> dict:
+def marker_env(yocto: YoctoVersion | None) -> dict:
     """
     A PEP 508 evaluation environment approximating the Yocto target.
 
@@ -632,6 +769,10 @@ def _marker_env(yocto: YoctoVersion | None) -> dict:
         env["python_version"] = yocto.python_version
         env["python_full_version"] = yocto.python_version + ".0"
     return env
+
+
+#: Backwards-compatible private alias (same module).
+_marker_env = marker_env
 
 
 # --------------------------------------------------------------------------- #
@@ -959,6 +1100,7 @@ def _build_deps_from_requires(requires: list[str]) -> list[Dependency]:
                 kind=DepKind.BUILD,
                 requirement=raw,
                 specifier=str(req.specifier),
+                marker=str(req.marker) if req.marker is not None else "",
             )
         )
     return out
@@ -989,6 +1131,7 @@ def build_metadata(
         keep=keep,
         requirement=requirement,
         check_public=check_public,
+        yocto=yocto,
     )
     msg = parse_metadata_file(source)
 
@@ -1018,15 +1161,23 @@ def build_metadata(
     )
     host_assumptions = detect_host_assumptions(source)
 
-    # Only sdists are fetched by the pypi class, so only they can hit its URL
-    # 404; a wheel's recipe keeps its own fetch semantics.
-    vendored = (
-        source.kind is SourceKind.SDIST and source.public_reachable is False
-    )
+    # The recipe must fetch *exactly* the artifact whose sha256 is recorded. The
+    # pypi class can only do that for an sdist it can reach at its derived
+    # public URL; anything else has to be vendored into the layer as a file://
+    # SRC_URI. That covers two cases:
+    #  - an sdist on a private index (its derived URL 404s), and
+    #  - a wheel, which the pypi class never fetches - it would request the
+    #    .tar.gz instead, so do_fetch either 404s (no sdist) or dies on
+    #    "sha256 mismatch" (one exists) while the recipe claims a different
+    #    artifact than the one it was hashed from.
+    # None means the public URL was not checked, which is equally not a proof
+    # that it resolves, so only an explicit True leaves the fetch to pypi.
+    vendored = source.public_reachable is not True
     if vendored:
         logger.info(
-            "%s: not on public PyPI - recipe vendors the sdist",
+            "%s: not fetchable by the pypi class - recipe vendors the %s",
             source.filename,
+            "sdist" if source.kind is SourceKind.SDIST else "wheel",
         )
     elif source.public_reachable is True:
         logger.debug("%s: reachable on public PyPI", source.filename)

@@ -66,6 +66,12 @@ class Dependency:
     requirement: str = ""
     #: The version specifier, e.g. ``>=8.0.0``.
     specifier: str = ""
+    #: The environment marker guarding this entry, e.g. ``sys_platform == "ios"``.
+    #: Empty for an unconditional dependency. Set for ``Requires-Dist`` and
+    #: ``[build-system].requires`` entries that carry a marker, so callers can
+    #: tell a floor that always applies from one gated on an environment the
+    #: target may never have.
+    marker: str = ""
     #: Reason this dependency was dropped (only for :attr:`DepKind.DROPPED`).
     reason: str = ""
 

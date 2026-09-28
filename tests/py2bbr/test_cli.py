@@ -6,8 +6,10 @@ import logging
 import runpy
 import subprocess
 import sys
+from unittest.mock import patch
 
 import pytest
+from packaging.version import Version
 
 from py2bbr import __version__, cli
 from py2bbr import metadata as M
@@ -19,6 +21,7 @@ from py2bbr.model import (
     PackageMetadata,
     SourceKind,
 )
+from py2bbr.recipe import _TOOL_COMPANION_REQUIREMENTS, canonical_name
 
 
 class TestParsePackageSpec:
@@ -671,3 +674,139 @@ class TestGapProvisioning:
         assert "shadow" in text
         assert "petalinux-build -c cleansstate python3-cython-native" in text
         assert "could not be found" in text
+
+
+class TestTransitiveProvisioning:
+    """A provisioned build tool drags its own native companions with it.
+
+    Regression: numpy 2.5.3 wants ``meson-python>=0.18.0`` (Scarthgap's native
+    sysroot ships 0.15.0), so the layer gained ``python3-meson-python_0.22.0``.
+    That recipe could not build: meson-python 0.18.0+ passes a third
+    ``metadata_version`` argument to ``StandardMetadata.from_pyproject``, but the
+    sysroot's ``pyproject-metadata`` is 0.7.1, whose method takes two --
+    ``TypeError: ... takes from 2 to 3 positional arguments but 4 were given``.
+    The companion is declared *unversioned* by meson-python, so only the
+    companion table can supply the bound. Provisioning has to iterate: a single
+    pass would stop at meson-python and still emit the unbuildable recipe.
+    """
+
+    def _gapped(self, make_meta_fn, **kw):
+        return make_meta_fn(
+            build_deps=[
+                Dependency(
+                    name="meson-python",
+                    kind=DepKind.BUILD,
+                    requirement="meson-python>=0.18.0",
+                    specifier=">=0.18.0",
+                )
+            ],
+            **kw,
+        )
+
+    def _fake_for(self, meta, tmp_path, make_meta_fn, versions):
+        """Fake ``build_metadata`` returning a canned version per package."""
+        inner = _dep_aware_fake(meta, _source(tmp_path), make_meta_fn)
+
+        def fake_build(name, *a, **k):
+            if name in versions:
+                return (
+                    make_meta_fn(
+                        name=name,
+                        canonical_name=canonical_name(name),
+                        version=versions[name],
+                    ),
+                    _source(tmp_path),
+                )
+            return inner(name, *a, **k)
+
+        return fake_build
+
+    def test_provisions_tool_and_companion(
+        self, tmp_path, monkeypatch, capsys, make_meta_fn
+    ):
+        meta = self._gapped(make_meta_fn)
+        monkeypatch.setattr(
+            cli,
+            "build_metadata",
+            self._fake_for(
+                meta,
+                tmp_path,
+                make_meta_fn,
+                {"meson-python": "0.22.0", "pyproject-metadata": "0.9.1"},
+            ),
+        )
+        rc = cli.main(
+            ["black", "-o", str(tmp_path / "out"), "--check", "structural"]
+        )
+        assert rc == 0
+        out = tmp_path / "out" / "meta-black" / "recipes-devtools" / "python"
+        assert (out / "python3-meson-python_0.22.0.bb").is_file()
+        # The companion that makes the provisioned tool buildable.
+        assert (out / "python3-pyproject-metadata_0.9.1.bb").is_file()
+
+    def test_companion_skipped_when_sysroot_is_new_enough(
+        self, tmp_path, monkeypatch, capsys, make_meta_fn
+    ):
+        # Nothing to drag in: the target sysroot already ships a new-enough
+        # pyproject-metadata, so no shadowing recipe is written.
+        meta = self._gapped(make_meta_fn)
+        monkeypatch.setattr(
+            cli,
+            "build_metadata",
+            self._fake_for(
+                meta, tmp_path, make_meta_fn, {"meson-python": "0.17.0"}
+            ),
+        )
+        rc = cli.main(
+            ["black", "-o", str(tmp_path / "out"), "--check", "structural"]
+        )
+        assert rc == 0
+        out = tmp_path / "out" / "meta-black" / "recipes-devtools" / "python"
+        assert (out / "python3-meson-python_0.17.0.bb").is_file()
+        assert not list(out.glob("python3-pyproject-metadata*.bb"))
+
+    def test_provisioning_terminates_on_a_cycle(
+        self, tmp_path, monkeypatch, capsys, make_meta_fn
+    ):
+        # A companion that demands the tool that pulled it in must not loop
+        # forever: the "already in the closure" check ends the fixpoint.
+        meta = self._gapped(make_meta_fn)
+        inner = _dep_aware_fake(meta, _source(tmp_path), make_meta_fn)
+        calls = []
+
+        def fake_build(name, *a, **k):
+            calls.append(name)
+            if name == "meson-python":
+                return (
+                    make_meta_fn(
+                        name="meson-python",
+                        canonical_name="meson-python",
+                        version="0.22.0",
+                        # demands the tool that pulled it in, plus a new companion
+                        build_deps=[
+                            Dependency(
+                                name="meson-python",
+                                kind=DepKind.BUILD,
+                                requirement="meson-python>=0.18.0",
+                                specifier=">=0.18.0",
+                            )
+                        ],
+                    ),
+                    _source(tmp_path),
+                )
+            return inner(name, *a, **k)
+
+        monkeypatch.setattr(cli, "build_metadata", fake_build)
+        with patch.dict(
+            _TOOL_COMPANION_REQUIREMENTS,
+            {
+                "pyproject-metadata": (
+                    (Version("0.8.0"), "meson-python>=0.18.0"),
+                )
+            },
+        ):
+            rc = cli.main(
+                ["black", "-o", str(tmp_path / "out"), "--check", "structural"]
+            )
+        assert rc == 0
+        assert calls.count("meson-python") == 1

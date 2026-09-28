@@ -13,16 +13,22 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+from dataclasses import replace
+from unittest.mock import patch
 
 import pytest
+from packaging.version import Version
 
 from py2bbr.model import (
     Dependency,
     DepKind,
     MachineDep,
+    SourceKind,
     YoctoVersion,
 )
 from py2bbr.recipe import (
+    _BUNDLED_TOOL_VERSIONS,
+    _TOOL_COMPANION_REQUIREMENTS,
     _classifier_drop_pattern,
     _minimum_version,
     _newer_minor_pattern,
@@ -33,6 +39,7 @@ from py2bbr.recipe import (
     pick_build_class,
     render_recipe,
     render_recipe_to_path,
+    tool_companion_gaps,
 )
 
 
@@ -738,6 +745,131 @@ class TestClassifierPruning:
         assert '"Programming Language :: Python :: 3.14"' not in pruned
 
 
+class TestLicenseFilesDroppedWithTableLicense:
+    """A table-form license may not keep ``project.license-files``.
+
+    The recipes normalize a PEP 639 string license (``license = "MIT"``) to
+    the legacy PEP 621 table form (``license = {text = "MIT"}``), which the
+    native sysroot's setuptools 69.x / flit_core 3.9.0 validators accept. PEP
+    639 only allows ``project.license-files`` next to an SPDX *string*, so the
+    key has to go with the rewrite. Leaving it broke
+    ``python3-meson-python-native 0.22.0`` under PetaLinux 2024.2, whose
+    do_compile aborted with ``"project.license-files" must not be used when
+    "project.license" is not a SPDX license expression``.
+    """
+
+    def _run_license_sed(self, text: str, pyproject) -> str:
+        """Apply the recipe's license-related sed programs, in order."""
+        if shutil.which("sed") is None:
+            pytest.skip("sed not available")
+        programs = [
+            line.split('"', 1)[1].rsplit('"', 1)[0]
+            for line in text.splitlines()
+            if "license" in line and line.strip().startswith("sed -i -E")
+        ]
+        assert programs, "recipe has no license-rewriting sed"
+        for program in programs:
+            subprocess.run(
+                ["sed", "-E", "-i", program, str(pyproject)], check=True
+            )
+        return pyproject.read_text()
+
+    def test_mesonpy_recipe_drops_license_files(self, make_meta_fn, yocto):
+        meta = make_meta_fn(build_backend="mesonpy")
+        text, _ = render_recipe(meta, yocto)
+        assert "license-files" in text
+
+    def test_single_line_license_files_removed(
+        self, make_meta_fn, yocto, tmp_path
+    ):
+        # meson-python 0.22.0's own shape: one line, single quotes.
+        meta = make_meta_fn(build_backend="mesonpy")
+        text, _ = render_recipe(meta, yocto)
+        pyproject = tmp_path / "pyproject.toml"
+        pyproject.write_text(
+            "[project]\n"
+            'name = "meson-python"\n'
+            'license = "MIT"\n'
+            "license-files = ['LICENSES/MIT.txt']\n"
+            'readme = "README.rst"\n'
+        )
+        out = self._run_license_sed(text, pyproject)
+        assert "license-files" not in out
+        assert 'license = {text = "MIT"}' in out
+        # Sibling keys survive.
+        assert 'name = "meson-python"' in out
+        assert 'readme = "README.rst"' in out
+
+    def test_multiline_license_files_array_removed(
+        self, make_meta_fn, yocto, tmp_path
+    ):
+        # An array opened on one line and closed on another must lose the whole
+        # span, closing bracket included, or the TOML no longer parses.
+        meta = make_meta_fn(build_backend="mesonpy")
+        text, _ = render_recipe(meta, yocto)
+        pyproject = tmp_path / "pyproject.toml"
+        pyproject.write_text(
+            "[project]\n"
+            'name = "x"\n'
+            'license = "MIT"\n'
+            "license-files = [\n"
+            '    "LICENSE",\n'
+            '    "AUTHORS.rst",\n'
+            "]\n"
+            'dependencies = ["a"]\n'
+            "\n[build-system]\n"
+            'requires = ["meson-python"]\n'
+        )
+        out = self._run_license_sed(text, pyproject)
+        assert "license-files" not in out
+        assert "AUTHORS.rst" not in out
+        assert 'dependencies = ["a"]' in out
+        # [build-system] is a different section: untouched.
+        assert 'requires = ["meson-python"]' in out
+
+    def test_other_tables_license_files_untouched(
+        self, make_meta_fn, yocto, tmp_path
+    ):
+        # Only [project] carries a PEP 639 license; an identically named key in
+        # another table is not ours to delete.
+        meta = make_meta_fn(build_backend="mesonpy")
+        text, _ = render_recipe(meta, yocto)
+        pyproject = tmp_path / "pyproject.toml"
+        pyproject.write_text(
+            "[project]\n"
+            'name = "x"\n'
+            'license = "MIT"\n'
+            'license-files = ["LICENSES/MIT.txt"]\n'
+            "\n[tool.mine]\n"
+            'license-files = ["keep-me"]\n'
+        )
+        out = self._run_license_sed(text, pyproject)
+        assert "LICENSES/MIT.txt" not in out
+        assert 'license-files = ["keep-me"]' in out
+
+    def test_no_license_files_key_is_a_noop(
+        self, make_meta_fn, yocto, tmp_path
+    ):
+        meta = make_meta_fn(build_backend="mesonpy")
+        text, _ = render_recipe(meta, yocto)
+        pyproject = tmp_path / "pyproject.toml"
+        pyproject.write_text(
+            '[project]\nname = "x"\nlicense = "MIT"\ndependencies = []\n'
+        )
+        out = self._run_license_sed(text, pyproject)
+        assert 'license = {text = "MIT"}' in out
+        assert "dependencies = []" in out
+
+    def test_absent_for_classes_that_do_not_rewrite_licenses(
+        self, make_meta_fn, yocto
+    ):
+        # A setuptools3 recipe (no PEP 517 metadata rewrite) leaves its
+        # pyproject.toml alone, so it must not carry a license-files deletion.
+        meta = make_meta_fn(build_backend="")
+        text, _ = render_recipe(meta, yocto)
+        assert "license-files" not in text
+
+
 class TestInstallPrefixOverride:
     """Every recipe must pin an install ``--prefix``.
 
@@ -1064,6 +1196,171 @@ class TestBuildVersionGaps:
         )
         gaps = build_version_gaps(meta, yocto)
         assert [g.name for g in gaps] == ["Cython"]
+
+    def test_marker_gated_floor_skipped(self, make_meta_fn, yocto):
+        # A pin that cannot apply on the target is not a floor the build has to
+        # satisfy. meson-python 0.22.0 pairs ``packaging>=23.2; sys_platform !=
+        # "ios"`` (satisfied by Scarthgap's 23.2) with ``packaging>=24.2;
+        # sys_platform == "ios"``. Treating the iOS pin as a gap provisioned a
+        # recipe for a platform the target never runs -- and pip then had to
+        # resolve a requirement that cannot resolve off-iOS.
+        meta = make_meta_fn(
+            build_deps=[
+                Dependency(
+                    name="packaging",
+                    kind=DepKind.BUILD,
+                    requirement='packaging >= 23.2; sys_platform != "ios"',
+                    specifier=">=23.2",
+                    marker='sys_platform != "ios"',
+                ),
+                Dependency(
+                    name="packaging",
+                    kind=DepKind.BUILD,
+                    requirement='packaging >= 24.2; sys_platform == "ios"',
+                    specifier=">=24.2",
+                    marker='sys_platform == "ios"',
+                ),
+            ]
+        )
+        assert build_version_gaps(meta, yocto) == []
+
+    def test_marker_true_floor_still_counts(self, make_meta_fn, yocto):
+        # The marker is satisfied on the target, so the floor stands.
+        meta = make_meta_fn(
+            build_deps=[
+                Dependency(
+                    name="pyproject-metadata",
+                    kind=DepKind.BUILD,
+                    requirement='pyproject-metadata >= 0.9.0; sys_platform != "win32"',
+                    specifier=">=0.9.0",
+                    marker='sys_platform != "win32"',
+                )
+            ]
+        )
+        assert [g.name for g in build_version_gaps(meta, yocto)] == [
+            "pyproject-metadata"
+        ]
+
+    def test_unresolvable_marker_keeps_floor(self, make_meta_fn, yocto):
+        # A marker we cannot evaluate must not silently drop a real floor.
+        meta = make_meta_fn(
+            build_deps=[
+                Dependency(
+                    name="pyproject-metadata",
+                    kind=DepKind.BUILD,
+                    requirement="pyproject-metadata >= 0.9.0; bogus_marker == 1",
+                    specifier=">=0.9.0",
+                    marker="bogus_marker == 1",
+                )
+            ]
+        )
+        assert [g.name for g in build_version_gaps(meta, yocto)] == [
+            "pyproject-metadata"
+        ]
+
+
+class TestToolCompanionGaps:
+    """A provisioned build tool's native companions are provisioned with it.
+
+    Regression: provisioning ``python3-meson-python_0.22.0`` (numpy 2.5.3 wants
+    ``meson-python>=0.18.0``; Scarthgap's native sysroot ships 0.15.0) emitted a
+    recipe that could not build. meson-python 0.18.0+ forwards a third
+    ``metadata_version`` argument to ``StandardMetadata.from_pyproject``, but
+    Scarthgap's ``pyproject-metadata`` is 0.7.1, whose method takes two. The
+    result was ``TypeError: StandardMetadata.from_pyproject() takes from 2 to 3
+    positional arguments but 4 were given`` in ``do_compile``. The companion
+    requirement is unversioned in meson-python's own metadata, so only the
+    table can close the loop.
+    """
+
+    def test_meson_python_needs_newer_pyproject_metadata(
+        self, make_meta_fn, yocto
+    ):
+        meta = make_meta_fn(
+            name="meson-python",
+            canonical_name="meson-python",
+            version="0.22.0",
+        )
+        gaps = tool_companion_gaps(meta, yocto)
+        assert [g.name for g in gaps] == ["pyproject-metadata"]
+        assert gaps[0].specifier == ">=0.8.0"
+
+    def test_older_meson_python_needs_nothing(self, make_meta_fn, yocto):
+        # 0.17.0 and earlier do not pass metadata_version, so the 0.7.1 copy
+        # in the sysroot is fine and no companion is provisioned.
+        meta = make_meta_fn(
+            name="meson-python",
+            canonical_name="meson-python",
+            version="0.17.0",
+        )
+        assert tool_companion_gaps(meta, yocto) == []
+
+    def test_companion_at_or_above_bundled_is_no_gap(self, make_meta_fn, yocto):
+        # Once the sysroot itself ships a new-enough pyproject-metadata, the
+        # companion table must not provision a shadowing recipe.
+        yocto_new = replace(yocto, version="99.0")
+        with patch.dict(
+            _BUNDLED_TOOL_VERSIONS,
+            {"99.0": {"pyproject-metadata": "0.9.1"}},
+        ):
+            meta = make_meta_fn(
+                name="meson-python",
+                canonical_name="meson-python",
+                version="0.22.0",
+            )
+            assert tool_companion_gaps(meta, yocto_new) == []
+
+    def test_companion_absent_from_sysroot_is_a_gap(self, make_meta_fn, yocto):
+        # A series table that lists no pyproject-metadata at all: provisioning
+        # the companion is the only way the tool can run.
+        with patch.dict(_BUNDLED_TOOL_VERSIONS, {"5.0": {}}, clear=True):
+            meta = make_meta_fn(
+                name="meson-python",
+                canonical_name="meson-python",
+                version="0.22.0",
+            )
+            assert [g.name for g in tool_companion_gaps(meta, yocto)] == [
+                "pyproject-metadata"
+            ]
+
+    def test_non_tool_package_has_no_companions(self, make_meta_fn, yocto):
+        assert tool_companion_gaps(make_meta_fn(name="numpy"), yocto) == []
+
+    def test_unparsable_version_is_ignored(self, make_meta_fn, yocto):
+        meta = make_meta_fn(
+            name="meson-python",
+            canonical_name="meson-python",
+            version="not-a-version",
+        )
+        assert tool_companion_gaps(meta, yocto) == []
+
+    def test_malformed_table_entry_is_skipped(self, make_meta_fn, yocto):
+        # The table is hand-maintained data; a bad entry must be ignored rather
+        # than abort provisioning of every other tool.
+        meta = make_meta_fn(
+            name="meson-python",
+            canonical_name="meson-python",
+            version="0.22.0",
+        )
+        with patch.dict(
+            _TOOL_COMPANION_REQUIREMENTS,
+            {"meson-python": ((Version("0.18.0"), "not a requirement!!"),)},
+        ):
+            assert tool_companion_gaps(meta, yocto) == []
+
+    def test_table_entry_without_floor_is_skipped(self, make_meta_fn, yocto):
+        # A companion with no positive bound constrains nothing, so the sysroot
+        # copy satisfies it and nothing is provisioned.
+        meta = make_meta_fn(
+            name="meson-python",
+            canonical_name="meson-python",
+            version="0.22.0",
+        )
+        with patch.dict(
+            _TOOL_COMPANION_REQUIREMENTS,
+            {"meson-python": ((Version("0.18.0"), "pyproject-metadata"),)},
+        ):
+            assert tool_companion_gaps(meta, yocto) == []
 
 
 class TestBootstrapToolShapes:
@@ -1475,3 +1772,246 @@ class TestMinimumVersion:
 
     def test_unparseable_specifier_is_ignored(self):
         assert _minimum_version("not a specifier") is None
+
+
+class TestVendoredWheelRecipe:
+    """A wheel-only package renders an install-the-wheel recipe, not a build.
+
+    ``inherit pypi`` can only ever fetch a ``.tar.gz`` derived from
+    BPN/PV, so a recipe whose recorded sha256 is a wheel's would either 404
+    (no sdist upstream) or die on "sha256 mismatch" (one exists) while
+    pointing at an artifact it was not hashed from. Vendoring the wheel and
+    installing it directly is the only shape where do_fetch and
+    ``SRC_URI[sha256sum]`` agree.
+    """
+
+    def _wheel_meta(self, make_meta_fn, **overrides):
+        return make_meta_fn(
+            source_kind=SourceKind.WHEEL,
+            source_filename="pyvizionsdk-26.9.1-py3-none-any.whl",
+            source_sha256="a" * 64,
+            vendored=True,
+            **overrides,
+        )
+
+    def test_does_not_inherit_pypi_or_set_s(self, make_meta_fn, yocto):
+        # Both are fatal in the wheel shape: the pypi fetch URL is derived from
+        # BPN/PV, and there is no archive to unpack into an S directory.
+        text, _ = render_recipe(self._wheel_meta(make_meta_fn), yocto)
+        assert "inherit pypi" not in text
+        assert not [ln for ln in text.splitlines() if ln.startswith("S =")]
+
+    def test_vendors_the_wheel_by_name(self, make_meta_fn, yocto):
+        meta = self._wheel_meta(make_meta_fn)
+        text, _ = render_recipe(meta, yocto)
+        assert 'SRC_URI = "file://pyvizionsdk-26.9.1-py3-none-any.whl"' in text
+        assert f'SRC_URI[sha256sum] = "{meta.source_sha256}"' in text
+
+    def test_installs_the_wheel_with_installer(self, make_meta_fn, yocto):
+        text, _ = render_recipe(self._wheel_meta(make_meta_fn), yocto)
+        # installer itself is a build tool, so it comes from the -native side.
+        assert 'DEPENDS += "python3-installer-native"' in text
+        assert "do_install() {" in text
+        # nativepython3, not ${PYTHON}: in a poky target recipe ${PYTHON} is
+        # the *native* interpreter, and the target one is a target-arch binary
+        # that cannot execute on the build host. The wheel's prebuilt extension
+        # modules are unpacked, never loaded.
+        assert "nativepython3 -m installer" in text
+        # --prefix for the same reason as every other recipe: installer derives
+        # its scheme from the running interpreter's absolute sysconfig base.
+        # For class-native ${prefix} is the sysroot-prefixed path, which is
+        # exactly poky's ${D}${prefix} convention there - verified in the
+        # PetaLinux 2024.2 build.
+        assert "--prefix ${prefix}" in text
+        assert "--destdir=${D}" in text
+        # The recorded shebang is the interpreter that will actually run the
+        # script: the target's for the target wheel, the build host's for the
+        # -native/-nativesdk variants.
+        assert 'WHEEL_INSTALL_PYTHON = "python3"' in text
+        assert 'WHEEL_INSTALL_PYTHON:class-native = "nativepython3"' in text
+        assert 'WHEEL_INSTALL_PYTHON:class-nativesdk = "nativepython3"' in text
+        assert (
+            '--interpreter "${USRBINPATH}/env ${WHEEL_INSTALL_PYTHON}"' in text
+        )
+
+    def test_inherits_the_sitepackages_default(self, make_meta_fn, yocto):
+        # setuptools3-base defines PYTHON_SITEPACKAGES_DIR and the FILES
+        # default, without which do_package reports "installed but not
+        # shipped" for every payload file.
+        text, _ = render_recipe(self._wheel_meta(make_meta_fn), yocto)
+        assert "inherit python3targetconfig setuptools3-base" in text
+
+    def test_carries_no_build_machinery(self, make_meta_fn, yocto):
+        # There is no source and no backend, so none of the PEP 517 output
+        # applies: no build-backend -native deps (only installer, which is the
+        # install tool itself), no pyproject.toml rewrites, and no PEP 517
+        # build-class override.
+        text, _ = render_recipe(self._wheel_meta(make_meta_fn), yocto)
+        depends = [
+            ln
+            for ln in text.splitlines()
+            if ln.startswith(("DEPENDS", "RDEPENDS"))
+        ]
+        # installer is the install tool itself, not a PEP 517 build backend.
+        assert depends == [
+            'DEPENDS += "python3-installer-native"',
+            'RDEPENDS:${PN} += "python3-click python3-packaging"',
+        ]
+        assert "do_configure" not in text
+        assert "pyproject.toml" not in text
+        # No PEP 517 build class and none of its task overrides (the
+        # explanatory comment does mention python_pep517_do_install by name).
+        assert "inherit python_pep517" not in text
+        assert "python_pep517_do_install() {" not in text
+        assert "python_pep517_do_compile" not in text
+
+    def test_runtime_and_machine_deps_are_carried(self, make_meta_fn, yocto):
+        meta = self._wheel_meta(
+            make_meta_fn,
+            machine_deps=[MachineDep(name="libfoo", machines=("aarch64",))],
+        )
+        text, _ = render_recipe(meta, yocto)
+        assert 'RDEPENDS:${PN} += "python3-click python3-packaging"' in text
+        assert 'RDEPENDS:${PN}:append:aarch64 += "python3-libfoo"' in text
+
+    def test_warns_about_the_artifact_shape(self, make_meta_fn, yocto):
+        _, warnings = render_recipe(self._wheel_meta(make_meta_fn), yocto)
+        assert any("no source distribution" in w for w in warnings)
+
+    def test_explicit_build_class_is_reported_not_crashed(
+        self, make_meta_fn, yocto
+    ):
+        # A --build-class names a class that would build the package, and a
+        # wheel has no source to build. That is a contradiction to report, not
+        # a request to emit a build recipe (which would crash looking for an
+        # unpack directory in a .whl).
+        text, warnings = render_recipe(
+            self._wheel_meta(make_meta_fn),
+            yocto,
+            build_class="python_pep517",
+        )
+        assert "do_install() {" in text
+        assert any("python_pep517" in w for w in warnings)
+
+    def test_sdist_still_takes_the_build_path(self, make_meta_fn, yocto):
+        # The other vendored shape (private-index sdist) is unaffected: it
+        # unpacks an S and builds through the PEP 517 classes.
+        meta = make_meta_fn(
+            source_filename="pyvizionsdk-26.9.1.tar.gz", vendored=True
+        )
+        text, _ = render_recipe(meta, yocto)
+        assert 'S = "${WORKDIR}/pyvizionsdk-26.9.1"' in text
+        # The install-prefix override renames python_pep517_do_install, so a
+        # bare do_install would mean the wheel shape.
+        assert "\ndo_install() {" not in text
+
+
+class TestToolInstallAdaptations:
+    """A provisioned tool must keep the fixups poky's own recipe applied.
+
+    Bitbake keys tasks by recipe name, so a generated recipe *replaces* the
+    distro's for that name. Anything the distro's recipe did after install is
+    then silently lost, and the consumers that relied on it stop resolving.
+    poky's python3-cython renames its console scripts to the versioned names
+    (``cython`` -> ``cython3``), and meson resolves its cython compiler by
+    running ``cython3 -V`` and nothing else - so a provisioned Cython keeping
+    upstream's script names left numpy 2.5.3's do_compile aborting with
+    ``ERROR: Unknown compiler(s): [['cython3']]``.
+    """
+
+    def test_cython_scripts_are_renamed(self, make_meta_fn, yocto):
+        meta = make_meta_fn(
+            name="cython", canonical_name="cython", version="3.3.0"
+        )
+        text, _ = render_recipe(meta, yocto)
+        assert "do_install:append() {" in text
+        assert "mv ${D}${bindir}/cython ${D}${bindir}/cython3" in text
+        assert "mv ${D}${bindir}/cythonize ${D}${bindir}/cythonize3" in text
+        assert "mv ${D}${bindir}/cygdb ${D}${bindir}/cygdb3" in text
+
+    def test_renames_are_guarded(self, make_meta_fn, yocto):
+        # poky uses a bare ``mv``, which would fail the build if a future
+        # Cython dropped a script. The guard keeps the rename best-effort.
+        meta = make_meta_fn(name="cython", canonical_name="cython")
+        text, _ = render_recipe(meta, yocto)
+        assert text.count('if [ -x "${D}${bindir}/') == 3
+
+    def test_absent_for_other_packages(self, make_meta_fn, yocto):
+        meta = make_meta_fn(name="black", canonical_name="black")
+        text, _ = render_recipe(meta, yocto)
+        assert "cython3" not in text
+
+
+class TestWheelRecipeLicense:
+    """A wheel recipe must give ``do_populate_lic`` something it can resolve.
+
+    ``do_populate_lic`` searches ``${S}`` for the file named in
+    ``LIC_FILES_CHKSUM``, and a wheel recipe has no source tree - the license
+    text is only inside the vendored zip. Pointing at the in-wheel path alone
+    would fail the task, so the common-license copy the target already ships is
+    preferred, and the in-wheel path is only used (with a prefunc that unpacks
+    it) for an SPDX id outside that table.
+    """
+
+    def _wheel_meta(self, make_meta_fn, **overrides):
+        base = {
+            "source_kind": SourceKind.WHEEL,
+            "source_filename": "pkg-1.0-py3-none-any.whl",
+            "vendored": True,
+        }
+        base.update(overrides)
+        return make_meta_fn(**base)
+
+    def test_common_license_is_preferred(self, make_meta_fn, yocto):
+        # MIT is in the table, and the target ships that text: it resolves on
+        # any Yocto and needs no ${S} content.
+        meta = self._wheel_meta(
+            make_meta_fn, license="MIT", license_file="LICENSE", license_md5="x"
+        )
+        text, _ = render_recipe(meta, yocto)
+        assert "COMMON_LICENSE_DIR" in text
+        assert "unpack_wheel_license" not in text
+        assert "unzip-native" not in text
+
+    def test_rare_license_is_extracted_from_the_wheel(
+        self, make_meta_fn, yocto
+    ):
+        meta = self._wheel_meta(
+            make_meta_fn,
+            license="BUSL-1.1",
+            license_file="LICENSE",
+            license_md5="d3465a2a183908c9cb95bf490bd1e7ab",
+        )
+        text, _ = render_recipe(meta, yocto)
+        assert (
+            'LIC_FILES_CHKSUM = "file://LICENSE;md5=d3465a2a183908c9cb95bf490bd1e7ab"'
+            in text
+        )
+        # do_populate_lic is a Python task, so the shell prefunc is the hook.
+        assert 'do_populate_lic[prefuncs] += "unpack_wheel_license"' in text
+        assert "unzip -jo ${WORKDIR}/*.whl" in text
+        # Both PEP 639 and the older flat dist-info layout.
+        assert '"*dist-info/licenses/LICENSE"' in text
+        assert '"*dist-info/LICENSE"' in text
+        assert 'DEPENDS += "python3-installer-native unzip-native"' in text
+
+    def test_license_absent_from_metadata_warns(self, make_meta_fn, yocto):
+        # Nothing to checksum at all: say so instead of emitting a
+        # LIC_FILES_CHKSUM that do_populate_lic cannot resolve.
+        meta = self._wheel_meta(
+            make_meta_fn, license="", license_file="", license_md5=""
+        )
+        text, warnings = render_recipe(meta, yocto)
+        assert "LIC_FILES_CHKSUM" not in text
+        assert 'LICENSE = "CLOSED"' in text
+        assert any("add LIC_FILES_CHKSUM manually" in w for w in warnings)
+
+    def test_rare_license_without_a_file_warns(self, make_meta_fn, yocto):
+        meta = self._wheel_meta(
+            make_meta_fn,
+            license="BUSL-1.1",
+            license_file="",
+            license_md5="",
+        )
+        _, warnings = render_recipe(meta, yocto)
+        assert any("no license file to checksum" in w for w in warnings)

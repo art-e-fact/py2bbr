@@ -188,12 +188,30 @@ def structural_check(recipe_path: Path) -> CheckResult:
     vendored = bool(re.search(r'^SRC_URI\s*=\s*"file://', text, re.MULTILINE))
     if vendored:
         # S6 vendored form: no pypi class (its fetch URL 404s for the package),
-        # so S must be spelled out (the class' S default is gone).
-        items.append(
-            _check_required(
-                text, r'^S\s*=\s*"\$\{WORKDIR\}/', "S (vendored)", required=True
-            )
+        # so S must be spelled out (the class' S default is gone). A vendored
+        # *wheel* has nothing to unpack and installs the artifact directly, so
+        # it carries a do_install instead of an S.
+        installs_wheel = bool(
+            re.search(r"^do_install\s*\(\)", text, re.MULTILINE)
         )
+        if installs_wheel:
+            items.append(
+                _check_required(
+                    text,
+                    r"^DEPENDS.*python3-installer",
+                    "python3-installer (wheel install)",
+                    required=True,
+                )
+            )
+        else:
+            items.append(
+                _check_required(
+                    text,
+                    r'^S\s*=\s*"\$\{WORKDIR\}/',
+                    "S (vendored)",
+                    required=True,
+                )
+            )
     else:
         items.append(
             _check_required(

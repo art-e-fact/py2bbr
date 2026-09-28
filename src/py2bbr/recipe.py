@@ -67,13 +67,16 @@ import re
 import shutil
 import textwrap
 
+from packaging.markers import InvalidMarker, Marker, UndefinedEnvironmentName
 from packaging.requirements import InvalidRequirement, Requirement
 from packaging.specifiers import InvalidSpecifier, SpecifierSet
 from packaging.version import InvalidVersion, Version
 
 from py2bbr.model import (
     Dependency,
+    DepKind,
     PackageMetadata,
+    SourceKind,
     YoctoVersion,
     machine_override_tokens,
 )
@@ -248,6 +251,44 @@ _BOOTSTRAP_TOOL_SHAPES: dict[str, tuple[str, ...]] = {
 }
 
 
+#: Post-install fixups that poky's *own* recipes for a build tool apply, which a
+#: py2bbr-generated recipe has to mirror. Bitbake keys tasks by recipe name, so
+#: provisioning a newer tool *replaces* the distro's recipe wholesale: any
+#: adaptation that recipe performed is silently lost, and the consumers relying
+#: on it stop resolving.
+#:
+#: cython: poky's ``python3-cython`` renames its console scripts to the
+#: versioned names (``cython`` -> ``cython3``) because the unversioned ones
+#: collide with a Python 2 build of Cython. That rename is also what consumers
+#: look for: meson resolves its ``cython`` compiler by running ``cython3 -V``
+#: and nothing else (meson 1.11's ``defaults['cython'] = ['cython3']``), so a
+#: provisioned Cython that keeps upstream's script names leaves the compiler
+#: unfindable and numpy 2.5.3's do_compile aborts with ``meson.build:1:0: ERROR:
+#: Unknown compiler(s): [['cython3']]``. Mirroring poky keeps the generated
+#: recipe a drop-in replacement; the guards keep a future Cython that drops a
+#: script from failing the build.
+#:
+#: Key: canonical (PEP 503) distribution name; value: recipe lines appended.
+_TOOL_INSTALL_ADAPTATIONS: dict[str, tuple[str, ...]] = {
+    "cython": (
+        "do_install:append() {",
+        "    # Mirror poky's python3-cython: the unversioned script names collide",
+        "    # with a Python 2 build of Cython, and meson resolves the cython",
+        "    # compiler by running `cython3 -V`.",
+        '    if [ -x "${D}${bindir}/cython" ]; then',
+        "        mv ${D}${bindir}/cython ${D}${bindir}/cython3",
+        "    fi",
+        '    if [ -x "${D}${bindir}/cythonize" ]; then',
+        "        mv ${D}${bindir}/cythonize ${D}${bindir}/cythonize3",
+        "    fi",
+        '    if [ -x "${D}${bindir}/cygdb" ]; then',
+        "        mv ${D}${bindir}/cygdb ${D}${bindir}/cygdb3",
+        "    fi",
+        "}",
+    ),
+}
+
+
 # Emitted into every recipe: PetaLinux's ``python_pep517_do_install`` (the
 # install step all build classes route through: setuptools3, python_pep517,
 # python_setuptools_build_meta, python_mesonpy) runs pypa installer with only
@@ -267,6 +308,29 @@ python_pep517_do_install() {
     nativepython3 -m installer ${INSTALL_WHEEL_COMPILE_BYTECODE} --interpreter "${USRBINPATH}/env ${PEP517_INSTALL_PYTHON}" --prefix ${prefix} --destdir=${D} ${PEP517_WHEEL_PATH}/*.whl
 }
 """
+
+
+#: ``sed -E`` programs dropping ``project.license-files`` from a pyproject.toml.
+#:
+#: PEP 639 only allows that key next to an SPDX *string* expression, so it
+#: cannot stay behind once the license is rewritten to the legacy table form
+#: (:data:`_INSTALL_PREFIX_OVERRIDE` describes the sibling workaround for the
+#: same reason). Enforced by meson-python, which aborts with ``"project
+#: .license-files" must not be used when "project.license" is not a SPDX license
+#: expression``. Two programs, order significant: the first drops a value whose
+#: array closes on the same line, the second an array that opens on one line and
+#: closes on a later one. Scoped to ``[project]`` so another table's identically
+#: named key is left alone.
+_LICENSE_FILES_DROP = (
+    (
+        r"/^[[:space:]]*\[project\]/,/^[[:space:]]*\[/ "
+        r"{ /^[[:space:]]*license-files[[:space:]]*=.*\][[:space:]]*$/d }"
+    ),
+    (
+        r"/^[[:space:]]*\[project\]/,/^[[:space:]]*\[/ "
+        r"{ /^[[:space:]]*license-files[[:space:]]*=[[:space:]]*\[/,/\]/d }"
+    ),
+)
 
 
 def bitbake_pn(name: str, python_pn: str = "python3") -> str:
@@ -543,6 +607,81 @@ _BUNDLED_TOOL_VERSIONS: dict[str, dict[str, str]] = {
 }
 
 
+# Native-sysroot packages a *provisioned* build tool needs at a version newer
+# than the series ships, beyond what its own ``[build-system].requires`` states.
+#
+# ``build_version_gaps`` reads the floors a *consumer* declares, which is blind
+# to a companion that a build tool imports at runtime without pinning it. The
+# concrete case: meson-python 0.18.0 onwards overrides
+# ``StandardMetadata.from_pyproject`` and forwards a third argument,
+# ``metadata_version``. ``pyproject-metadata`` only accepts that argument from
+# 0.8.0 (0.7.1, the copy Scarthgap's native sysroot ships, has the two-argument
+# form), and meson-python lists ``pyproject-metadata`` **unversioned** in its
+# ``requires``, so no floor is visible to derive. Provisioning meson-python
+# without its companion therefore emitted a recipe that dies in ``do_compile``
+# with ``TypeError: StandardMetadata.from_pyproject() takes from 2 to 3
+# positional arguments but 4 were given``.
+#
+# Key: canonical name of the provisioned tool; value: ``(from_version,
+# requirement)`` pairs - the companion requirement that applies from that
+# version of the tool onwards. The last matching entry wins, so a tool can
+# tighten its companion over time by listing successive versions.
+_TOOL_COMPANION_REQUIREMENTS: dict[str, tuple[tuple[Version, str], ...]] = {
+    "meson-python": ((Version("0.18.0"), "pyproject-metadata>=0.8.0"),),
+}
+
+
+def _requirement_to_dependency(requirement: str) -> Dependency | None:
+    """Parse a PEP 508 requirement into a BUILD :class:`Dependency`."""
+    try:
+        req = Requirement(requirement)
+    except InvalidRequirement:
+        return None
+    return Dependency(
+        name=req.name,
+        kind=DepKind.BUILD,
+        requirement=requirement,
+        specifier=str(req.specifier),
+    )
+
+
+def tool_companion_gaps(
+    meta: PackageMetadata, yocto: YoctoVersion
+) -> list[Dependency]:
+    """Native-sysroot companions too old for a build tool py2bbr provisions.
+
+    :func:`build_version_gaps` answers "does this *consumer* demand a build tool
+    newer than the sysroot ships?". This answers the next question: once py2bbr
+    provisions that tool, are the native packages it *imports* too old to run?
+    The answer comes from :data:`_TOOL_COMPANION_REQUIREMENTS` rather than from
+    the tool's own metadata, because the tools that break this way declare the
+    companion unversioned (see that table's comment). A companion the sysroot
+    does not ship at all counts as a gap: provisioning it is the only way to
+    make the tool's recipe build.
+    """
+    bundled = _BUNDLED_TOOL_VERSIONS.get(yocto.version, {})
+    try:
+        version = Version(meta.version)
+    except InvalidVersion:
+        return []
+    gaps: list[Dependency] = []
+    for since, requirement in _TOOL_COMPANION_REQUIREMENTS.get(
+        meta.canonical_name, ()
+    ):
+        if version < since:
+            continue
+        dep = _requirement_to_dependency(requirement)
+        if dep is None:
+            continue
+        needed = _minimum_version(dep.specifier)
+        have = bundled.get(canonical_name(dep.name))
+        if needed is None:
+            continue
+        if have is None or needed > Version(have):
+            gaps.append(dep)
+    return gaps
+
+
 def sysroot_tool_version(yocto: YoctoVersion, name: str) -> str | None:
     """Version of a build tool the target series' native sysroot ships.
 
@@ -582,6 +721,34 @@ def _minimum_version(specifier: str) -> Version | None:
     return max(floors) if floors else None
 
 
+def _applies_to_target(dep: Dependency, yocto: YoctoVersion) -> bool:
+    """Whether a ``[build-system].requires`` entry can apply on the target.
+
+    A pin guarded by an environment marker is not a floor the build has to
+    satisfy: PEP 518 has the *build frontend* evaluate markers against the build
+    environment, and that environment is the native sysroot - Linux, on the
+    series' own Python. meson-python 0.22.0 pins
+    ``packaging>=24.2; sys_platform == "ios"`` next to
+    ``packaging>=23.2; sys_platform != "ios"``; treating the iOS pin as a floor
+    provisions a recipe for a platform the target never runs. A dependency that
+    cannot apply is skipped, exactly as :func:`machine_gated_deps` leaves the
+    real answer to bitbake.
+    """
+    marker = dep.marker
+    if not marker:
+        return True
+    # Imported here: py2bbr.metadata imports py2bbr.targets, which imports this
+    # module, so a module-level import would be circular.
+    from py2bbr.metadata import marker_env
+
+    try:
+        return bool(Marker(marker).evaluate(marker_env(yocto)))
+    except (InvalidMarker, UndefinedEnvironmentName):
+        # An unresolvable marker must not silently drop a real floor: treat the
+        # entry as unconditional and let the build report it.
+        return True
+
+
 def build_version_gaps(
     meta: PackageMetadata, yocto: YoctoVersion
 ) -> list[Dependency]:
@@ -604,6 +771,9 @@ def build_version_gaps(
     recipe - PetaLinux then reports SIGGEN_LOCKEDSIGS mismatch warnings for
     the native variant (blessed 1.50.0's ``flit_core>=3.11,<4`` vs Scarthgap's
     3.9.0). The sysroot copies are authoritative for the build.
+
+    Marker-gated entries are skipped when they cannot apply on the target (see
+    :func:`_applies_to_target`).
     """
     bundled = _BUNDLED_TOOL_VERSIONS.get(yocto.version, {})
     gaps: list[Dependency] = []
@@ -613,6 +783,7 @@ def build_version_gaps(
             name in ("setuptools", "wheel")
             or name in _BOOTSTRAP_TOOL_SHAPES
             or name not in bundled
+            or not _applies_to_target(dep, yocto)
         ):
             continue
         needed = _minimum_version(dep.specifier)
@@ -637,6 +808,233 @@ def effective_build_class(
     return pick_build_class(meta.build_backend)[0]
 
 
+def _wheel_license_unpack(license_file: str) -> str:
+    """Recipe lines exposing ``license_file`` from inside the vendored wheel.
+
+    ``do_populate_lic`` searches ``${S}`` - which ``find_license_files`` derives
+    from ``LIC_FILES_CHKSUM`` - and a wheel recipe has no source tree, so the
+    license text only exists *inside* the vendored zip. Unpacking that one
+    member first lets the standard checksum check run unchanged. ``unzip``'s
+    own pattern matching covers both PEP 639
+    (``<dist-info>/licenses/<name>``) and the older flat ``<dist-info>/<name>``
+    layout. Only emitted for a license the target does not already ship (see
+    :func:`_recipe_header`).
+
+    A function rather than a template because bitbake's ``${VAR}`` syntax is
+    not ``str.format``'s placeholder syntax.
+    """
+    return (
+        "# The license text lives inside the vendored wheel: do_populate_lic\n"
+        "# searches ${S} and a wheel recipe has no source tree to search.\n"
+        "# Unpack that one member so the standard checksum check finds it.\n"
+        'do_populate_lic[prefuncs] += "unpack_wheel_license"\n'
+        "\n"
+        "unpack_wheel_license() {\n"
+        "    install -d ${S}\n"
+        "    unzip -jo ${WORKDIR}/*.whl "
+        f'"*dist-info/licenses/{license_file}" "*dist-info/{license_file}" '
+        "-d ${S}\n"
+        "}\n"
+    )
+
+
+def _recipe_header(
+    meta: PackageMetadata, warnings: list[str], *, vendored_wheel: bool = False
+) -> list[str]:
+    """The recipe's leading metadata block, shared by every render shape.
+
+    ``do_populate_lic`` needs ``LIC_FILES_CHKSUM`` and PetaLinux rejects a
+    recipe without ``LICENSE``, so both are always emitted. A vendored wheel
+    is the awkward case: it has no source tree, so a path into the artifact
+    cannot be checksummed. The license text the *target* already ships (the
+    common-licenses fallback) is preferred, since that resolves on any Yocto;
+    the in-wheel path is only used for an SPDX id outside that table, and then
+    :func:`_wheel_license_unpack` has to make it resolvable.
+    """
+    wheel_license: str | None = None
+    if vendored_wheel and not _common_licenses_checksum(meta.license or ""):
+        wheel_license = meta.license_file or None
+        if not wheel_license:
+            warnings.append(
+                f"{meta.canonical_name} {meta.version} publishes a wheel whose "
+                "license is not a known SPDX id, so do_populate_lic has no file "
+                "to checksum; add LIC_FILES_CHKSUM manually."
+            )
+    lines = [f'SUMMARY = "{_q(meta.summary or meta.name)}"']
+    if meta.description and meta.description != meta.summary:
+        lines.append(f'DESCRIPTION = "{_q(meta.description)}"')
+    if meta.homepage:
+        lines.append(f'HOMEPAGE = "{_q(meta.homepage)}"')
+    if meta.license:
+        lines.append(f'LICENSE = "{_yocto_license_expr(_q(meta.license))}"')
+        fallback = _common_licenses_checksum(meta.license)
+        if vendored_wheel and (fallback or not wheel_license):
+            # Prefer the common-license copy: it resolves on every Yocto and
+            # needs no ${S} content. Point into the wheel only when there is
+            # no such copy (see _wheel_license_unpack).
+            if fallback:
+                lines.append(f'LIC_FILES_CHKSUM = "{fallback}"')
+            else:
+                warnings.append(
+                    f"{meta.canonical_name} {meta.version}: no license file to "
+                    "checksum; add LIC_FILES_CHKSUM manually."
+                )
+        elif meta.license_file and meta.license_md5:
+            lines.append(
+                f'LIC_FILES_CHKSUM = "file://{meta.license_file};md5={meta.license_md5}"'
+            )
+        elif fallback:
+            # sdist ships no license file (e.g. runs 1.3.0); do_populate_lic
+            # fails without LIC_FILES_CHKSUM, so point at the license text the
+            # target ships in meta/files/common-licenses.
+            lines.append(f'LIC_FILES_CHKSUM = "{fallback}"')
+        else:
+            warnings.append(
+                "no license file found in the source tree; "
+                "add LIC_FILES_CHKSUM manually (license is declared via metadata only)."
+            )
+    else:
+        # PetaLinux errors on recipes without a LICENSE field; emit the Yocto
+        # convention for an unknown/proprietary license so the build proceeds.
+        lines.append('LICENSE = "CLOSED"')
+        warnings.append(
+            "no license detected; defaulted LICENSE to CLOSED; "
+            "set LICENSE manually before building."
+        )
+    lines.append("")
+    if wheel_license:
+        lines.append(_wheel_license_unpack(wheel_license).rstrip())
+        lines.append("")
+    return lines
+
+
+#: ``do_install`` for a recipe whose only artifact is a wheel.
+#:
+#: A wheel is upstream's own build product, not source: there is nothing to
+#: unpack, configure or compile, and no build backend to drive. The recipe
+#: installs the wheel itself, with pypa installer - the same tool
+#: :func:`python_pep517_do_install` uses, so the payload, the console scripts
+#: and the ``.dist-info`` land exactly where a built-from-source recipe puts
+#: them. The emitted comment explains each variable; the two that are easy to get
+#: wrong are ``nativepython3`` (not ``${PYTHON}``, which in a poky target recipe
+#: is the *native* interpreter, and whose target counterpart is a target-arch
+#: binary that cannot run on the build host) and the class-conditional
+#: ``WHEEL_INSTALL_PYTHON`` (the shebang has to name the interpreter that will
+#: actually run the script).
+_WHEEL_INSTALL = """\
+# The interpreter recorded in the console scripts' shebang. A target wheel
+# records the target's own python3; the -native/-nativesdk variants record the
+# build host's, because that is what will run them. Same split the pypi class
+# makes through PEP517_INSTALL_PYTHON.
+WHEEL_INSTALL_PYTHON = "python3"
+WHEEL_INSTALL_PYTHON:class-native = "nativepython3"
+WHEEL_INSTALL_PYTHON:class-nativesdk = "nativepython3"
+
+# Upstream publishes no source distribution for this package, only a wheel, so
+# there is nothing to build: the recipe installs the artifact as shipped, with
+# pypa installer - the same tool python_pep517_do_install uses, so the payload,
+# the console scripts and the .dist-info land where a built recipe puts them.
+# nativepython3 runs the installer because the target interpreter is a
+# target-arch binary that cannot execute on the build host; the wheel's own
+# prebuilt extension modules are simply unpacked, not loaded. --prefix for the
+# same reason as every other generated recipe (see _INSTALL_PREFIX_OVERRIDE):
+# installer derives its scheme from the running interpreter's sysconfig, whose
+# base is an absolute sysroot path it would otherwise join onto ${D}.
+do_install() {
+    nativepython3 -m installer --interpreter "${USRBINPATH}/env ${WHEEL_INSTALL_PYTHON}" --prefix ${prefix} --destdir=${D} ${WORKDIR}/*.whl
+}
+"""
+
+
+def _render_wheel_recipe(
+    meta: PackageMetadata, yocto: YoctoVersion
+) -> tuple[str, list[str]]:
+    """Render a recipe that installs a vendored wheel.
+
+    Chosen when the index offers no sdist and the wheel's Python tag serves the
+    target (:func:`py2bbr.metadata._wheel_rejection_reason` rejects the rest).
+    None of the build machinery applies - no ``inherit pypi`` (its fetch URL
+    would request a ``.tar.gz`` that does not exist, or a different artifact
+    than the recorded sha256), no ``S``/``do_unpack``, no build backend, no
+    build-time ``-native`` deps - so this is a separate shape rather than a
+    branch through :func:`render_recipe`.
+    """
+    warnings: list[str] = []
+    lines = _recipe_header(meta, warnings, vendored_wheel=True)
+    lines.append(f'SRC_URI = "file://{_q(meta.source_filename)}"')
+    if meta.source_sha256:
+        lines.append(f'SRC_URI[sha256sum] = "{meta.source_sha256}"')
+    if meta.requires_python:
+        lines.append(f"# Upstream requires Python {meta.requires_python}")
+    lines.append("")
+
+    # ``inherit pypi`` is deliberately absent: its fetch URL is derived from
+    # BPN/PV and always points at a .tar.gz, which is not this artifact.
+    # ``setuptools3-base`` supplies PYTHON_SITEPACKAGES_DIR and the FILES
+    # default that keeps do_package from reporting "installed but not shipped".
+    lines.append("inherit python3targetconfig setuptools3-base")
+    lines.append("")
+    install_deps = ["python3-installer-native"]
+    if "unpack_wheel_license()" in "\n".join(lines):
+        # _wheel_license_unpack shells out to unzip, which is only on the build
+        # host through unzip-native.
+        install_deps.append("unzip-native")
+    lines.append(f'DEPENDS += "{" ".join(install_deps)}"')
+    lines.append("")
+    if meta.runtime_deps:
+        deps = " ".join(
+            _bitbake_deps(
+                [d.name for d in meta.runtime_deps], f"{yocto.python_pn}-"
+            )
+        )
+        lines.append(f'RDEPENDS:${{PN}} += "{deps}"')
+        lines.append("")
+    if meta.machine_deps:
+        lines.append(
+            "# Machine-gated dependencies (Requires-Dist platform_machine "
+            "markers):"
+        )
+        by_token: dict[str, list[str]] = {}
+        for dep in meta.machine_deps:
+            for machine in dep.machines:
+                for token in machine_override_tokens(machine):
+                    by_token.setdefault(token, []).append(dep.name)
+        for token, names in by_token.items():
+            deps = " ".join(_bitbake_deps(names, f"{yocto.python_pn}-"))
+            lines.append(f'RDEPENDS:${{PN}}:append:{token} += "{deps}"')
+        lines.append("")
+
+    lines.append(_WHEEL_INSTALL.rstrip())
+    lines.append("")
+    lines.append('BBCLASSEXTEND = "native nativesdk"')
+    lines.append("")
+    lines.append(
+        f"# Generated by py2bbr for {meta.canonical_name} {meta.version}"
+    )
+    lines.append(
+        f"# Target: {yocto.label} | source: {meta.source_filename} "
+        f"({meta.source_kind})"
+    )
+    if meta.dropped_deps:
+        lines.append(
+            "# Dropped dependencies (optional extras / non-target markers):"
+        )
+        for dep in meta.dropped_deps:
+            reason = f" - {dep.reason}" if dep.reason else ""
+            lines.append(f"#   {dep.name}{reason}")
+    lines.append("")
+
+    warnings.append(
+        f"{meta.canonical_name} {meta.version} publishes no source "
+        "distribution; the recipe vendors the wheel from the layer and installs "
+        "it with pypa installer instead of building it. A wheel carries "
+        "prebuilt extension modules for one exact Python ABI, so this only "
+        "works while the target's Python and architecture match the wheel's "
+        "tags; publish an sdist if the target ever moves."
+    )
+    return "\n".join(lines), warnings
+
+
 def render_recipe(
     meta: PackageMetadata,
     yocto: YoctoVersion,
@@ -646,7 +1044,27 @@ def render_recipe(
     Render the ``.bb`` content.
 
     Returns ``(recipe_text, warnings)``.
+
+    A vendored wheel takes a separate shape (:func:`_render_wheel_recipe`): the
+    artifact is a build product, so there is no source to drive a PEP 517
+    backend and none of the class/DEPENDS machinery below applies.
     """
+    if meta.vendored and meta.source_kind is SourceKind.WHEEL:
+        text, warnings = _render_wheel_recipe(meta, yocto)
+        if build_class is not None:
+            # The override names a class that would build the package, and
+            # there is nothing to build. Say so rather than emitting a recipe
+            # that ignores the request (or crashing trying to find an unpack
+            # directory in a zip).
+            warnings.append(
+                f"build class {build_class!r} was requested for "
+                f"{meta.canonical_name} {meta.version}, but the only artifact "
+                "is a wheel: there is no source to build, so the recipe "
+                "installs the wheel as shipped. Build an sdist to use a build "
+                "class."
+            )
+        return text, warnings
+
     warnings: list[str] = []
 
     warn_backend = pick_build_class(meta.build_backend)[1]
@@ -690,7 +1108,19 @@ def render_recipe(
     # target python3 on the sysroot), meson's cross file, or - for the generic
     # PEP 517 class - the backend honouring that exported environment.
     cross_lines: list[str] = []
+    qa_lines: list[str] = []
     if meta.has_native_code:
+        # A package that compiles C sources often bundles the intermediate
+        # static libraries its own build produced into the wheel, because the
+        # PEP 517 classes install whatever the backend emitted (pypa installer
+        # has no notion of split packages). Yocto's package_qa then fails
+        # do_package_qa with "non -staticdev package contains static .a
+        # library" (numpy 2.5.3 ships libnpymath.a / libnpyrandom.a under
+        # site-packages). poky's own recipe dodges it with a hand-written
+        # FILES:${PN}-staticdev listing those exact paths; a generated recipe
+        # cannot know them, since they are an artefact of the build rather than
+        # of the metadata. Skip the check instead of guessing the paths.
+        qa_lines.append('INSANE_SKIP:${PN} += "staticdev"')
         evidence = ", ".join(meta.native_code_evidence[:2]) or "native code"
         if build_class == "python_mesonpy":
             note = (
@@ -740,43 +1170,15 @@ def render_recipe(
                 "target."
             )
 
-    lines: list[str] = []
-    lines.append(f'SUMMARY = "{_q(meta.summary or meta.name)}"')
-    if meta.description and meta.description != meta.summary:
-        lines.append(f'DESCRIPTION = "{_q(meta.description)}"')
-    if meta.homepage:
-        lines.append(f'HOMEPAGE = "{_q(meta.homepage)}"')
-    if meta.license:
-        lines.append(f'LICENSE = "{_yocto_license_expr(_q(meta.license))}"')
-        if meta.license_file and meta.license_md5:
-            lines.append(
-                f'LIC_FILES_CHKSUM = "file://{meta.license_file};md5={meta.license_md5}"'
-            )
-        elif fallback := _common_licenses_checksum(meta.license):
-            # sdist ships no license file (e.g. runs 1.3.0); do_populate_lic
-            # fails without LIC_FILES_CHKSUM, so point at the license text the
-            # target ships in meta/files/common-licenses.
-            lines.append(f'LIC_FILES_CHKSUM = "{fallback}"')
-        else:
-            warnings.append(
-                "no license file found in the source tree; "
-                "add LIC_FILES_CHKSUM manually (license is declared via metadata only)."
-            )
-    else:
-        # PetaLinux errors on recipes without a LICENSE field; emit the Yocto
-        # convention for an unknown/proprietary license so the build proceeds.
-        lines.append('LICENSE = "CLOSED"')
-        warnings.append(
-            "no license detected; defaulted LICENSE to CLOSED; "
-            "set LICENSE manually before building."
-        )
-    lines.append("")
+    lines: list[str] = _recipe_header(meta, warnings)
 
     if meta.vendored:
         # S6: the sdist is not reachable at the pypi class' public URL (e.g.
-        # pyvizionsdk, only on a private index). Ship it in the layer (file://
+        # a package only on a private index). Ship it in the layer (file://
         # SRC_URI resolves through FILESPATH) and derive S from its archive
         # name; without inherit pypi there is no BPN-derived fetch URL or S.
+        # (A vendored *wheel* never reaches here - it renders as
+        # _render_wheel_recipe, which has no S at all.)
         lines.append(f'SRC_URI = "file://{_q(meta.source_filename)}"')
         lines.append(
             f'S = "${{WORKDIR}}/{_q(_sdist_stem(meta.source_filename))}"'
@@ -822,6 +1224,10 @@ def render_recipe(
 
     if cross_lines:
         lines.extend(cross_lines)
+        lines.append("")
+
+    if qa_lines:
+        lines.extend(qa_lines)
         lines.append("")
 
     # Build-time deps: the build class already provides setuptools + wheel as
@@ -893,6 +1299,9 @@ def render_recipe(
         lines.append("")
 
     sed_programs: list[str] = []
+    # Set when a PEP 639 string license is rewritten to the legacy table form,
+    # which forces ``project.license-files`` out (see _LICENSE_FILES_DROP).
+    license_rewritten = False
     if _needs_bounds_relax(build_class, meta.build_deps):
         warnings.append(
             "build-system.requires pins versions that may exceed the target "
@@ -927,6 +1336,7 @@ def render_recipe(
             r"/^[[:space:]]*\[project\]/,/^[[:space:]]*\[/ "
             r"s/^[[:space:]]*license[[:space:]]*=[[:space:]]*\"(.*)\"/license = {text = \"\1\"}/"
         )
+        license_rewritten = True
     if build_class in (
         "python_pep517",
         "python_setuptools_build_meta",
@@ -955,6 +1365,19 @@ def render_recipe(
         if external_backend:
             quoted_license = quoted_license[1:]
         sed_programs.extend(quoted_license)
+        license_rewritten = bool(quoted_license)
+    if license_rewritten:
+        # PEP 639 makes ``project.license-files`` valid *only* alongside an SPDX
+        # string expression, so the table form and that key cannot coexist.
+        # Leaving the key behind aborts the build: meson-python 0.22.0 under
+        # PetaLinux failed its do_compile with ``"project.license-files" must not
+        # be used when "project.license" is not a SPDX license expression``.
+        # Drop the key rather than keep the license: the license text still
+        # reaches the image through LIC_FILES_CHKSUM. Two programs, run in
+        # order - a value closed on its own line, then an array opened on one
+        # line and closed on another (the first program has already removed the
+        # single-line form, so the range cannot swallow a following key).
+        sed_programs.extend(_LICENSE_FILES_DROP)
     if build_class == "python_pep517":
         classifier_drop = _classifier_drop_pattern(yocto.python_version)
         if classifier_drop:
@@ -978,6 +1401,12 @@ def render_recipe(
     # (see _INSTALL_PREFIX_OVERRIDE).
     lines.append(_INSTALL_PREFIX_OVERRIDE.rstrip())
     lines.append("")
+
+    # Fixups the distro's own recipe for this tool applied, which a generated
+    # replacement would otherwise drop (see _TOOL_INSTALL_ADAPTATIONS).
+    if adaptations := _TOOL_INSTALL_ADAPTATIONS.get(meta.canonical_name):
+        lines.extend(adaptations)
+        lines.append("")
 
     lines.append('BBCLASSEXTEND = "native nativesdk"')
     lines.append("")
@@ -1012,7 +1441,7 @@ def render_recipe_to_path(
 ) -> tuple:
     """Write the recipe into ``out_dir``; return ``(path, warnings)``.
 
-    A vendored recipe also copies its sdist into ``out_dir/files/`` (the
+    A vendored recipe also copies its artifact into ``out_dir/files/`` (the
     ``file://`` SRC_URI resolves through FILESPATH); ``vendor_source`` is the
     downloaded artifact to copy. Its absence for a vendored recipe is an
     error: the emitted recipe would reference a file that does not exist.
@@ -1028,8 +1457,8 @@ def render_recipe_to_path(
     if meta.vendored:
         if vendor_source is None:
             raise ValueError(
-                f"{meta.canonical_name} vendors its sdist; vendor_source path "
-                "is required to copy it next to the recipe"
+                f"{meta.canonical_name} vendors its artifact; vendor_source "
+                "path is required to copy it next to the recipe"
             )
         files_dir = out_dir / "files"
         files_dir.mkdir(parents=True, exist_ok=True)
