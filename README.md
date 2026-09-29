@@ -98,10 +98,10 @@ override with `--layer-name`.
 | `--max-depth N` | Cap the dependency tree walk depth (default: unlimited). |
 | `--no-deps` | Disable dependency closure (default is on): Generate only the top recipe and leave its RDEPENDS to other layers (e.g. meta-python). |
 | `--no-layer`, `--no-kas` | Generate only the recipe and skip the kas file. |
-| `--no-major-bump-cap` | Do not cap dependency majors. By default every, dependency with a lower bound (`numpy>=1.21.0`) is resolved as `numpy>=1.21.0,<2`---the latest release of the major series (1.x), not a later major (2.x) as it could break builds (typically to avoid numpy 2.x breaking OpenCV, etc). Strong bounds (`~=`, `<`, `<=`, `==`) are untouched. |
+| `--no-major-bump-cap` | Do not cap dependency majors. By default every, dependency with a lower bound only (`numpy>=1.21.0`) is resolved as `numpy>=1.21.0,<2`---the latest release of the major series (1.x), not a later major (2.x) as it could break builds (typically to avoid numpy 2.x breaking OpenCV, etc). Strong bounds (`~=`, `<`, `<=`, `==`) are untouched. |
 | `--pip-arg` | Append any extra raw argument to `pip download` (repeatable). |
 | `--python-version` | Python version the target image runs (`3.12`). Default: The interpreter py2bbr itself runs under. |
-| `-q`, `-v` | Logging: INFO stage progress lines on stderr (default); `-q` restricts to warnings/errors (and disables the live fetch progress bars); `-v` adds DEBUG detail (per-package fetch/parse summaries, public-PyPI reachability). |
+| `-q`/`--quiet`, `-v`/`--verbose` | Logging: INFO stage progress lines on stderr (default); `-q` restricts to warnings/errors (and disables the live fetch progress bars); `-v` adds DEBUG detail (per-package fetch/parse summaries, public-PyPI reachability). |
 | `--skip-dep NAME` | Exclude a dependency from the closure (repeatable; canonical names). |
 | `--target-arch`, `--arch` | CPU the target image runs, as `platform.machine()` reports it (`aarch64`, `armv7l`, `x86_64`, `riscv64`). Default: This machine arch. |
 | `--targets LIST` | Restrict the final report to these target keys (comma-separated, e.g. `zynqmp,versal`); an unknown key is reported and ignored. Default: the whole list. |

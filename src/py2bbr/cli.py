@@ -1,17 +1,3 @@
-"""
-Command-line interface for py2bbr.
-
-Usage examples (see README.md for more information):
-
-    py2bbr black
-    py2bbr "requests==2.34.2" --yocto-version 5.0
-    py2bbr pyvizionsdk --python-version 3.12 --target-arch aarch64
-    py2bbr mytool --extra-index-url https://pypi.mycompany.com/simple \\
-                 --trusted-host pypi.mycompany.com --check build
-"""
-
-from __future__ import annotations
-
 import argparse
 import logging
 import sys
@@ -50,7 +36,9 @@ logger = logging.getLogger(__name__)
 
 
 def _parse_package_spec(spec: str) -> tuple[str, str | None]:
-    """Split a positional ``name`` / ``name==version`` into (name, version)."""
+    """
+    Split a requirement ``name`` / ``name==version`` into (name, version).
+    """
     try:
         req = Requirement(spec)
     except InvalidRequirement as exc:
@@ -64,11 +52,10 @@ def _parse_package_spec(spec: str) -> tuple[str, str | None]:
 
 
 class _PipArgParser(argparse.ArgumentParser):
-    """ArgumentParser that lets ``--pip-arg`` consume option-like values.
-
-    argparse refuses to use a token starting with ``-`` as an option value, so
-    ``--pip-arg --retries`` would fail with "expected one argument". Rewrite
-    such pairs into the unambiguous ``--pip-arg=--retries`` form first.
+    """
+    Hack to accept arguments like `--pip-arg --retries`, as argparse
+    does not parse as expected. The common trick here is to massage
+    the arguments for argparse, by normalising to `--pip-arg=--retries`.
     """
 
     def parse_known_args(self, args=None, namespace=None):
@@ -96,7 +83,7 @@ class _PipArgParser(argparse.ArgumentParser):
 def build_parser() -> argparse.ArgumentParser:
     p = _PipArgParser(
         prog="py2bbr",
-        description="Convert a Python package into a Yocto Bitbake recipe.",
+        description="Convert a Python package into a Yocto Bitbake layer/recipe.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument(
@@ -125,7 +112,7 @@ def build_parser() -> argparse.ArgumentParser:
     out.add_argument(
         "--no-layer",
         action="store_true",
-        help="Emit only the .bb recipe file (no conf/layer.conf, no README).",
+        help="Generate only the .bb recipe file (no conf/layer.conf, etc).",
     )
     out.add_argument(
         "--kas-file",
@@ -140,7 +127,7 @@ def build_parser() -> argparse.ArgumentParser:
     out.add_argument(
         "--keep-sources",
         action="store_true",
-        help="Keep the downloaded source artifacts (for debugging).",
+        help="Keep the downloaded files (e.g. for debugging).",
     )
     out.add_argument(
         "--with-deps",
@@ -148,11 +135,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=True,
         help=(
-            "Resolve the transitive runtime dependency closure and render one "
-            "recipe per closure member into the same layer (RDEPENDS chains "
-            "them; the top recipe stays the kas target). This is the default "
-            "so generated layers are self-contained; pass --no-deps to "
-            "disable it."
+            'Walk the dependency tree and render one recipe per member in the same layer (default; bitbake follows RDEPENDS). This basically aims at "self-contained" layers'
         ),
     )
     out.add_argument(
@@ -160,16 +143,14 @@ def build_parser() -> argparse.ArgumentParser:
         dest="with_deps",
         action="store_false",
         help=(
-            "Do not resolve the runtime dependency closure; emit only the top "
-            "recipe and leave its RDEPENDS to be provided by other layers "
-            "(e.g. meta-python)."
+            "Disable dependency closure (default is on): Generate only the top recipe and leave its RDEPENDS to other layers (e.g. meta-python)."
         ),
     )
     out.add_argument(
         "--max-depth",
         type=int,
         default=None,
-        help="Limit dependency resolution depth (None = unlimited).",
+        help="Limit dependency resolution depth (default is unlimited).",
     )
     out.add_argument(
         "--skip-dep",
@@ -177,8 +158,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=[],
         metavar="NAME",
         help=(
-            "Skip this canonical package name (repeatable) when resolving the "
-            "dependency closure (escape hatch for distro-provided deps)."
+            "Exclude a dependency from the closure (repeatable; canonical names)."
         ),
     )
     out.add_argument(
@@ -186,8 +166,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=4,
         help=(
-            "Number of fetches to run in parallel while resolving the "
-            "dependency closure (1 = sequential)."
+            "Number of fetches to run in parallel (default is 4, and 1 means sequential)."
         ),
     )
     out.add_argument(
@@ -196,12 +175,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_false",
         default=True,
         help=(
-            "Do not add a same-major upper bound when resolving dependencies "
-            "with a lower bound. By default each version floor is fetched as "
-            '"<floor>,<major+1>" (numpy>=1.21.0 becomes numpy>=1.21.0,<2), so '
-            "the newest release of the floor's major series is picked instead "
-            "of a later major whose surprise jump could break the build; pass "
-            "this flag to honour upstream bounds verbatim."
+            "Do not cap dependency majors. By default every, dependency with a lower bound only (`numpy>=1.21.0`) is resolved as `numpy>=1.21.0,<2`. Strong bounds (`~=`, `<`, `<=`, `==`) are untouched."
         ),
     )
 
@@ -216,11 +190,7 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="X.Y",
         default=current_python_version(),
         help=(
-            "Python version the target image runs (e.g. 3.12). Overrides the "
-            "series' own version: it pins the artifact the recipe installs "
-            "(wheel ABI tag), judges Requires-Python, evaluates the "
-            "python_version PEP 508 markers and prunes the classifiers the "
-            "target's Python does not know."
+            "Python version the target image runs (`3.12`). Default: The interpreter py2bbr itself runs under."
         ),
     )
     yocto.add_argument(
@@ -230,10 +200,7 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="ARCH",
         default=current_platform_machine(),
         help=(
-            "CPU architecture the target image runs, as platform.machine() "
-            "reports it (e.g. aarch64, armv7l, x86_64). A wheel download is "
-            "pinned to it when it differs from this machine's, so the recipe "
-            "installs the target's artifact and not the build host's."
+            "CPU the target image runs, as `platform.machine()` reports it (`aarch64`, `armv7l`, `x86_64`, `riscv64`). Default: This machine arch."
         ),
     )
     yocto.add_argument(
@@ -250,12 +217,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--targets",
         default=None,
         help="Comma-separated target keys for the build-for-target report "
-        "(default: all known targets: "
+        "(default: all supported targets: "
         "x86, x86_64, cortex-a53, cortex-a57, cortex-a72, cortex-a53-64, "
         "cortex-a72-64, zynqmp, versal, riscv64).",
     )
 
-    pipg = p.add_argument_group("pip index (forwarded to 'pip download')")
+    pipg = p.add_argument_group("pip index (passed to 'pip download')")
     pipg.add_argument(
         "--index-url", default=None, help="Primary package index URL."
     )
@@ -289,13 +256,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--check",
         choices=list(LEVELS),
         default=DEFAULT_LEVEL,
-        help="Validation ceiling: structural | parse | checklayer | build.",
+        help="Validation levels: structural | parse | checklayer | build.",
     )
     checkg.add_argument(
         "--check-timeout",
         type=int,
         default=1800,
-        help="Timeout (s) for each external check level.",
+        help="Timeout (s) for each check level.",
     )
 
     p.add_argument(
@@ -308,13 +275,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 class _RichLogHandler(logging.Handler):
-    """Logging handler that prints records through a rich ``Console``.
-
-    When the fetch progress bars are live on the same console, rich prints
-    the line *above* the live progress region and redraws the bars underneath.
-    Without this, plain stderr lines would be written into the middle of the
-    live region and the bars' ``\\r``/cursor-up control sequences would erase
-    them (the log output lost its newlines).
+    """
+    Fancy log handler.
     """
 
     def __init__(self, console):
@@ -329,21 +291,15 @@ class _RichLogHandler(logging.Handler):
                 highlight=False,
                 soft_wrap=True,
             )
-        except Exception:  # noqa: BLE001 - logging must never raise
+        except Exception:  # noqa: BLE001
             self.handleError(record)
 
 
 def _configure_logging(args, console=None) -> None:
-    """Route py2bbr stage progress to stderr: INFO by default, -q->WARNING, -v->DEBUG.
-
-    The level is set on the ``py2bbr`` logger (its ``py2bbr.*`` children
-    inherit it), so unrelated libraries are untouched. The stderr handler is
-    attached only when none exists yet, keeping the call idempotent across
-    repeated ``main()`` invocations (tests call it many times in one process).
-
-    ``console`` is the rich Console shared with the fetch progress bars; when
-    given, records are routed through it (see :class:`_RichLogHandler`) so
-    log lines and the live bars cooperate on one stream.
+    """
+    INFO by default
+    WARNING for quiet (-q)
+    DEBUG for verbose (-v)
     """
     level = (
         logging.DEBUG
@@ -359,19 +315,13 @@ def _configure_logging(args, console=None) -> None:
             handler: logging.Handler = _RichLogHandler(console)
         else:
             handler = logging.StreamHandler(sys.stderr)
-        handler.setFormatter(
-            logging.Formatter("[py2bbr] %(levelname)s %(message)s")
-        )
+        handler.setFormatter(logging.Formatter("%(message)s"))
         lg.addHandler(handler)
 
 
 class _FetchProgress:
-    """One live progress bar per in-flight fetch on stderr (TTY only).
-
-    Closure fetches run in parallel (``--jobs``); each gets its own rich task
-    row that is removed on completion, so the terminal shows exactly which
-    fetches are still running. Disabled when stderr is not a TTY (pipes,
-    tests) or under ``-q``; every call site stays unconditional and no-ops.
+    """
+    Fancy progress bars.
     """
 
     def __init__(self, enabled: bool, console=None):
@@ -431,8 +381,6 @@ def _print_report(
         print(f"Homepage     : {meta.homepage or '-'}")
         print(f"Build backend: {meta.build_backend or '(setuptools/setup.py)'}")
         if meta.build_backend_source:
-            # Saying *where* the answer came from keeps it from reading as the
-            # release's own declaration: this is the project's default branch.
             print(f"               (read from {meta.build_backend_source})")
         print(f"Runtime deps : {len(meta.runtime_deps)}")
         print(f"External libs: {', '.join(meta.external_needed_libs) or '-'}")
@@ -473,11 +421,10 @@ def _print_report(
 
 
 def _select_targets(spec: str | None, warnings: list[str]):
-    """Resolve ``--targets`` into a :class:`py2bbr.targets.Target` tuple.
+    """
+    Empty `spec` means all none targets.
 
-    Empty spec means "the whole known matrix". An unknown key is reported and
-    ignored rather than failing the run: a typo in a convenience flag should not
-    cost the user the recipe they asked for.
+    An unknown key is reported and ignored to continue.
     """
     from py2bbr.targets import KNOWN_TARGETS, target_by_key
 
@@ -499,15 +446,6 @@ def _select_targets(spec: str | None, warnings: list[str]):
 
 
 def _rendered_build_class(meta, build_class: str | None) -> str:
-    """The build class the recipe is actually rendered with.
-
-    Shares :func:`py2bbr.recipe.render_recipe`'s dispatch, so the report cannot
-    describe a class the recipe does not use. A vendored wheel renders as a
-    wheel install with no build class at all, which is reported as
-    ``wheel-install`` (installing a prebuilt artifact is trivially portable -
-    the wheel's own tags are what constrain it, and the rejection for those
-    already happened at fetch time).
-    """
     from py2bbr.model import SourceKind
     from py2bbr.recipe import effective_build_class
 
@@ -517,12 +455,6 @@ def _rendered_build_class(meta, build_class: str | None) -> str:
 
 
 def _build_target_report(meta, yocto, args, warnings):
-    """Build the build-for-target verdict for the rendered build class.
-
-    The layer is cross-built: build tools are host binaries, the package itself
-    must be compiled for the target CPU. The report says which targets the
-    generated recipe can serve and what breaks where.
-    """
     from py2bbr.targets import evaluate
 
     targets = _select_targets(getattr(args, "targets", None), warnings)
@@ -535,17 +467,14 @@ def _build_target_report(meta, yocto, args, warnings):
 
 
 def _shadow_warning(shadowed: list[str]) -> str:
-    """Warn that provisioned build tools took over a distro RPROVIDER.
+    """
+    Textual warning that build tools took over a distro RPROVIDER.
 
-    ``python3-flit-core`` and ``python3-meson-python`` are the ones that bite:
-    poky ships both, and py2bbr provisions a newer copy when a
-    ``build-system.requires`` floor demands one. Bitbake keys tasks by recipe
-    name, not version, so the swap drops the previous version's sstate
-    manifests; a signature-locked cache (PetaLinux's ``SIGGEN_LOCKEDSIGS`` with
-    ``SSTATE_EXISTS_CHECK = "none"``) keeps honouring the old setscene stamps,
-    so the manifests are never rewritten and every recipe needing that sysroot
-    fails in ``do_prepare_recipe_sysroot`` - a recipe that has nothing to do
-    with the change.
+    Necessary when the like of flit and meson-python are needed, as
+    they are provided by Poky, etc and cannot be overriden (at
+    least more work and likely not recommended.
+
+    TODO May be specific to PetaLinux.
     """
     names = ", ".join(shadowed)
     tasks = " ".join(f"{pn}-native" for pn in shadowed)
@@ -554,7 +483,7 @@ def _shadow_warning(shadowed: list[str]) -> str:
         f"every consumer now resolves the layer's copy of "
         f"{', '.join(f'{pn}-native' for pn in shadowed)}. In a tree that "
         "already built the distro's copy, the swap invalidates its sstate "
-        "manifests while a signature-locked cache (PetaLinux "
+        "manifests while a signature-locked cache (e.g. PetaLinux "
         "SIGGEN_LOCKEDSIGS) keeps its setscene stamps valid, so the next "
         'build fails in an unrelated recipe with "The sstate manifest for '
         "task '<recipe>-native:populate_sysroot' could not be found\". "
@@ -573,23 +502,14 @@ def _provision_build_tools(
     yocto,
     args,
 ) -> set[str]:
-    """Add a recipe for every build tool the target sysroot is too old for.
+    """
+    Add a recipe for every build tool the target sysroot is too old for.
 
-    Returns the canonical names actually provisioned. The worklist is processed
-    to a fixpoint because a provisioned tool is itself built in the native
-    sysroot and can drag in further gaps, from two directions:
+    This can cause really more work, as an extra build tool is likely to
+    call for more dependencies, so need to walk an extra tree.
 
-    * its own ``[build-system].requires`` floors (``build_version_gaps``) - a
-      tool built by meson-python needs meson/ninja that the sysroot may be too
-      old for, exactly like the original consumer did;
-    * the native packages it imports at run time
-      (:func:`tool_companion_gaps`) - meson-python 0.18.0+ calls
-      ``StandardMetadata.from_pyproject`` with the ``metadata_version`` argument
-      that ``pyproject-metadata`` only accepts from 0.8.0, and declares that
-      companion unversioned so no floor is visible.
-
-    A single pass would emit a meson-python recipe that still cannot build, so
-    the loop re-evaluates each tool it pulls in.
+    Example met: Need for a specific meson-python version recipe cannot
+    build without searching for each tool it needs in turn.
     """
     have = {canonical_name(m.name) for m in closure}
     queued: list[Dependency] = list(gaps)
@@ -630,7 +550,9 @@ def _provision_build_tools(
 
 
 def _print_target_report(report) -> None:
-    """Print the target report, compactly when nothing is flagged."""
+    """
+    Print the target report.
+    """
     if report is None:
         return
     if report.ok:
@@ -685,7 +607,7 @@ def main(argv: list[str] | None = None) -> int:
         output = Path(args.output)
         output.mkdir(parents=True, exist_ok=True)
 
-        # 1. Fetch + parse metadata.
+        # 1. Fetch and parse.
         logger.info("fetching %s==%s ...", name, version or "latest")
         workdir = output / ".py2bbr-work"
         with progress.fetch(f"{name}=={version or 'latest'}"):
@@ -699,14 +621,10 @@ def main(argv: list[str] | None = None) -> int:
                 check_public=True,
                 cap_major_bump=args.cap_major_bump,
             )
-        # Path of the artifact each closure member was fetched from, keyed by
-        # canonical name: vendored members copy their sdist into the layer.
+
         closure_sources: dict[str, Path] = {meta.canonical_name: source.path}
 
-        # Dependency closure (default on, so the layer is self-contained:
-        # every RDEPENDS has a recipe in the same layer). Skipped with
-        # --no-layer (no layer to hold member recipes) or --no-deps (deps
-        # left to other layers, e.g. meta-python).
+        # Dependency closure (default on, so the layer is self-contained)
         closure = [meta]
         warnings_extra: list[str] = []
         if args.with_deps and not args.no_layer:
@@ -737,11 +655,7 @@ def main(argv: list[str] | None = None) -> int:
             )
         logger.info("closure: %d package(s) resolved", len(closure))
 
-        # Build-backend version-gap provisioning: when a build-system bound
-        # demands a newer tool than the target series' native sysroot ships
-        # (numpy 2.5.3 wants Cython>=3.1.0; Scarthgap has 3.0.8), render a
-        # recipe of the newer tool into the layer so the layer builds it
-        # itself instead of failing the --no-isolation dependency check.
+        # Deal with specific build systems or their version requirements.
         gaps = [
             dep
             for member in list(closure)
@@ -750,8 +664,8 @@ def main(argv: list[str] | None = None) -> int:
         if not (args.with_deps and not args.no_layer):
             for dep in gaps:
                 warnings_extra.append(
-                    f"{dep.name}: build-system.requires demands {dep.requirement}, "
-                    "newer than the target Yocto's native sysroot ships; no "
+                    f"{dep.name}: build-system.requires needs {dep.requirement}, "
+                    "newer than the target Yocto environment; no "
                     "layer is generated to hold a newer recipe (use --with-deps)."
                 )
         else:
@@ -769,9 +683,10 @@ def main(argv: list[str] | None = None) -> int:
             if provisioned:
                 warnings_extra.append(
                     "provisioned newer build-backend recipe(s) into the layer "
-                    "(the sysroot ships older than build-system.requires "
-                    "demands): " + ", ".join(sorted(provisioned))
+                    "(the target uses an older than build-system.requires "
+                    "needs): " + ", ".join(sorted(provisioned))
                 )
+                # Extra report in generated files for manual tracking/debugging
                 shadowed = sorted(
                     pn
                     for pn in (
@@ -783,7 +698,7 @@ def main(argv: list[str] | None = None) -> int:
                 if shadowed:
                     warnings_extra.append(_shadow_warning(shadowed))
 
-        # 2. Render + write the recipe (and optionally a full layer).
+        # 2. Generate recipe and layer.
         layer_name = args.layer_name or default_layer_name(meta.canonical_name)
         layer_dir = output / layer_name if not args.no_layer else None
         extra_metas = closure[1:] if len(closure) > 1 else None
@@ -821,7 +736,7 @@ def main(argv: list[str] | None = None) -> int:
             )
             warnings += recipe_warnings
 
-        # 3. Render + validate the kas build file.
+        # 3. Generate kas build file.
         kas_file = None
         kas_errors: list[str] = []
         if not args.no_kas and not args.no_layer:
@@ -856,8 +771,8 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 logger.info("kas build file validated against kas schema")
 
-        # 4. Run the validation ladder.
-        logger.info("running validation ladder (check=%s) ...", args.check)
+        # 4. Validate output.
+        logger.info("running validation level (check=%s) ...", args.check)
         results = run_checks(
             meta,
             recipe_path,
@@ -872,8 +787,8 @@ def main(argv: list[str] | None = None) -> int:
         target_report = _build_target_report(meta, yocto, args, warnings)
         if not target_report.buildable:
             warnings.append(
-                "the generated recipe cannot build for at least one target in "
-                "the matrix; see the build-for-target report"
+                "the generated recipe cannot build for at least one target; "
+                "see the build-for-target report"
             )
         _print_report(
             args,
