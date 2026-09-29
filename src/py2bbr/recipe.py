@@ -966,10 +966,33 @@ do_install() {
 #: and what poky's own recipes do for prebuilt binaries
 #: (``python3-uv-build``, ``python3-packaging``, ``linux-firmware``).
 #:
+#: An auditwheel build also makes ``file-rdeps`` unsatisfiable, and for the
+#: same reason: the artifact is a build product of another toolchain, not
+#: output bitbake linked. Auditwheel renames every bundled library to a fresh,
+#: hash-decorated name (``libudev-8d5af18d.so.1.6.11``) - a name no distro
+#: package can ever claim - and rewrites its consumers' ``DT_NEEDED`` to that
+#: name. The ``.gnu.version_d`` section of the renamed library still names the
+#: *original* soname (``libudev.so.1``), so rpm dependency resolution (what
+#: ``do_package`` feeds ``file-rdeps`` from) *provides* the versioned symbols
+#: under the original name while consumers *need* them under the renamed one.
+#: ``file-rdeps`` then fails with "no providers found" for every versioned
+#: symbol crossing - try ``libudev-8d5af18d.so.1.6.11(LIBUDEV_183)(64bit)``
+#: against any distro and it is never there. No per-soname knob exists for the
+#: check (a skip or a provider applies to the whole package), so the check has
+#: to be waived here rather than selectively.
+#:
+#: What waiving it must not hide - the shared libraries the binaries link
+#: against that are *not* bundled (gstreamer, glib, ...) - is surfaced instead:
+#: ``py2bbr`` records which sonames are needed but not provided inside the
+#: wheel and lists them in the report and as a recipe comment, so the missing
+#: runtime dependency remains visible and actionable even though the QA gate
+#: no longer demands it from ``RDEPENDS``.
+#:
 #: The trade is stated rather than hidden: no ``-dbg`` package, and no debug
-#: symbols for anything the extension modules call into. That is already the
-#: situation on the target, so waiving the check changes the build's outcome
-#: from *failed* to *as good as the artifact allows*.
+#: symbols for anything the extension modules call into, and no automatic
+#: ``file-rdeps`` verification of the external system libraries. That is already
+#: the situation on the target, so waiving the check changes the build's
+#: outcome from *failed* to *as good as the artifact allows*.
 #:
 #: Scoped to ``${PN}``: the same QA run also covers the ``-dbg``/``-static``
 #: variants, but the check reads ``INSANE_SKIP:${PN}``, and adding a blanket
@@ -982,8 +1005,83 @@ _WHEEL_QA_SKIP = """\
 # "already-stripped"; nothing in this recipe can undo it, so the check is
 # waived for this package only - the same waiver poky's own recipes apply to
 # prebuilt binaries (python3-uv-build, linux-firmware).
-INSANE_SKIP:${PN} = "already-stripped"
+#
+# A prebuilt wheel also cannot satisfy bitbake's file-rdeps check: auditwheel
+# renames the bundled libraries (libudev-8d5af18d.so.1.6.11) and rewrites
+# DT_NEEDED to those names, but the version-definition section of each renamed
+# library still names the original soname (libudev.so.1). rpm dependency
+# resolution then provides the versioned symbols under the original name while
+# the consumers need them under the renamed one - a cross of two namespaces no
+# distro package can ever fill (there is no libudev-8d5af18d.so.1.6.11
+# provider anywhere). The check has no per-soname escape, so it is waived here
+# too; the external system libraries the binaries need are called out in the
+# report and in the comment below so the target rootfs cannot silently miss
+# them.
+INSANE_SKIP:${PN} = "already-stripped file-rdeps"
 """
+
+#: Advisory mapping from a shared-library ``DT_SONAME`` to the OE package that
+#: typically provides it (scarthgap-era OE-core package splits). Used only to
+#: phrase the *report* for the external system libraries a vendored wheel's
+#: binaries link against - never rendered into the recipe: provider names
+#: differ between distros and a wrong guess in ``RDEPENDS`` would break
+#: ``do_rootfs``, while the report entry just has to be identifiable.
+_OE_LIB_PACKAGE_HINTS = {
+    "libgobject-2.0.so.0": "glib-2.0",
+    "libglib-2.0.so.0": "glib-2.0",
+    "libgio-2.0.so.0": "glib-2.0",
+    "libgmodule-2.0.so.0": "glib-2.0",
+    "libgstreamer-1.0.so.0": "gstreamer1.0",
+    "libgstapp-1.0.so.0": "gstreamer1.0-plugins-base",
+    "libgstallocators-1.0.so.0": "gstreamer1.0-plugins-base",
+    "libgstvideo-1.0.so.0": "gstreamer1.0-plugins-base",
+    "libgsttag-1.0.so.0": "gstreamer1.0-plugins-base",
+    "libgstpbutils-1.0.so.0": "gstreamer1.0-plugins-base",
+    "libudev.so.1": "udev",
+    "libz.so.1": "zlib",
+    "libpcre2-8.so.0": "libpcre2",
+    "libssl.so.3": "openssl",
+    "libcrypto.so.3": "openssl",
+    "libcurl.so.4": "curl",
+}
+
+
+def _oe_lib_package_hint(soname: str) -> str:
+    """Typical OE package for ``soname``, or ``""`` when none is known well
+    enough to be worth naming (see :data:`_OE_LIB_PACKAGE_HINTS`)."""
+    return _OE_LIB_PACKAGE_HINTS.get(soname, "")
+
+
+def _render_external_libs_comment(sonames: list[str]) -> str:
+    """Recipe comment naming the shared libraries the wheel's bundled binaries
+    link against that are not bundled - the readable record of what
+    ``file-rdeps`` would have enforced had the wheel been bitbake's own output
+    (see :data:`_WHEEL_QA_SKIP`)."""
+    lines = [
+        (
+            "# The wheel's bundled binaries link against these shared "
+            "libraries, which are NOT bundled"
+        ),
+        "# in the wheel and must already be in the target rootfs:",
+    ]
+    width = max(len(s) for s in sonames)
+    for soname in sonames:
+        hint = _oe_lib_package_hint(soname)
+        if hint:
+            lines.append(
+                f"#   {soname:<{width}}   typically packaged as {hint}"
+            )
+        else:
+            lines.append(
+                f"#   {soname:<{width}}   no OE provider in py2bbr's "
+                "knowledge (add the providing package yourself)"
+            )
+    lines.append(
+        "# No RDEPENDS is generated for them - the provider name differs "
+        "between distros - so make sure"
+    )
+    lines.append("# the image provides them when this package is used.")
+    return "\n".join(lines)
 
 
 def _render_wheel_recipe(
@@ -1052,6 +1150,11 @@ def _render_wheel_recipe(
     if meta.ships_prebuilt_binaries:
         lines.append(_WHEEL_QA_SKIP.rstrip())
         lines.append("")
+    if meta.external_needed_libs:
+        # Same check that _WHEEL_QA_SKIP waived, preserved as information: the
+        # external system libraries this wheel's binaries really link against.
+        lines.append(_render_external_libs_comment(meta.external_needed_libs))
+        lines.append("")
     lines.append('BBCLASSEXTEND = "native nativesdk"')
     lines.append("")
     lines.append(
@@ -1099,6 +1202,26 @@ def _render_wheel_recipe(
             "bitbake's fatal already-stripped QA check and no -dbg package is "
             "produced. The symbols are not in the artifact; only a from-source "
             "build can restore them."
+        )
+    if meta.external_needed_libs:
+        hinted = sorted(
+            {
+                pkg
+                for soname in meta.external_needed_libs
+                if (pkg := _oe_lib_package_hint(soname))
+            }
+        )
+        rootfs_note = (
+            f" Typical OE providers are {', '.join(hinted)}." if hinted else ""
+        )
+        warnings.append(
+            f"{meta.canonical_name} {meta.version}: the wheel's bundled "
+            "binaries link against shared libraries that are not bundled in "
+            "the wheel and must already be in the target rootfs: "
+            f"{', '.join(meta.external_needed_libs)}.{rootfs_note} The recipe "
+            "cannot name their packages for every distro, so it lists them "
+            "instead of guessing them into RDEPENDS; make sure the image "
+            "provides them when this package is used."
         )
     return "\n".join(lines), warnings
 

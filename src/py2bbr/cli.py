@@ -421,6 +421,7 @@ def _print_report(
             # release's own declaration: this is the project's default branch.
             print(f"               (read from {meta.build_backend_source})")
         print(f"Runtime deps : {len(meta.runtime_deps)}")
+        print(f"External libs: {', '.join(meta.external_needed_libs) or '-'}")
         print(
             f"Dropped deps : {len(meta.dropped_deps)}"
             + (

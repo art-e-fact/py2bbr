@@ -221,6 +221,14 @@ class PackageMetadata:
     #: False for a pure-Python (``py3-none-any``) wheel and for every sdist,
     #: which bitbake compiles and strips itself.
     ships_prebuilt_binaries: bool = False
+    #: Sonames (``libgstreamer-1.0.so.0``) that the wheel's ELF binaries link
+    #: against but that the wheel does not bundle itself and the C toolchain is
+    #: not assumed to provide - i.e. shared libraries that must already exist
+    #: in the target rootfs. Populated only for wheels, best-effort (an
+    #: unparsable archive yields ``[]``). The recipe cannot discover their
+    #: providing packages for every distro, so they are surfaced in the report
+    #: and recommended in the recipe rather than guessed into ``RDEPENDS``.
+    external_needed_libs: list[str] = field(default_factory=list)
 
     # --- dependencies ----------------------------------------------------
     runtime_deps: list[Dependency] = field(default_factory=list)

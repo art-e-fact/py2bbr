@@ -1888,6 +1888,7 @@ class TestVendoredWheelRecipe:
         # tag admits prebuilt binaries, so a pure-Python wheel keeps the check.
         text, warnings = render_recipe(self._wheel_meta(make_meta_fn), yocto)
         assert "already-stripped" not in text
+        assert "file-rdeps" not in text
         assert not any("already-stripped" in w for w in warnings)
         meta = self._wheel_meta(
             make_meta_fn,
@@ -1897,8 +1898,60 @@ class TestVendoredWheelRecipe:
             ships_prebuilt_binaries=True,
         )
         text, warnings = render_recipe(meta, yocto)
-        assert 'INSANE_SKIP:${PN} = "already-stripped"' in text
+        assert 'INSANE_SKIP:${PN} = "already-stripped file-rdeps"' in text
         assert any("already-stripped QA check" in w for w in warnings)
+
+    def test_lists_external_system_libraries_the_wheel_links_against(
+        self, make_meta_fn, yocto
+    ):
+        # Waiving file-rdeps (same _WHEEL_QA_SKIP block) must not hide what
+        # that check would otherwise have enforced: the real system libraries
+        # the bundled binaries link against that are not bundled in the wheel.
+        # They are listed in the recipe and warned about, each with the typical
+        # OE package when py2bbr knows one - but never guessed into RDEPENDS,
+        # since the provider name differs between distros.
+        meta = self._wheel_meta(
+            make_meta_fn,
+            source_filename=(
+                "pyvizionsdk-26.9.1-cp312-cp312-manylinux_2_31_aarch64.whl"
+            ),
+            ships_prebuilt_binaries=True,
+            external_needed_libs=[
+                "libgstreamer-1.0.so.0",
+                "libgobject-2.0.so.0",
+                "libweird-2.0.so.0",
+            ],
+        )
+        text, warnings = render_recipe(meta, yocto)
+        assert (
+            "# in the wheel and must already be in the target rootfs:" in text
+        )
+        assert "typically packaged as gstreamer1.0" in text
+        assert "typically packaged as glib-2.0" in text
+        assert "no OE provider in py2bbr's knowledge" in text
+        assert 'RDEPENDS:${PN} += "python3-click python3-packaging"' in text
+        rdeps_lines = [
+            ln for ln in text.splitlines() if ln.startswith("RDEPENDS")
+        ]
+        assert all(
+            "gstreamer1.0" not in ln and "glib-2.0" not in ln
+            for ln in rdeps_lines
+        )
+        warned = next(w for w in warnings if "not bundled in the wheel" in w)
+        assert (
+            "libgstreamer-1.0.so.0, libgobject-2.0.so.0, libweird-2.0.so.0"
+            in warned
+        )
+        assert "Typical OE providers are glib-2.0, gstreamer1.0" in warned
+
+    def test_pure_python_wheel_stays_quiet_about_external_libs(
+        self, make_meta_fn, yocto
+    ):
+        # No prebuilt binaries -> no file-rdeps waiver and no external-library
+        # commentary; an empty list renders nothing.
+        text, warnings = render_recipe(self._wheel_meta(make_meta_fn), yocto)
+        assert "NOT bundled" not in text
+        assert not any("not bundled in the wheel" in w for w in warnings)
 
     def test_warns_where_the_recovered_backend_came_from(
         self, make_meta_fn, yocto

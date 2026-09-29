@@ -220,6 +220,10 @@ class TestMain:
             ),
             vendored=True,
             ships_prebuilt_binaries=True,
+            external_needed_libs=[
+                "libgstreamer-1.0.so.0",
+                "libgobject-2.0.so.0",
+            ],
             build_backend="mesonpy",
             build_backend_source="github.com/vizion/pyvizionsdk@pyproject.toml",
         )
@@ -245,6 +249,9 @@ class TestMain:
         assert "Build backend: mesonpy" in out
         assert "(read from github.com/vizion/pyvizionsdk@pyproject.toml)" in out
         assert "waives bitbake's fatal already-stripped QA check" in out
+        assert (
+            "External libs: libgstreamer-1.0.so.0, libgobject-2.0.so.0" in out
+        )
         recipe = (
             tmp_path
             / "out"
@@ -254,7 +261,10 @@ class TestMain:
             / "python3-pyvizionsdk_26.9.1.bb"
         )
         assert recipe.is_file()
-        assert 'INSANE_SKIP:${PN} = "already-stripped"' in recipe.read_text()
+        assert (
+            'INSANE_SKIP:${PN} = "already-stripped file-rdeps"'
+            in recipe.read_text()
+        )
 
     def test_no_layer_quiet_keep_sources(
         self, tmp_path, monkeypatch, meta, capsys

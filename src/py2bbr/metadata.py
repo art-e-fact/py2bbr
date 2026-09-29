@@ -30,6 +30,7 @@ import os
 import platform
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tarfile
@@ -1344,6 +1345,183 @@ def wheel_ships_prebuilt_binaries(filename: str) -> bool:
     return any(tag.platform != "any" for tag in tags)
 
 
+#: Sonames of the C runtime that every OE rootfs already ships with its Python
+#: (glibc/musl libc and its satellites, the compiler runtime, the C++ runtime).
+#: A wheel linking these is not a finding: the base system provides them
+#: whether or not this recipe's RDEPENDS list them.
+_TOOLCHAIN_LIB_NAMES = frozenset(
+    {
+        "libc.so.6",
+        "libm.so.6",
+        "libpthread.so.0",
+        "librt.so.1",
+        "libdl.so.2",
+        "libutil.so.1",
+        "libresolv.so.2",
+        "libgcc_s.so.1",
+        "libstdc++.so.6",
+        "libc.musl-aarch64.so.1",
+        "libc.musl-x86_64.so.1",
+    }
+)
+
+
+def _is_toolchain_soname(soname: str) -> bool:
+    """Whether ``soname`` is a toolchain runtime piece, never an external
+    system library to surface (see :data:`_TOOLCHAIN_LIB_NAMES`)."""
+    if soname in _TOOLCHAIN_LIB_NAMES:
+        return True
+    # The dynamic linker's name embeds the ISA (ld-linux-aarch64.so.1 /
+    # ld-musl-x86_64.so.1), so match it by shape instead of enumerating it.
+    return soname.startswith(("ld-linux-", "ld-musl-")) and soname.endswith(
+        ".so.1"
+    )
+
+
+_ELF_MAGIC = b"\x7fELF"
+_PT_LOAD = 1
+_PT_DYNAMIC = 2
+_DT_NULL = 0
+_DT_NEEDED = 1
+_DT_STRTAB = 5
+_DT_STRSZ = 10
+_DT_SONAME = 14
+#: Long enough for any real .dynstr entry; guards against a corrupt strtab
+#: making the parser read to the end of file for a phantom index.
+_MAX_DYNSTR = 512
+
+
+def _elf64_dynamic_tags(data: bytes) -> tuple[str | None, list[str]]:
+    """Read ``(DT_SONAME, DT_NEEDED)`` out of an ELF64 little-endian blob.
+
+    Returns ``(None, [])`` for anything that is not a recognisable dynamic
+    ELF64 LSB file (32-bit, big-endian, or not ELF at all) - wheels for OE
+    targets are built by manylinux/musllinux toolchains in this one shape.
+
+    ``DT_STRTAB`` is a *virtual* address, and a wheel's DSOs are loaded at a
+    nonzero base, so the table is mapped back to a file offset through the
+    ``PT_LOAD`` segments before the ``DT_NEEDED``/``DT_SONAME`` string-table
+    indices are read.
+    """
+    if len(data) < 0x40 or data[:4] != _ELF_MAGIC:
+        return (None, [])
+    if data[4] != 2 or data[5] != 1:  # ELF64, little-endian
+        return (None, [])
+    (e_phoff,) = struct.unpack_from("<Q", data, 0x20)
+    (e_phentsize,) = struct.unpack_from("<H", data, 0x36)
+    (e_phnum,) = struct.unpack_from("<H", data, 0x38)
+    if not e_phentsize or not e_phnum:
+        return (None, [])
+    loads: list[tuple[int, int, int]] = []  # (vaddr, filesz, offset)
+    dyn: list[tuple[int, int]] = []  # (offset, filesz)
+    for i in range(e_phnum):
+        off = e_phoff + i * e_phentsize
+        if off + 56 > len(data):
+            break
+        (p_type,) = struct.unpack_from("<I", data, off)
+        (p_offset,) = struct.unpack_from("<Q", data, off + 8)
+        (p_vaddr,) = struct.unpack_from("<Q", data, off + 16)
+        (p_filesz,) = struct.unpack_from("<Q", data, off + 32)
+        if p_type == _PT_LOAD:
+            loads.append((p_vaddr, p_filesz, p_offset))
+        elif p_type == _PT_DYNAMIC:
+            dyn.append((p_offset, p_filesz))
+
+    def file_offset_of(vaddr: int) -> int:
+        for base, filesz, offset in loads:
+            if filesz and base <= vaddr < base + filesz:
+                return offset + (vaddr - base)
+        return vaddr  # unusual layout: treat it as an offset already
+
+    needed: list[int] = []
+    soname: int | None = None
+    strtab: int | None = None
+    strsz = 0
+    for p_offset, p_filesz in dyn:
+        end = min(p_offset + p_filesz, len(data))
+        pos = p_offset
+        while pos + 16 <= end:
+            (d_tag,) = struct.unpack_from("<q", data, pos)
+            (d_val,) = struct.unpack_from("<Q", data, pos + 8)
+            if d_tag == _DT_NULL:
+                break
+            elif d_tag == _DT_NEEDED:
+                needed.append(d_val)
+            elif d_tag == _DT_STRTAB:
+                strtab = file_offset_of(d_val)
+            elif d_tag == _DT_STRSZ:
+                strsz = d_val
+            elif d_tag == _DT_SONAME:
+                soname = d_val
+            pos += 16
+    if strtab is None:
+        return (None, [])
+    names = [
+        name
+        for idx in needed
+        if (name := _elf_strtab_lookup(data, strtab, strsz, idx))
+    ]
+    soname_name = (
+        _elf_strtab_lookup(data, strtab, strsz, soname)
+        if soname is not None
+        else None
+    )
+    return (soname_name, names)
+
+
+def _elf_strtab_lookup(data: bytes, strtab: int, strsz: int, idx: int) -> str:
+    if idx >= strsz or strtab + idx >= len(data):
+        return ""
+    start = strtab + idx
+    end = data.find(b"\x00", start, start + _MAX_DYNSTR)
+    if end == -1:
+        return ""
+    return data[start:end].decode("utf-8", "replace")
+
+
+def wheel_external_needed_libs(filename: str | os.PathLike[str]) -> list[str]:
+    """Shared libraries the wheel's ELF binaries need that the wheel does not
+    bundle itself and the C toolchain is not assumed to provide.
+
+    Every ELF member of the archive is parsed for its ``DT_NEEDED`` and
+    ``DT_SONAME``; a soname that appears among the bundled ``DT_SONAME``s is
+    self-contained (an auditwheel build's renamed ``*.libs/*.so*`` sidecars),
+    and the toolchain runtime is a given, so neither is a finding.
+
+    Best-effort by design: an unparsable member or archive yields whatever the
+    rest of the wheel supports, and ``[]`` when nothing can be read. The recipe
+    and report use this as *information* (a hint about what the target rootfs
+    must provide), so a false negative must not fail the run.
+    """
+    needed: set[str] = set()
+    provided: set[str] = set()
+    so_member = re.compile(r"\.so(?:\.|$)")
+    try:
+        with zipfile.ZipFile(filename) as zf:
+            for info in zf.infolist():
+                if info.is_dir() or not so_member.search(info.filename):
+                    continue
+                try:
+                    payload = zf.read(info)
+                except (OSError, zipfile.BadZipFile):
+                    continue
+                soname, deps = _elf64_dynamic_tags(payload)
+                if soname is None and not deps:
+                    # A non-ELF member whose name happens to carry ".so"
+                    # (a text file, a symlink target) - not an error.
+                    continue
+                if soname:
+                    provided.add(soname)
+                needed.update(deps)
+    except (OSError, zipfile.BadZipFile):
+        return []
+    return sorted(
+        lib
+        for lib in needed
+        if lib not in provided and not _is_toolchain_soname(lib)
+    )
+
+
 def detect_native_code(
     source: FetchedSource, build_requires: list[str] = ()
 ) -> tuple[bool, list[str]]:
@@ -1687,6 +1865,14 @@ def build_metadata(
         ships_prebuilt_binaries=(
             source.kind is SourceKind.WHEEL
             and wheel_ships_prebuilt_binaries(source.filename)
+        ),
+        external_needed_libs=(
+            # source.filename is the bare artifact name; the ELF scan needs the
+            # actual file on disk, which is source.path (the download may be
+            # kept or cleaned, but it is present for the span of build_metadata).
+            wheel_external_needed_libs(source.path)
+            if source.kind is SourceKind.WHEEL
+            else []
         ),
         requires_dist=list(requires_dist),
         has_native_code=has_native_code,

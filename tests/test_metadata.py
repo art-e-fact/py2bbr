@@ -7,6 +7,7 @@ import email
 import gzip
 import hashlib
 import io
+import struct
 import subprocess
 import sys
 import tarfile
@@ -1889,6 +1890,214 @@ class TestWheelShipsPrebuiltBinaries:
         # than to waive a check that would have caught a real problem.
         assert not M.wheel_ships_prebuilt_binaries("not-a-wheel.txt")
         assert not M.wheel_ships_prebuilt_binaries("")
+
+
+def _elf64_bytes(
+    needed: list[str],
+    soname: str | None = None,
+    *,
+    vaddr_base: int = 0x400000,
+    elf_class: int = 2,
+    elf_data: int = 1,
+) -> bytes:
+    """A minimal dynamic ELF64 that py2bbr's reader understands.
+
+    DT_STRTAB intentionally carries a *virtual* address (``vaddr_base +
+    table``), not the file offset: wheel DSOs sit at a nonzero load base, and
+    the vaddr->offset mapping through PT_LOAD is exactly what the parser has to
+    get right.
+    """
+    strings: dict[str, int] = {}
+    table = b"\x00"
+    for name in list(needed) + ([soname] if soname else []):
+        if name not in strings:
+            strings[name] = len(table)
+            table += name.encode() + b"\x00"
+    entries = [
+        (5, vaddr_base + 0),  # DT_STRTAB placeholder, patched below
+        (10, len(table)),  # DT_STRSZ
+    ]
+    for name in needed:
+        entries.append((1, strings[name]))  # DT_NEEDED
+    if soname is not None:
+        entries.append((14, strings[soname]))  # DT_SONAME
+    entries.append((0, 0))  # DT_NULL
+
+    phdr_off = 64
+    dyn_off = phdr_off + 2 * 56
+    strtab_off = dyn_off + len(entries) * 16
+    size = strtab_off + len(table)
+    entries[0] = (5, vaddr_base + strtab_off)  # real string-table vaddr
+
+    out = bytearray(size)
+    out[0:4] = b"\x7fELF"
+    out[4] = elf_class
+    out[5] = elf_data
+    struct.pack_into("<H", out, 16, 3)  # ET_DYN
+    struct.pack_into("<H", out, 18, 183)  # EM_AARCH64
+    struct.pack_into("<I", out, 20, 1)
+    struct.pack_into("<Q", out, 32, phdr_off)
+    struct.pack_into("<H", out, 52, 64)  # e_ehsize
+    struct.pack_into("<H", out, 54, 56)  # e_phentsize
+    struct.pack_into("<H", out, 56, 2)  # e_phnum
+
+    # PT_LOAD covering the whole file at the given virtual base.
+    struct.pack_into("<I", out, phdr_off, 1)
+    struct.pack_into("<I", out, phdr_off + 4, 6)  # RW
+    struct.pack_into("<Q", out, phdr_off + 8, 0)
+    struct.pack_into("<Q", out, phdr_off + 16, vaddr_base)
+    struct.pack_into("<Q", out, phdr_off + 24, vaddr_base)
+    struct.pack_into("<Q", out, phdr_off + 32, size)
+    struct.pack_into("<Q", out, phdr_off + 40, size)
+    struct.pack_into("<Q", out, phdr_off + 48, 8)
+
+    # PT_DYNAMIC.
+    struct.pack_into("<I", out, phdr_off + 56, 2)
+    struct.pack_into("<I", out, phdr_off + 60, 6)
+    struct.pack_into("<Q", out, phdr_off + 64, dyn_off)
+    struct.pack_into("<Q", out, phdr_off + 72, vaddr_base + dyn_off)
+    struct.pack_into("<Q", out, phdr_off + 80, vaddr_base + dyn_off)
+    struct.pack_into("<Q", out, phdr_off + 88, len(entries) * 16)
+    struct.pack_into("<Q", out, phdr_off + 96, len(entries) * 16)
+    struct.pack_into("<Q", out, phdr_off + 104, 8)
+
+    for i, (tag, val) in enumerate(entries):
+        struct.pack_into("<q", out, dyn_off + i * 16, tag)
+        struct.pack_into("<Q", out, dyn_off + i * 16 + 8, val)
+    out[strtab_off:] = table
+    return bytes(out)
+
+
+class TestWheelExternalNeededLibs:
+    """Which shared libraries a vendored wheel still needs from the target.
+
+    The QA error this guards: an auditwheel wheel's sidecar libraries reference
+    each other and system libraries by soname; bitbake's file-rdeps check fails
+    on exactly the ones no package can provide - the renamed sidecars (their
+    versioned symbols cross rpm's original/renamed namespace split) and, really
+    and truly, the external system libraries. The recipe waives file-rdeps, so
+    py2bbr has to surface those external sonames itself.
+    """
+
+    @staticmethod
+    def _wheel(
+        tmp_path: Path, members: dict[str, bytes], name: str = "pkg-1.0-any.whl"
+    ) -> Path:
+        path = tmp_path / name
+        with zipfile.ZipFile(path, "w") as zf:
+            for member, data in members.items():
+                zf.writestr(member, data)
+        return path
+
+    def test_external_vs_self_provided_split(self, tmp_path):
+        # The extension module links the glib family and the bundled sidecar;
+        # the sidecar itself provides its own (mangled) soname. net: only the
+        # glib family is a true external system-library finding.
+        core = _elf64_bytes(
+            [
+                "libglib-2.0.so.0",
+                "libgobject-2.0.so.0",
+                "libself-a1b2c3.so.1",
+                "libc.so.6",
+            ]
+        )
+        sidecar = _elf64_bytes(
+            ["libglib-2.0.so.0", "libc.so.6"], soname="libself-a1b2c3.so.1"
+        )
+        whl = self._wheel(
+            tmp_path,
+            {
+                "pkg/_core.cpython-312-aarch64-linux-gnu.so": core,
+                "pkg.libs/libself-a1b2c3.so.1": sidecar,
+            },
+            "pkg-1.0-cp312-cp312-manylinux_2_31_aarch64.whl",
+        )
+        assert M.wheel_external_needed_libs(whl) == [
+            "libglib-2.0.so.0",
+            "libgobject-2.0.so.0",
+        ]
+
+    def test_toolchain_runtime_is_not_a_finding(self, tmp_path):
+        # glibc and its satellites, the compiler runtime, the dynamic linker:
+        # every OE rootfs with python3 ships them, so they are noise.
+        core = _elf64_bytes(
+            [
+                "libc.so.6",
+                "libm.so.6",
+                "libpthread.so.0",
+                "librt.so.1",
+                "libdl.so.2",
+                "libgcc_s.so.1",
+                "libstdc++.so.6",
+                "ld-linux-aarch64.so.1",
+            ]
+        )
+        whl = self._wheel(tmp_path, {"pkg/_core.so": core})
+        assert M.wheel_external_needed_libs(whl) == []
+
+    def test_toolchain_soname_match(self):
+        assert M._is_toolchain_soname("libc.so.6")
+        assert M._is_toolchain_soname("ld-linux-aarch64.so.1")
+        assert M._is_toolchain_soname("ld-musl-x86_64.so.1")
+        assert not M._is_toolchain_soname("libgstreamer-1.0.so.0")
+        assert not M._is_toolchain_soname("libz.so.1")
+
+    def test_unparsable_members_and_archives_yield_empty(self, tmp_path):
+        whl = self._wheel(tmp_path, {"pkg/__init__.py": ""})
+        assert M.wheel_external_needed_libs(whl) == []
+        # A member that is not an ELF but has ".so" in its name.
+        whl = self._wheel(
+            tmp_path, {"pkg/README.so": b"text, definitely not ELF"}
+        )
+        assert M.wheel_external_needed_libs(whl) == []
+        # A 32-bit ELF is not the shape manylinux wheels take; it is skipped.
+        whl = self._wheel(
+            tmp_path,
+            {"pkg/_core.so": _elf64_bytes(["libglib-2.0.so.0"], elf_class=1)},
+        )
+        assert M.wheel_external_needed_libs(whl) == []
+        # Not a zip at all: best-effort failure, no error.
+        bogus = tmp_path / "pkg-1.0-cp312-cp312-manylinux_2_31_aarch64.whl"
+        bogus.write_bytes(b"not a zip archive")
+        assert M.wheel_external_needed_libs(bogus) == []
+
+    def test_elf_reader_defensive_branches(self):
+        # The reader must degrade to (None, []) on every malformed shape it
+        # can meet, not raise: a vendored wheel is informational input.
+        assert M._elf64_dynamic_tags(b"") == (None, [])
+        # e_phentsize == 0 (no program header table).
+        header = bytearray(64)
+        header[0:4] = b"\x7fELF"
+        header[4] = 2
+        header[5] = 1
+        struct.pack_into("<H", header, 16, 3)
+        struct.pack_into("<H", header, 56, 1)
+        assert M._elf64_dynamic_tags(bytes(header)) == (None, [])
+        # phpnum points past EOF -> the phdr scan breaks early and there is no
+        # dynamic section.
+        struct.pack_into("<Q", header, 32, 64)
+        struct.pack_into("<H", header, 54, 56)
+        struct.pack_into("<H", header, 56, 2)
+        assert M._elf64_dynamic_tags(bytes(header)) == (None, [])
+        # A PT_DYNAMIC that never sets DT_STRTAB.
+        phoff, doff, dynsz = 64, 64 + 56, 32
+        blob = bytearray(phoff + 56 + dynsz)  # header + 1 phdr + 2 dyn entries
+        blob[0:64] = header
+        struct.pack_into("<Q", blob, 32, phoff)
+        struct.pack_into("<H", blob, 54, 56)
+        struct.pack_into("<H", blob, 56, 1)
+        struct.pack_into("<I", blob, phoff, 2)  # PT_DYNAMIC
+        struct.pack_into("<Q", blob, phoff + 8, doff)
+        struct.pack_into("<Q", blob, phoff + 16, doff)
+        struct.pack_into("<Q", blob, phoff + 32, dynsz)
+        struct.pack_into("<q", blob, doff, 1)  # DT_NEEDED
+        struct.pack_into("<Q", blob, doff + 8, 98)  # index into nothing
+        struct.pack_into("<q", blob, doff + 16, 0)  # DT_NULL
+        assert M._elf64_dynamic_tags(bytes(blob)) == (None, [])
+        # String-table lookups: out-of-range index, and a pointer with no NUL
+        # terminator within the cap.
+        assert M._elf_strtab_lookup(b"ab\x00cd", 0, 5, 99) == ""
+        assert M._elf_strtab_lookup(b"ab" + b"\xff" * 600, 0, 602, 2) == ""
 
 
 class TestVcsBuildSystem:
