@@ -1,16 +1,3 @@
-"""Tests for py2bbr.recipe rendering (no network required).
-
-Regression: DEPENDS / RDEPENDS must render as single-line, double-quoted
-assignments with a literal ``python3-`` package prefix (no ``${PYTHON_PN}`` in
-values, no backslash line continuations). A line-oriented post-processing pass
-(shell-style continuation joining, ``${VAR}`` expansion with the variable
-unset, timestamp appending) corrupts multi-line continued values with
-``${...}`` references (e.g. ``DEPENDS += \\`` + ``${PYTHON_PN}-x-native \\``
-became the unparsable ``DEPENDS += -x-native '00:00`` seen in PetaLinux).
-"""
-
-from __future__ import annotations
-
 import shutil
 import subprocess
 from dataclasses import replace

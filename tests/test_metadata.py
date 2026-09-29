@@ -1,7 +1,3 @@
-"""Tests for py2bbr.metadata (pure functions, no network)."""
-
-from __future__ import annotations
-
 import dataclasses
 import email
 import gzip

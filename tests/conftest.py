@@ -1,7 +1,3 @@
-"""Shared fixtures and helpers for the py2bbr test-suite (no network required)."""
-
-from __future__ import annotations
-
 import pytest
 
 from py2bbr.model import Dependency, DepKind, PackageMetadata, SourceKind

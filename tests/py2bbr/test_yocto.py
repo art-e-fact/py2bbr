@@ -1,16 +1,3 @@
-"""Tests for py2bbr.yocto layer rendering (no network required).
-
-Regression: the generated layer.conf must load in a bitbake environment that
-has poky core but NOT meta-python. bitbake (>= the Scarthgap line) refuses to
-load a layer whose LAYERDEPENDS names a collection that is not enabled, and it
-only honours ``LAYERSERIES_COMPAT_<c>`` (the old ``LAYERCOMPATIBLE_<c>`` is
-dead). Since ``pypi``/``setuptools3``/``python_pep517``/
-``python_setuptools_build_meta`` all live in poky core in Scarthgap, the layer
-may only hard-depend on ``core``.
-"""
-
-from __future__ import annotations
-
 import platform
 import sys
 

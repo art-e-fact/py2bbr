@@ -1,14 +1,3 @@
-"""Tests for py2bbr.targets: the target matrix and build-for-target report.
-
-The layer is cross-built (x86_64 host, target CPU from the board), so the
-report has to separate two questions that look alike: "does the build class
-compile against the *target* toolchain" (a property of the class) and "does
-this package work on *this* CPU" (a property of the target). Verdicts are
-therefore ``OK`` / ``RISK`` (builds, verify) / ``INCOMPATIBLE`` (cannot work).
-"""
-
-from __future__ import annotations
-
 import pytest
 
 from py2bbr.model import (

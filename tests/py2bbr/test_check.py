@@ -1,7 +1,3 @@
-"""Tests for py2bbr.check stage plumbing (no bitbake / network required)."""
-
-from __future__ import annotations
-
 import subprocess
 
 from py2bbr import check

@@ -1,7 +1,3 @@
-"""Small edge tests: errors, model, package, recipe corners."""
-
-from __future__ import annotations
-
 import io
 import tarfile
 
