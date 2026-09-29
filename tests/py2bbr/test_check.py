@@ -316,7 +316,7 @@ class TestRunChecks:
         results = check.run_checks(
             _meta(), _write(tmp_path, _CLEAN), None, None, level="bogus"
         )
-        assert [r.stage for r in results] == ["structural", "parse"]
+        assert [r.level for r in results] == ["structural", "parse"]
 
     def test_all_skipped(self, tmp_path, monkeypatch):
         p = _write(tmp_path, _CLEAN)
@@ -342,10 +342,10 @@ class TestRunChecks:
 
 
 class TestRunChecksAvailable:
-    """When a tool *is* available, the stage has to actually run it.
+    """When a tool *is* available, the level has to actually run it.
 
     The skipped branches are cheap to reach (monkeypatch the probe to say
-    "unavailable"), so the running branches need their own tests - a stage that
+    "unavailable"), so the running branches need their own tests - a level that
     silently skips whenever bitbake/kas/check-layer exist would report success
     without validating anything.
     """

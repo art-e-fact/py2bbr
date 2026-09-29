@@ -21,7 +21,7 @@ from pathlib import Path
 from packaging.requirements import InvalidRequirement, Requirement
 
 from py2bbr import __version__
-from py2bbr.check import DEFAULT_LEVEL, STAGES, run_checks
+from py2bbr.check import DEFAULT_LEVEL, LEVELS, run_checks
 from py2bbr.errors import MetadataNotFoundError, Py2BbrError
 from py2bbr.metadata import PipOptions, build_metadata
 from py2bbr.model import DEFAULT_YOCTO_VERSION, Dependency
@@ -287,7 +287,7 @@ def build_parser() -> argparse.ArgumentParser:
     checkg = p.add_argument_group("checks")
     checkg.add_argument(
         "--check",
-        choices=list(STAGES),
+        choices=list(LEVELS),
         default=DEFAULT_LEVEL,
         help="Validation ceiling: structural | parse | checklayer | build.",
     )
@@ -295,7 +295,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--check-timeout",
         type=int,
         default=1800,
-        help="Timeout (s) for each external check stage.",
+        help="Timeout (s) for each external check level.",
     )
 
     p.add_argument(
@@ -467,7 +467,7 @@ def _print_report(
             "SKIPPED": "·",
             "ERROR": "✗",
         }.get(r.status.value, "?")
-        print(f"  [{icon}] {r.stage:<11} {r.status.value:<8} {r.detail}")
+        print(f"  [{icon}] {r.level:<11} {r.status.value:<8} {r.detail}")
         for name, status, detail in r.items:
             print(f"        - {name}: {status.value} {detail}")
 

@@ -1,21 +1,3 @@
-"""Capability-gated recipe validation ladder.
-
-Stages, cheapest first:
-
-* ``structural``  - pure-Python checks on the generated ``.bb`` (always runs).
-* ``parse``       - ``bitbake -p <pn>`` (parse-only; needs bitbake + a
-                    sourced BUILDDIR).
-* ``checklayer``  - ``yocto-check-layer <layer>`` (needs the tool + BUILDDIR;
-                    runs ``bitbake world`` and is expensive).
-* ``build``       - ``kas build -c <kasfile>`` (needs kas + network; full build).
-
-``--check LEVEL`` selects the ceiling; every stage up to it that is not runnable
-in the current environment is reported as ``SKIPPED`` with the reason, so the
-output always shows exactly what was validated and what was not.
-"""
-
-from __future__ import annotations
-
 import logging
 import os
 import re
@@ -30,8 +12,8 @@ from py2bbr.recipe import bitbake_pn
 
 logger = logging.getLogger(__name__)
 
-#: Ordered stages, cheapest first. ``--check`` names the ceiling.
-STAGES = ("structural", "parse", "checklayer", "build")
+# Ordered levels, cheapest first.
+LEVELS = ("structural", "parse", "checklayer", "build")
 
 DEFAULT_LEVEL = "parse"
 _DEFAULT_TIMEOUT = 1800
@@ -47,10 +29,10 @@ class Status(StrEnum):
 
 @dataclass
 class CheckResult:
-    stage: str
+    level: str
     status: Status
     detail: str = ""
-    #: Individual sub-checks (for the structural stage).
+    #: Individual sub-checks (for the structural level).
     items: list[tuple[str, Status, str]] = field(default_factory=list)
 
     @property
@@ -276,9 +258,6 @@ def structural_check(recipe_path: Path) -> CheckResult:
     return CheckResult("structural", status, summary, items=items)
 
 
-# --------------------------------------------------------------------------- #
-# external stages
-# --------------------------------------------------------------------------- #
 def _run_cmd(
     cmd: list[str],
     cwd: str | None,
@@ -370,24 +349,24 @@ def run_checks(
     timeout: int = _DEFAULT_TIMEOUT,
 ) -> list[CheckResult]:
     """Run the validation ladder up to (and including) ``level``."""
-    if level not in STAGES:
+    if level not in LEVELS:
         level = DEFAULT_LEVEL
-    ceiling = STAGES.index(level)
+    ceiling = LEVELS.index(level)
     builddir = os.environ.get("BUILDDIR", "")
 
     results: list[CheckResult] = []
-    for stage in STAGES[: ceiling + 1]:
-        logger.info("check %s: running ...", stage)
+    for level in LEVELS[: ceiling + 1]:
+        logger.info("check %s: running ...", level)
         before = len(results)
-        if stage == "structural":
+        if level == "structural":
             results.append(structural_check(recipe_path))
-        elif stage == "parse":
+        elif level == "parse":
             avail, reason = _bitbake_available()
             if not avail:
                 results.append(CheckResult("parse", Status.SKIP, reason))
             else:
                 results.append(bitbake_parse(meta, builddir, timeout))
-        elif stage == "checklayer":
+        elif level == "checklayer":
             if layer_dir is None:
                 results.append(
                     CheckResult(
@@ -404,7 +383,7 @@ def run_checks(
                     )
                 else:
                     results.append(checklayer(layer_dir, builddir, timeout))
-        elif stage == "build":
+        elif level == "build":
             wd = workdir or (
                 Path(kas_file).parent / "kas-workdir"
                 if kas_file
@@ -417,5 +396,5 @@ def run_checks(
             else:
                 results.append(kas_build(kas_file, wd, timeout))
         for r in results[before:]:
-            logger.info("check %s: %s - %s", r.stage, r.status.value, r.detail)
+            logger.info("check %s: %s - %s", r.level, r.status.value, r.detail)
     return results
