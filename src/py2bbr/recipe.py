@@ -1017,6 +1017,13 @@ _WHEEL_QA_SKIP = """\
 # too; the external system libraries the binaries need are called out in the
 # report and in the comment below so the target rootfs cannot silently miss
 # them.
+#
+# Waiving the check must not let the *renamed* tokens through unresolved
+# either: rpm still emits them as do_rootfs requires
+# (libudev-8d5af18d.so.1.6.11(LIBUDEV_183)(64bit)), and unless the package
+# provides them the image fails to assemble. The bundled libraries ship inside
+# the wheel, so the recipe re-provides those tokens itself (see
+# _render_bundled_libs_block) - the only provider that can exist.
 INSANE_SKIP:${PN} = "already-stripped file-rdeps"
 """
 
@@ -1081,6 +1088,66 @@ def _render_external_libs_comment(sonames: list[str]) -> str:
         "between distros - so make sure"
     )
     lines.append("# the image provides them when this package is used.")
+    return "\n".join(lines)
+
+
+def _render_bundled_libs_block(bundled: dict[str, list[str]]) -> str:
+    """Recipe comment + ``RPROVIDES`` re-exporting the wheel's bundled sidecar
+    libraries.
+
+    The companion to :data:`_WHEEL_QA_SKIP`'s part two: auditwheel renamed the
+    bundled libraries and rewrote the consumers' ``DT_NEEDED`` to those names,
+    so ``do_package``'s shlib scan turns every versioned symbol into a require
+    under the *renamed* soname (``libblkid-e4a77f31.so.1.1.0(BLKID_1.0)(64bit)``)
+    while providing the symbols under neither the renamed nor the original name.
+    ``INSANE_SKIP`` only silences the check - the requires still reach the rpm,
+    and ``do_rootfs`` aborts with "nothing provides". The libraries ship inside
+    this wheel, so this package provides the cross tokens itself: the only
+    provider that can exist. Every token is ``<soname>(<version>)(64bit)`` (or
+    ``<soname>()(64bit)`` for the unversioned ``DT_NEEDED`` reference), the
+    exact form rpm emits on an aarch64/x86_64 target (the ``(64bit)`` arch
+    suffix is what plain ELF64 objects get on both).
+    """
+    tokens_by_soname: list[str] = []
+    for soname, versions in bundled.items():
+        # Consumers' DT_NEEDED records the renamed soname with no version, so
+        # rpm requires the bare `soname()(64bit)` token in addition to the
+        # versioned symbols; both must be re-provided.
+        tokens = [f"{soname}()(64bit)"]
+        tokens += [f"{soname}({version})(64bit)" for version in versions]
+        tokens_by_soname.append(" ".join(tokens))
+    if not tokens_by_soname:
+        return ""
+    lines: list[str] = []
+    lines.append(
+        "# The sidecar libraries bundled with this wheel are an auditwheel "
+        "rename of"
+    )
+    lines.append(
+        "# system libraries, and rpm needs their versioned symbols under the "
+        "renamed"
+    )
+    lines.append(
+        "# soname (e.g. libblkid-e4a77f31.so.1.1.0(BLKID_1.0)(64bit)) while "
+        "providing"
+    )
+    lines.append(
+        "# them under neither. The libraries ship inside the wheel, so this "
+        "package"
+    )
+    lines.append(
+        "# provides those tokens itself; without this, do_rootfs fails with "
+        '"nothing provides" for every versioned symbol they define.'
+    )
+    lines.append(
+        "# One assignment per bundled library keeps every line's quotes "
+        "balanced (the"
+    )
+    lines.append(
+        "# structural check py2bbr runs on its own recipes rejects bitbake "
+        "line continuations)."
+    )
+    lines += [f'RPROVIDES:${{PN}} += "{group}"' for group in tokens_by_soname]
     return "\n".join(lines)
 
 
@@ -1154,6 +1221,11 @@ def _render_wheel_recipe(
         # Same check that _WHEEL_QA_SKIP waived, preserved as information: the
         # external system libraries this wheel's binaries really link against.
         lines.append(_render_external_libs_comment(meta.external_needed_libs))
+        lines.append("")
+    if meta.bundled_lib_versions:
+        # The renamed sidecar tokens rpm still requires from this package - it
+        # is the only provider that can exist (they are bundled, not system).
+        lines.append(_render_bundled_libs_block(meta.bundled_lib_versions))
         lines.append("")
     lines.append('BBCLASSEXTEND = "native nativesdk"')
     lines.append("")

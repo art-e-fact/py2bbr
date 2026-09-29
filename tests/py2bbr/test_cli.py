@@ -130,6 +130,16 @@ class TestBuildParser:
         args = cli.build_parser().parse_args(["black", "--jobs", "2"])
         assert args.jobs == 2
 
+    def test_major_bump_cap_default_and_flag(self):
+        # The same-major cap is ON by default; --no-major-bump-cap disables it.
+        assert cli.build_parser().parse_args(["black"]).cap_major_bump is True
+        assert (
+            cli.build_parser()
+            .parse_args(["black", "--no-major-bump-cap"])
+            .cap_major_bump
+            is False
+        )
+
 
 def _source(tmp_path) -> FetchedSource:
     p = tmp_path / "black-26.5.1.tar.gz"
@@ -198,6 +208,48 @@ class TestMain:
         ).is_file()
         assert (out / "meta-black" / "conf" / "layer.conf").is_file()
         assert (out / "py2bbr.kas.yml").is_file()
+
+    def test_major_bump_cap_reaches_every_fetch(
+        self, tmp_path, monkeypatch, meta, make_meta_fn
+    ):
+        # The cap flag is threaded into build_metadata for the top package and
+        # every closure member; with --no-major-bump-cap every fetch must see
+        # the flag cleared.
+        seen = []
+        src = _source(tmp_path)
+
+        def fake(name, *a, **k):
+            seen.append(k.get("cap_major_bump"))
+            if name == meta.name:
+                return meta, src
+            member = make_meta_fn(
+                name=name,
+                canonical_name=name,
+                version="1.0.0",
+                runtime_deps=[],
+            )
+            return member, src
+
+        monkeypatch.setattr(cli, "build_metadata", fake)
+        rc = cli.main(
+            ["black", "-o", str(tmp_path / "on"), "--check", "structural"]
+        )
+        assert rc == 0
+        assert seen and all(v is True for v in seen)
+
+        seen.clear()
+        rc = cli.main(
+            [
+                "black",
+                "-o",
+                str(tmp_path / "off"),
+                "--check",
+                "structural",
+                "--no-major-bump-cap",
+            ]
+        )
+        assert rc == 0
+        assert seen and all(v is False for v in seen)
 
     def test_wheel_report_and_recipe_waive_the_strip_check(
         self, tmp_path, monkeypatch, capsys, make_meta_fn

@@ -98,6 +98,7 @@ providers.
 | `--skip-dep NAME` | Exclude a dependency from the closure (repeatable; canonical names). |
 | `--targets LIST` | Restrict the build-for-target report to these target keys (comma-separated, e.g. `zynqmp,versal`); an unknown key is reported and ignored. Default: the whole matrix. |
 | `--jobs N` | Fetch closure dependencies in parallel (default `4`; `1` = sequential). Each in-flight fetch shows its own live progress bar on stderr (TTY only). The top package and its direct deps keep their order; deeper members always come after the member that discovered them, but members found by two concurrent parents can interleave at the same depth (order has no effect on the generated layer, since bitbake follows `RDEPENDS`). |
+| `--no-major-bump-cap` | Do not cap transitive dependency majors. By default every dependency with a lower bound (`numpy>=1.21.0`) is resolved as `numpy>=1.21.0,<2` — the newest release of the floor's major series (1.x), never a later major (2.x) whose surprise jump could break a rebuild (numpy 1.x → 2.x breaking OpenCV's generators is what this guards). Already-bounded bounds (`~=`, `<`, `<=`, `==`) and 0.x floors pass through verbatim. |
 | `-q`, `-v` | Logging: INFO stage progress lines on stderr (default); `-q` restricts to warnings/errors (and disables the live fetch progress bars); `-v` adds DEBUG detail (per-package fetch/parse summaries, public-PyPI reachability). |
 
 ## Target runtime (Python version + CPU)

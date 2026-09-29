@@ -1944,6 +1944,57 @@ class TestVendoredWheelRecipe:
         )
         assert "Typical OE providers are glib-2.0, gstreamer1.0" in warned
 
+    def test_reprovides_bundled_sidecar_lib_tokens(self, make_meta_fn, yocto):
+        # The wheel bundles auditwheel-renamed copies of system libraries
+        # (pyvizionsdk.libs/*.so*). rpm emits requires for the versioned
+        # symbols under the renamed soname - libblkid-e4a77f31.so.1.1.0(BLKID_1.0)
+        # (64bit) - which no other package can provide; the libraries ship in
+        # this wheel, so the recipe provides those tokens itself or do_rootfs
+        # fails with "nothing provides".
+        meta = self._wheel_meta(
+            make_meta_fn,
+            source_filename=(
+                "pyvizionsdk-26.9.1-cp312-cp312-manylinux_2_31_aarch64.whl"
+            ),
+            ships_prebuilt_binaries=True,
+            external_needed_libs=["libgstreamer-1.0.so.0"],
+            bundled_lib_versions={
+                "libblkid-e4a77f31.so.1.1.0": [
+                    "BLKID_1.0",
+                    "BLKID_2.15",
+                    "BLKID_2.17",
+                ],
+                "libudev-8d5af18d.so.1.6.11": ["LIBUDEV_183"],
+            },
+        )
+        text, _ = render_recipe(meta, yocto)
+        # One RPROVIDES assignment per bundled library, each with balanced
+        # quotes (bitbake line continuations would fail py2bbr's own structural
+        # check). The unversioned DT_NEEDED reference yields a bare
+        # soname()(64bit) require; rpm needs that token provided next to the
+        # versioned ones.
+        assert (
+            'RPROVIDES:${PN} += "libblkid-e4a77f31.so.1.1.0()(64bit) '
+            "libblkid-e4a77f31.so.1.1.0(BLKID_1.0)(64bit) "
+            "libblkid-e4a77f31.so.1.1.0(BLKID_2.15)(64bit) "
+            'libblkid-e4a77f31.so.1.1.0(BLKID_2.17)(64bit)"' in text
+        )
+        assert (
+            'RPROVIDES:${PN} += "libudev-8d5af18d.so.1.6.11()(64bit) '
+            'libudev-8d5af18d.so.1.6.11(LIBUDEV_183)(64bit)"' in text
+        )
+        # The dialog right before the block names the failure it prevents.
+        assert 'do_rootfs fails with "nothing' in text
+        # The runtime package dependencies stay as generated.
+        assert 'RDEPENDS:${PN} += "python3-click python3-packaging"' in text
+
+    def test_pure_python_wheel_omits_bundled_lib_provides(
+        self, make_meta_fn, yocto
+    ):
+        # No bundled libraries -> no RPROVIDES block at all.
+        text, _ = render_recipe(self._wheel_meta(make_meta_fn), yocto)
+        assert "RPROVIDES:${PN}" not in text
+
     def test_pure_python_wheel_stays_quiet_about_external_libs(
         self, make_meta_fn, yocto
     ):

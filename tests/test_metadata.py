@@ -15,6 +15,7 @@ import zipfile
 from pathlib import Path
 
 import pytest
+from packaging.version import InvalidVersion
 
 from py2bbr import metadata as M
 from py2bbr.errors import MetadataError, MetadataNotFoundError
@@ -129,6 +130,93 @@ class TestClassifyRequiresDist:
         )
         assert runtime == []
         assert dropped[0].kind is DepKind.DROPPED
+
+    def test_floor_capped_to_same_major(self):
+        # Default behaviour: numpy>=1.21.0 resolves within 1.x (<2), never 2.x.
+        runtime, _b, _d = classify_requires_dist(["numpy>=1.21.0"], self.y)
+        assert runtime[0].requirement == "numpy>=1.21.0,<2"
+        assert runtime[0].specifier == ">=1.21.0,<2"
+
+    def test_cap_disabled_keeps_upstream_bounds(self):
+        runtime, _b, _d = classify_requires_dist(
+            ["numpy>=1.21.0"], self.y, cap_major_bump=False
+        )
+        assert runtime[0].requirement == "numpy>=1.21.0"
+        assert runtime[0].specifier == ">=1.21.0"
+
+
+class TestApplyMajorCap:
+    def test_basic(self):
+        assert M.apply_major_cap("numpy>=1.21.0") == (
+            "numpy>=1.21.0,<2",
+            ">=1.21.0,<2",
+        )
+
+    def test_user_example(self):
+        # mypackage>=2.3.1 -> newest 2.x, never 3.x or later.
+        assert M.apply_major_cap("mypackage>=2.3.1") == (
+            "mypackage>=2.3.1,<3",
+            ">=2.3.1,<3",
+        )
+
+    def test_strict_floor_is_capped(self):
+        assert M.apply_major_cap("numpy>1.19") == ("numpy>1.19,<2", ">1.19,<2")
+
+    def test_highest_floor_wins(self):
+        req, spec = M.apply_major_cap("pkg>=2.0,>=2.5")
+        assert req == "pkg>=2.0,>=2.5,<3"
+        assert spec == ">=2.0,>=2.5,<3"
+
+    def test_exclusions_survive(self):
+        req, spec = M.apply_major_cap("pkg>=2.0,!=1.5")
+        assert req.count("!=1.5") == 1
+        assert req.endswith(",<3")
+        assert spec.endswith(",<3")
+
+    def test_marker_stays_trailing_and_valid(self):
+        req, spec = M.apply_major_cap('numpy>=1.21.0; python_version < "3.11"')
+        assert req == 'numpy>=1.21.0,<2; python_version < "3.11"'
+        assert spec == ">=1.21.0,<2"
+
+    def test_extras_preserved(self):
+        assert M.apply_major_cap("numpy[test]>=1.21.0") == (
+            "numpy[test]>=1.21.0,<2",
+            ">=1.21.0,<2",
+        )
+
+    def test_already_bounded_untouched(self):
+        assert M.apply_major_cap("foo>=1.0,<3")[0] == "foo>=1.0,<3"
+        assert M.apply_major_cap("foo<2.0")[0] == "foo<2.0"
+        assert M.apply_major_cap("foo<=2.0")[0] == "foo<=2.0"
+        assert M.apply_major_cap("foo~=1.4.2")[0] == "foo~=1.4.2"
+
+    def test_pinned_untouched(self):
+        assert M.apply_major_cap("foo==2.3.1")[0] == "foo==2.3.1"
+        assert M.apply_major_cap("foo===2.3.1")[0] == "foo===2.3.1"
+
+    def test_no_floor_untouched(self):
+        assert M.apply_major_cap("foo")[0] == "foo"
+        assert M.apply_major_cap("foo!=1.0")[0] == "foo!=1.0"
+
+    def test_zero_floor_untouched(self):
+        # A 0.x floor is no "major series" promise: capping >=0.5 to <1 would
+        # prefer a years-old 0.x release over the current one upstream tests.
+        assert M.apply_major_cap("foo>=0.5")[0] == "foo>=0.5"
+        assert M.apply_major_cap("foo>=0")[0] == "foo>=0"
+
+    def test_unparseable_untouched(self):
+        assert M.apply_major_cap("not a requirement !!!")[0] == (
+            "not a requirement !!!"
+        )
+
+    def test_unversionable_floor_untouched(self, monkeypatch):
+        # A floor text packaging cannot turn into a Version (defensive guard
+        # against odd distro-patched metadata) passes through uncapped.
+        def explode(text, *a, **k):
+            raise InvalidVersion(text)
+
+        monkeypatch.setattr(M, "Version", explode)
+        assert M.apply_major_cap("foo>=1.0")[0] == "foo>=1.0"
 
 
 class TestDetectLicense:
@@ -776,6 +864,34 @@ class TestBuildMetadata:
         assert [d.name for d in meta.build_deps] == ["hatchling"]
         assert [d.name for d in meta.dropped_deps] == ["tomli", "colorama"]
         assert meta.resolved_from == "https://pypi.org"
+
+    def test_major_cap_applied_by_default(self, tmp_path, monkeypatch):
+        # click>=8.0.0 -> click>=8.0.0,<9 and hatchling>=1.27.0 ->
+        # hatchling>=1.27.0,<2: the ceiling rides on the recorded requirements
+        # so resolution AND reporting agree.
+        src = _sdist_src(_sdist(tmp_path, _FULL_MEMBERS))
+        monkeypatch.setattr(M, "fetch_source", lambda *a, **k: src)
+        meta, _ = M.build_metadata(
+            "black", "26.5.1", PipOptions(), tmp_path, yocto=M.default_yocto()
+        )
+        assert meta.runtime_deps[0].requirement == "click>=8.0.0,<9"
+        assert meta.runtime_deps[0].specifier == ">=8.0.0,<9"
+        assert meta.build_deps[0].requirement == "hatchling>=1.27.0,<2"
+
+    def test_major_cap_disabled_keeps_bounds(self, tmp_path, monkeypatch):
+        src = _sdist_src(_sdist(tmp_path, _FULL_MEMBERS))
+        monkeypatch.setattr(M, "fetch_source", lambda *a, **k: src)
+        meta, _ = M.build_metadata(
+            "black",
+            "26.5.1",
+            PipOptions(),
+            tmp_path,
+            yocto=M.default_yocto(),
+            cap_major_bump=False,
+        )
+        assert meta.runtime_deps[0].requirement == "click>=8.0.0"
+        assert meta.runtime_deps[0].specifier == ">=8.0.0"
+        assert meta.build_deps[0].requirement == "hatchling>=1.27.0"
 
     def test_resolved_from_index(self, tmp_path, monkeypatch):
         src = _sdist_src(_sdist(tmp_path, _FULL_MEMBERS))
@@ -1899,6 +2015,7 @@ def _elf64_bytes(
     vaddr_base: int = 0x400000,
     elf_class: int = 2,
     elf_data: int = 1,
+    versions: tuple[str, ...] = (),
 ) -> bytes:
     """A minimal dynamic ELF64 that py2bbr's reader understands.
 
@@ -1906,13 +2023,27 @@ def _elf64_bytes(
     table``), not the file offset: wheel DSOs sit at a nonzero load base, and
     the vaddr->offset mapping through PT_LOAD is exactly what the parser has to
     get right.
+
+    ``versions`` appends a minimal ``.gnu.version_d`` - a base node named by
+    the library file (which the reader must drop) followed by one node per
+    version - so tests can exercise the renamed-soname/symbol-version cross
+    that rpm cannot resolve on its own.
     """
     strings: dict[str, int] = {}
     table = b"\x00"
-    for name in list(needed) + ([soname] if soname else []):
+    version_names = list(versions)
+    base_name = soname or "libbase.so.1"  # the .gnu.version_d file-name node
+    for name in (
+        list(needed)
+        + ([soname] if soname else [])
+        + version_names
+        + [base_name]
+    ):
         if name not in strings:
             strings[name] = len(table)
             table += name.encode() + b"\x00"
+    vd_count = len(version_names) + 1  # base node names the library file
+    verdef_size = vd_count * 28
     entries = [
         (5, vaddr_base + 0),  # DT_STRTAB placeholder, patched below
         (10, len(table)),  # DT_STRSZ
@@ -1921,13 +2052,17 @@ def _elf64_bytes(
         entries.append((1, strings[name]))  # DT_NEEDED
     if soname is not None:
         entries.append((14, strings[soname]))  # DT_SONAME
+    entries.append((0x6FFFFFFC, 0))  # DT_VERDEF placeholder, patched below
+    entries.append((0x6FFFFFFD, vd_count))  # DT_VERDEFNUM
     entries.append((0, 0))  # DT_NULL
 
     phdr_off = 64
     dyn_off = phdr_off + 2 * 56
     strtab_off = dyn_off + len(entries) * 16
-    size = strtab_off + len(table)
+    verdef_off = strtab_off + len(table)
+    size = verdef_off + verdef_size
     entries[0] = (5, vaddr_base + strtab_off)  # real string-table vaddr
+    entries[-3] = (0x6FFFFFFC, vaddr_base + verdef_off)  # real verdef vaddr
 
     out = bytearray(size)
     out[0:4] = b"\x7fELF"
@@ -1964,7 +2099,26 @@ def _elf64_bytes(
     for i, (tag, val) in enumerate(entries):
         struct.pack_into("<q", out, dyn_off + i * 16, tag)
         struct.pack_into("<Q", out, dyn_off + i * 16 + 8, val)
-    out[strtab_off:] = table
+    # Bounded write: a bare slice assignment would resize the buffer down to
+    # strtab + table, truncating the verdef region that follows it.
+    out[strtab_off : strtab_off + len(table)] = table
+
+    # .gnu.version_d: a base node (the library file name, dropped by the
+    # reader) then one 20-byte Elf64_Verdef + 8-byte Elf64_Verdaux per version.
+    for i, vname in enumerate([base_name] + version_names):
+        node = verdef_off + i * 28
+        struct.pack_into("<H", out, node, 1)  # vd_version
+        struct.pack_into("<H", out, node + 2, 0)  # vd_flags
+        struct.pack_into("<H", out, node + 4, 1)  # vd_cnt
+        struct.pack_into("<I", out, node + 8, 0)  # vd_hash
+        struct.pack_into("<I", out, node + 12, 20)  # vd_aux -> first aux
+        # vd_next: 28 for every node but the last.
+        struct.pack_into(
+            "<I", out, node + 16, 28 if i < len(version_names) else 0
+        )
+        aux = node + 20
+        struct.pack_into("<I", out, aux, strings[vname])  # vda_name
+        struct.pack_into("<I", out, aux + 4, 0)  # vda_next
     return bytes(out)
 
 
@@ -2062,9 +2216,9 @@ class TestWheelExternalNeededLibs:
         assert M.wheel_external_needed_libs(bogus) == []
 
     def test_elf_reader_defensive_branches(self):
-        # The reader must degrade to (None, []) on every malformed shape it
+        # The reader must degrade to (None, [], []) on every malformed shape it
         # can meet, not raise: a vendored wheel is informational input.
-        assert M._elf64_dynamic_tags(b"") == (None, [])
+        assert M._elf64_dynamic_tags(b"") == (None, [], [])
         # e_phentsize == 0 (no program header table).
         header = bytearray(64)
         header[0:4] = b"\x7fELF"
@@ -2072,13 +2226,13 @@ class TestWheelExternalNeededLibs:
         header[5] = 1
         struct.pack_into("<H", header, 16, 3)
         struct.pack_into("<H", header, 56, 1)
-        assert M._elf64_dynamic_tags(bytes(header)) == (None, [])
+        assert M._elf64_dynamic_tags(bytes(header)) == (None, [], [])
         # phpnum points past EOF -> the phdr scan breaks early and there is no
         # dynamic section.
         struct.pack_into("<Q", header, 32, 64)
         struct.pack_into("<H", header, 54, 56)
         struct.pack_into("<H", header, 56, 2)
-        assert M._elf64_dynamic_tags(bytes(header)) == (None, [])
+        assert M._elf64_dynamic_tags(bytes(header)) == (None, [], [])
         # A PT_DYNAMIC that never sets DT_STRTAB.
         phoff, doff, dynsz = 64, 64 + 56, 32
         blob = bytearray(phoff + 56 + dynsz)  # header + 1 phdr + 2 dyn entries
@@ -2093,11 +2247,99 @@ class TestWheelExternalNeededLibs:
         struct.pack_into("<q", blob, doff, 1)  # DT_NEEDED
         struct.pack_into("<Q", blob, doff + 8, 98)  # index into nothing
         struct.pack_into("<q", blob, doff + 16, 0)  # DT_NULL
-        assert M._elf64_dynamic_tags(bytes(blob)) == (None, [])
+        assert M._elf64_dynamic_tags(bytes(blob)) == (None, [], [])
         # String-table lookups: out-of-range index, and a pointer with no NUL
         # terminator within the cap.
         assert M._elf_strtab_lookup(b"ab\x00cd", 0, 5, 99) == ""
         assert M._elf_strtab_lookup(b"ab" + b"\xff" * 600, 0, 602, 2) == ""
+
+
+class TestWheelBundledLibVersions:
+    """The symbol versions the wheel's bundled sidecar libraries define.
+
+    The rpm cross that motivates this: an auditwheel build renames the
+    bundled library (libblkid-e4a77f31.so.1.1.0) and rewrites consumers'
+    DT_NEEDED to that name, while the library's .gnu.version_d still records
+    the original names; rpm then requires
+    libblkid-e4a77f31.so.1.1.0(BLKID_1.0)(64bit) and no package provides it.
+    The recipe re-provides exactly these tokens (see recipe.py), keyed by
+    what this function returns.
+    """
+
+    @staticmethod
+    def _wheel(
+        tmp_path: Path, members: dict[str, bytes], name: str = "pkg-1.0-any.whl"
+    ) -> Path:
+        path = tmp_path / name
+        with zipfile.ZipFile(path, "w") as zf:
+            for member, data in members.items():
+                zf.writestr(member, data)
+        return path
+
+    def test_bundled_sidecar_versions(self, tmp_path):
+        # Two auditwheel-renamed sidecars, each defining versioned symbols;
+        # the base node (the library file name) must be dropped.
+        blkid = _elf64_bytes(
+            [],
+            soname="libblkid-e4a77f31.so.1.1.0",
+            versions=("BLKID_1.0", "BLKID_2.17"),
+        )
+        udev = _elf64_bytes(
+            [], soname="libudev-8d5af18d.so.1.6.11", versions=("LIBUDEV_183",)
+        )
+        whl = self._wheel(
+            tmp_path,
+            {
+                "pyvizionsdk.libs/libblkid-e4a77f31.so.1.1.0": blkid,
+                "pyvizionsdk.libs/libudev-8d5af18d.so.1.6.11": udev,
+            },
+        )
+        assert M.wheel_bundled_lib_versions(whl) == {
+            "libblkid-e4a77f31.so.1.1.0": ["BLKID_1.0", "BLKID_2.17"],
+            "libudev-8d5af18d.so.1.6.11": ["LIBUDEV_183"],
+        }
+
+    def test_extension_modules_contribute_nothing(self, tmp_path):
+        # A compiled extension module has no DT_SONAME and (in this build) no
+        # version definitions: it is not a bundled library and must not appear.
+        core = _elf64_bytes(["libglib-2.0.so.0"])
+        sidecar = _elf64_bytes(
+            [], soname="libgstvideo-1.0.so.0", versions=("GSTVIDEO_1_0",)
+        )
+        whl = self._wheel(
+            tmp_path,
+            {
+                "pyvizionsdk/_core.cpython-312-aarch64-linux-gnu.so": core,
+                "pyvizionsdk.libs/libgstvideo-1.0.so.0": sidecar,
+            },
+        )
+        assert M.wheel_bundled_lib_versions(whl) == {
+            "libgstvideo-1.0.so.0": ["GSTVIDEO_1_0"]
+        }
+
+    def test_sorted_and_deduplicated(self, tmp_path):
+        # Two members carrying the same soname (e.g. a hardlink duplicated by
+        # the build) still yield one sorted, deduplicated entry.
+        blob = _elf64_bytes([], soname="libm.so.6", versions=("GLIBC_2.17",))
+        whl = self._wheel(
+            tmp_path,
+            {
+                "pkg.libs/libm.so.6": blob,
+                "pkg.libs/dupe/libm.so.6": blob,
+            },
+        )
+        assert M.wheel_bundled_lib_versions(whl) == {
+            "libm.so.6": ["GLIBC_2.17"]
+        }
+
+    def test_best_effort_failures(self, tmp_path):
+        # Corrupt archive and a wheel with no parseable .so members both give
+        # {} - informational input must never raise.
+        bogus = tmp_path / "pkg-1.0-cp312-cp312-manylinux_2_31_aarch64.whl"
+        bogus.write_bytes(b"not a zip archive")
+        assert M.wheel_bundled_lib_versions(bogus) == {}
+        empty = self._wheel(tmp_path, {"pkg/README.txt": b"no binaries"})
+        assert M.wheel_bundled_lib_versions(empty) == {}
 
 
 class TestVcsBuildSystem:

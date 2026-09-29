@@ -190,6 +190,20 @@ def build_parser() -> argparse.ArgumentParser:
             "dependency closure (1 = sequential)."
         ),
     )
+    out.add_argument(
+        "--no-major-bump-cap",
+        dest="cap_major_bump",
+        action="store_false",
+        default=True,
+        help=(
+            "Do not add a same-major upper bound when resolving dependencies "
+            "with a lower bound. By default each version floor is fetched as "
+            '"<floor>,<major+1>" (numpy>=1.21.0 becomes numpy>=1.21.0,<2), so '
+            "the newest release of the floor's major series is picked instead "
+            "of a later major whose surprise jump could break the build; pass "
+            "this flag to honour upstream bounds verbatim."
+        ),
+    )
 
     yocto = p.add_argument_group("yocto")
     yocto.add_argument(
@@ -422,6 +436,7 @@ def _print_report(
             print(f"               (read from {meta.build_backend_source})")
         print(f"Runtime deps : {len(meta.runtime_deps)}")
         print(f"External libs: {', '.join(meta.external_needed_libs) or '-'}")
+        print(f"Bundled libs : {', '.join(meta.bundled_lib_versions) or '-'}")
         print(
             f"Dropped deps : {len(meta.dropped_deps)}"
             + (
@@ -600,6 +615,7 @@ def _provision_build_tools(
                     keep=args.keep_sources,
                     requirement=dep.requirement,
                     check_public=True,
+                    cap_major_bump=args.cap_major_bump,
                 )
         except MetadataNotFoundError as exc:
             warnings_extra.append(f"could not provision {dep.name}: {exc}")
@@ -681,6 +697,7 @@ def main(argv: list[str] | None = None) -> int:
                 yocto=yocto,
                 keep=args.keep_sources,
                 check_public=True,
+                cap_major_bump=args.cap_major_bump,
             )
         # Path of the artifact each closure member was fetched from, keyed by
         # canonical name: vendored members copy their sdist into the layer.
@@ -706,6 +723,7 @@ def main(argv: list[str] | None = None) -> int:
                         keep=args.keep_sources,
                         requirement=req.requirement,
                         check_public=True,
+                        cap_major_bump=args.cap_major_bump,
                     )
                 closure_sources[member.canonical_name] = msource.path
                 return member, msource

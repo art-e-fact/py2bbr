@@ -47,6 +47,7 @@ from pathlib import Path, PurePosixPath
 from packaging.markers import default_environment
 from packaging.requirements import InvalidRequirement, Requirement
 from packaging.utils import InvalidWheelFilename, parse_wheel_filename
+from packaging.version import InvalidVersion, Version
 
 from py2bbr.errors import MetadataError, MetadataNotFoundError
 from py2bbr.model import (
@@ -507,9 +508,11 @@ def fetch_source(
 
     ``requirement``, when given, is used verbatim as the ``pip download``
     requirement instead of ``name``/``version``. This is how the dependency
-    closure resolver passes the raw requirement (with its bounds, e.g.
-    ``tomli>=1.0.2``) through to pip so the upstream bounds are honoured when
-    picking versions.
+    closure resolver passes a dependency's requirement (with its bounds, e.g.
+    ``tomli>=1.0.2``) through to pip so the declared bounds are honoured when
+    picking versions. The requirement has usually already been capped to the
+    same-major series by :func:`apply_major_cap` during classification
+    (``tomli>=1.0.2,<2``), unless ``--no-major-bump-cap`` was passed.
 
     With ``check_public=True``, ``public_reachable`` records whether the
     ``pypi`` class' fetch URL for the artifact answers on public PyPI
@@ -1386,15 +1389,27 @@ _DT_NEEDED = 1
 _DT_STRTAB = 5
 _DT_STRSZ = 10
 _DT_SONAME = 14
+#: ``DT_VERDEF`` / ``DT_VERDEFNUM`` point at the ``.gnu.version_d`` table whose
+#: entries name the symbol versions (``BLKID_1.0``, ``LIBUDEV_183``, ...) a
+#: bundled library defines.
+_DT_VERDEF = 0x6FFFFFFC
+_DT_VERDEFNUM = 0x6FFFFFFD
 #: Long enough for any real .dynstr entry; guards against a corrupt strtab
 #: making the parser read to the end of file for a phantom index.
 _MAX_DYNSTR = 512
+#: Sanity caps on the ``.gnu.version_d`` walk: a real library has a handful of
+#: version nodes (glibc's libc has ~40); anything beyond the cap is corrupt
+#: input, not a library.
+_MAX_VERDEF = 256
 
 
-def _elf64_dynamic_tags(data: bytes) -> tuple[str | None, list[str]]:
-    """Read ``(DT_SONAME, DT_NEEDED)`` out of an ELF64 little-endian blob.
+def _elf64_dynamic_tags(
+    data: bytes,
+) -> tuple[str | None, list[str], list[str]]:
+    """Read ``(DT_SONAME, DT_NEEDED, symbol versions)`` out of an ELF64
+    little-endian blob.
 
-    Returns ``(None, [])`` for anything that is not a recognisable dynamic
+    Returns ``(None, [], [])`` for anything that is not a recognisable dynamic
     ELF64 LSB file (32-bit, big-endian, or not ELF at all) - wheels for OE
     targets are built by manylinux/musllinux toolchains in this one shape.
 
@@ -1402,16 +1417,22 @@ def _elf64_dynamic_tags(data: bytes) -> tuple[str | None, list[str]]:
     nonzero base, so the table is mapped back to a file offset through the
     ``PT_LOAD`` segments before the ``DT_NEEDED``/``DT_SONAME`` string-table
     indices are read.
+
+    The symbol versions are the version-definition names from
+    ``.gnu.version_d`` - the ``BLKID_1.0`` half of a versioned symbol - with
+    the table's own base entry (whose name repeats the library file, like
+    ``libblkid.so.1``) dropped, since that is a file name, not a symbol
+    version.
     """
     if len(data) < 0x40 or data[:4] != _ELF_MAGIC:
-        return (None, [])
+        return (None, [], [])
     if data[4] != 2 or data[5] != 1:  # ELF64, little-endian
-        return (None, [])
+        return (None, [], [])
     (e_phoff,) = struct.unpack_from("<Q", data, 0x20)
     (e_phentsize,) = struct.unpack_from("<H", data, 0x36)
     (e_phnum,) = struct.unpack_from("<H", data, 0x38)
     if not e_phentsize or not e_phnum:
-        return (None, [])
+        return (None, [], [])
     loads: list[tuple[int, int, int]] = []  # (vaddr, filesz, offset)
     dyn: list[tuple[int, int]] = []  # (offset, filesz)
     for i in range(e_phnum):
@@ -1437,6 +1458,8 @@ def _elf64_dynamic_tags(data: bytes) -> tuple[str | None, list[str]]:
     soname: int | None = None
     strtab: int | None = None
     strsz = 0
+    verdef: int | None = None  # file offset of .gnu.version_d
+    verdefnum = 0
     for p_offset, p_filesz in dyn:
         end = min(p_offset + p_filesz, len(data))
         pos = p_offset
@@ -1453,9 +1476,13 @@ def _elf64_dynamic_tags(data: bytes) -> tuple[str | None, list[str]]:
                 strsz = d_val
             elif d_tag == _DT_SONAME:
                 soname = d_val
+            elif d_tag == _DT_VERDEF:
+                verdef = file_offset_of(d_val)
+            elif d_tag == _DT_VERDEFNUM:
+                verdefnum = d_val
             pos += 16
     if strtab is None:
-        return (None, [])
+        return (None, [], [])
     names = [
         name
         for idx in needed
@@ -1466,7 +1493,45 @@ def _elf64_dynamic_tags(data: bytes) -> tuple[str | None, list[str]]:
         if soname is not None
         else None
     )
-    return (soname_name, names)
+    versions = (
+        _elf64_verdef_names(data, strtab, strsz, verdef, verdefnum)
+        if verdef is not None
+        else []
+    )
+    return (soname_name, names, versions)
+
+
+def _elf64_verdef_names(
+    data: bytes, strtab: int, strsz: int, verdef: int, verdefnum: int
+) -> list[str]:
+    """The symbol-version names a dynamic ELF64 defines, from
+    ``.gnu.version_d``.
+
+    Each version node carries one or more ``Elf64_Verdaux`` auxiliary entries;
+    the first names the version (``BLKID_1.0``, ``LIBUDEV_183``, ...). The
+    table's own base node names the library file itself (``libblkid.so.1``)
+    rather than a symbol version, and is dropped. ``verdef`` is the *file
+    offset* of the table (callers map the ``DT_VERDEF`` virtual address through
+    the load segments). Returns ``[]`` for corrupt or unexpected layouts -
+    best-effort, like every other wheel read here.
+    """
+    if verdefnum < 1 or verdefnum > _MAX_VERDEF:
+        return []
+    versions: list[str] = []
+    pos = verdef
+    for _ in range(min(verdefnum, _MAX_VERDEF)):
+        if pos + 20 > len(data):
+            break
+        (vd_aux, vd_next) = struct.unpack_from("<II", data, pos + 12)
+        if pos + vd_aux + 8 <= len(data):
+            (vda_name,) = struct.unpack_from("<I", data, pos + vd_aux)
+            name = _elf_strtab_lookup(data, strtab, strsz, vda_name)
+            if name and ".so" not in name:
+                versions.append(name)
+        if not vd_next:
+            break
+        pos += vd_next
+    return versions
 
 
 def _elf_strtab_lookup(data: bytes, strtab: int, strsz: int, idx: int) -> str:
@@ -1505,7 +1570,7 @@ def wheel_external_needed_libs(filename: str | os.PathLike[str]) -> list[str]:
                     payload = zf.read(info)
                 except (OSError, zipfile.BadZipFile):
                     continue
-                soname, deps = _elf64_dynamic_tags(payload)
+                soname, deps, _versions = _elf64_dynamic_tags(payload)
                 if soname is None and not deps:
                     # A non-ELF member whose name happens to carry ".so"
                     # (a text file, a symlink target) - not an error.
@@ -1520,6 +1585,52 @@ def wheel_external_needed_libs(filename: str | os.PathLike[str]) -> list[str]:
         for lib in needed
         if lib not in provided and not _is_toolchain_soname(lib)
     )
+
+
+def wheel_bundled_lib_versions(
+    filename: str | os.PathLike[str],
+) -> dict[str, list[str]]:
+    """The symbol versions each wheel-bundled shared library defines, keyed by
+    its ``DT_SONAME``.
+
+    An auditwheel build's renamed ``*.libs/*.so*`` sidecars declare versioned
+    symbols - ``.gnu.version_d`` names them ``BLKID_1.0``, ``LIBUDEV_183``,
+    ... - under the *original* soname, while ``DT_NEEDED`` in the binaries that
+    use them records the *renamed* one. rpm therefore requires the versioned
+    symbols under the renamed name (``libudev-8d5af18d.so.1.6.11(LIBUDEV_183)`)
+    and provides them under neither, and the rootfs dependency solver cannot
+    resolve the package. The libraries ship inside the wheel, so the recipe
+    re-provides those renamed tokens (see ``recipe._render_bundled_libs_block``);
+    this is the data it needs to do that.
+
+    Best-effort by design, mirroring :func:`wheel_external_needed_libs`: an
+    unparsable member or archive yields whatever the rest of the wheel
+    supports, and ``{}`` when nothing can be read.
+    """
+    so_member = re.compile(r"\.so(?:\.|$)")
+    versions_by_soname: dict[str, list[str]] = {}
+    try:
+        with zipfile.ZipFile(filename) as zf:
+            for info in zf.infolist():
+                if info.is_dir() or not so_member.search(info.filename):
+                    continue
+                try:
+                    payload = zf.read(info)
+                except (OSError, zipfile.BadZipFile):
+                    continue
+                soname, _deps, versions = _elf64_dynamic_tags(payload)
+                if not soname or not versions:
+                    continue
+                versions_by_soname.setdefault(soname, [])
+                for version in versions:
+                    if version not in versions_by_soname[soname]:
+                        versions_by_soname[soname].append(version)
+    except (OSError, zipfile.BadZipFile):
+        return {}
+    return {
+        soname: sorted(versions)
+        for soname, versions in sorted(versions_by_soname.items())
+    }
 
 
 def detect_native_code(
@@ -1639,8 +1750,66 @@ def machine_gated_deps(
     return gated, plain
 
 
+def apply_major_cap(raw: str) -> tuple[str, str]:
+    """Cap ``raw`` at its lower bound's major series.
+
+    Returns ``(requirement, specifier)`` under the same-major dependency
+    policy: a requirement with a version *floor* (``>=``/``>``) in the 1.y+
+    series and no upper bound of its own gets a ``,<major+1`` ceiling
+    appended, so resolution picks the newest release of the floor's major
+    series instead of a later major that upstream bounds alone would allow.
+
+        >>> apply_major_cap("numpy>=1.21.0")
+        ("numpy>=1.21.0,<2", ">=1.21.0,<2")
+
+    The ceiling guards the whole pipeline: the requirement string is what
+    ``pip download`` resolves with, so a parity jump that upstream only
+    discovers years later (numpy 1.x -> 2.x breaking OpenCV generators,
+    auditwheel ABI churn) never silently lands in a rebuilt layer.
+
+    Everything else passes through unchanged (``requirement`` == ``raw``):
+    requirements already bounded above (``<``/``<=``/``~=``), exact pins
+    (``==``/``===``), requirements with only exclusions (``!=``) or no
+    specifier at all, floors in the 0.y series (a 0.x floor is no "major
+    series" promise - some projects live there permanently, and capping one
+    to ``<1`` would prefer a years-old release), and strings ``packaging``
+    cannot parse. Pass ``--no-major-bump-cap`` to keep every bound verbatim.
+    """
+    try:
+        req = Requirement(raw)
+    except InvalidRequirement:
+        return raw, ""
+    floor: Version | None = None
+    for item in req.specifier:
+        op = item.operator
+        if op in ("==", "===", "<", "<=", "~="):
+            # Already pinned or bounded above: adding a ceiling would be
+            # redundant at best, contradictory at worst.
+            return raw, str(req.specifier)
+        if op in (">=", ">"):
+            try:
+                candidate = Version(item.version)
+            except InvalidVersion:
+                return raw, str(req.specifier)
+            if floor is None or candidate > floor:
+                floor = candidate
+    if floor is None or floor.major == 0:
+        return raw, str(req.specifier)
+    specifier = f"{req.specifier},<{floor.major + 1}"
+    parts = [req.name]
+    if req.extras:
+        parts.append(f"[{','.join(sorted(req.extras))}]")
+    parts.append(specifier)
+    if req.marker is not None:
+        parts.append(f"; {req.marker}")
+    return "".join(parts), specifier
+
+
 def classify_requires_dist(
-    requires_dist: list[str], yocto: YoctoVersion | None
+    requires_dist: list[str],
+    yocto: YoctoVersion | None,
+    *,
+    cap_major_bump: bool = True,
 ) -> tuple[list[Dependency], list[Dependency], list[Dependency]]:
     """
     Split ``Requires-Dist`` into (runtime, build, dropped).
@@ -1650,6 +1819,10 @@ def classify_requires_dist(
     * otherwise the marker is evaluated against the Yocto target; if it does not
       hold on this target (e.g. Windows-only, or a lower Python) -> dropped
     * unconditional (or target-satisfied) deps -> runtime
+
+    Unless ``cap_major_bump=False``, every runtime requirement carries the
+    same-major ceiling from :func:`apply_major_cap`: ``numpy>=1.21.0`` is held
+    and resolved as ``numpy>=1.21.0,<2`` (newest 1.x, never 2.x).
     """
     env = _marker_env(yocto)
     runtime: list[Dependency] = []
@@ -1700,31 +1873,38 @@ def classify_requires_dist(
                 )
                 continue
 
+        capped = apply_major_cap(raw) if cap_major_bump else None
         runtime.append(
             Dependency(
                 name=name,
                 kind=DepKind.RUNTIME,
-                requirement=raw,
-                specifier=str(req.specifier),
+                requirement=capped[0] if capped else raw,
+                specifier=capped[1] if capped else str(req.specifier),
             )
         )
 
     return runtime, [], dropped
 
 
-def _build_deps_from_requires(requires: list[str]) -> list[Dependency]:
+def _build_deps_from_requires(
+    requires: list[str], *, cap_major_bump: bool = True
+) -> list[Dependency]:
     out: list[Dependency] = []
     for raw in requires:
         try:
             req = Requirement(raw)
         except InvalidRequirement:
             continue
+        if cap_major_bump:
+            requirement, specifier = apply_major_cap(raw)
+        else:
+            requirement, specifier = raw, str(req.specifier)
         out.append(
             Dependency(
                 name=req.name,
                 kind=DepKind.BUILD,
-                requirement=raw,
-                specifier=str(req.specifier),
+                requirement=requirement,
+                specifier=specifier,
                 marker=str(req.marker) if req.marker is not None else "",
             )
         )
@@ -1741,12 +1921,17 @@ def build_metadata(
     *,
     requirement: str | None = None,
     check_public: bool = False,
+    cap_major_bump: bool = True,
 ) -> tuple[PackageMetadata, FetchedSource]:
     """Fetch + parse a package into a fully-populated :class:`PackageMetadata`.
 
     ``check_public`` forwards to :func:`fetch_source`; an sdist that is not
     reachable at the ``pypi`` class' public URL marks the metadata ``vendored``
     so the recipe ships the sdist in the layer instead of inheriting ``pypi``.
+
+    ``cap_major_bump`` forwards to the dependency classifiers: dependency
+    bounds are resolved within the lower bound's major series
+    (``numpy>=1.21.0`` -> ``numpy>=1.21.0,<2``) unless the flag is cleared.
     """
     source = fetch_source(
         name,
@@ -1802,9 +1987,11 @@ def build_metadata(
     # not here (the host that runs bitbake is not the target).
     machine_deps, plain_requires = machine_gated_deps(requires_dist, yocto)
     runtime, _build_from_rd, dropped = classify_requires_dist(
-        plain_requires, yocto
+        plain_requires, yocto, cap_major_bump=cap_major_bump
     )
-    build_deps = _build_deps_from_requires(build_requires)
+    build_deps = _build_deps_from_requires(
+        build_requires, cap_major_bump=cap_major_bump
+    )
     has_native_code, native_evidence = detect_native_code(
         source, build_requires
     )
@@ -1874,6 +2061,14 @@ def build_metadata(
             if source.kind is SourceKind.WHEEL
             else []
         ),
+        bundled_lib_versions=(
+            # The renamed sidecar libraries' symbol versions, so the recipe can
+            # re-provide the tokens rpm requires under the renamed sonames (see
+            # wheel_bundled_lib_versions).
+            wheel_bundled_lib_versions(source.path)
+            if source.kind is SourceKind.WHEEL
+            else {}
+        ),
         requires_dist=list(requires_dist),
         has_native_code=has_native_code,
         native_code_evidence=native_evidence,
@@ -1911,9 +2106,11 @@ def resolve_closure(
     """Resolve the transitive **runtime** closure of ``top``.
 
     BFS over ``runtime_deps``; each member is fetched through ``builder`` (the
-    network seam; tests inject a fake) with its raw requirements (bounds
-    intact, e.g. ``tomli>=1.0.2``) passed through verbatim so upstream
-    bounds are honoured when picking versions.
+    network seam; tests inject a fake) with its requirement (bounds intact,
+    e.g. ``tomli>=1.0.2``) passed through verbatim so upstream bounds are
+    honoured when picking versions. The bounds a member ships may already
+    carry the ``<major+1`` ceiling added by :func:`apply_major_cap` during
+    classification, so the closure stays within each floor's major series.
 
     With ``workers > 1`` fetches run in parallel through one shared thread
     pool. A member's dependencies are unknowable until its own fetch has

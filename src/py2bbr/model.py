@@ -229,6 +229,14 @@ class PackageMetadata:
     #: providing packages for every distro, so they are surfaced in the report
     #: and recommended in the recipe rather than guessed into ``RDEPENDS``.
     external_needed_libs: list[str] = field(default_factory=list)
+    #: For a vendored wheel, the symbol versions each bundled sidecar shared
+    #: library defines, keyed by its (auditwheel-renamed) ``DT_SONAME``. The
+    #: recipe re-provides ``<soname>(<version>)(64bit)`` for these: rpm
+    #: generates those tokens as *requires* (consumers' ``DT_NEEDED`` names the
+    #: renamed soname) but provides them under neither the renamed nor the
+    #: original name, so without them ``do_rootfs`` fails with "nothing
+    #: provides". Only populated for wheels that bundle libraries.
+    bundled_lib_versions: dict[str, list[str]] = field(default_factory=dict)
 
     # --- dependencies ----------------------------------------------------
     runtime_deps: list[Dependency] = field(default_factory=list)
