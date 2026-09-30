@@ -600,16 +600,24 @@ class TestTargetReport:
     def test_incompatible_target_adds_a_warning(
         self, tmp_path, monkeypatch, capsys, make_meta_fn
     ):
+        # An INCOMPATIBLE target has to say so per target *and* raise the
+        # run-wide warning. The target Python is named explicitly because
+        # --python-version defaults to the interpreter running the tests: a
+        # ">=3.13" gate that the host satisfies (any 3.13+ interpreter) never
+        # fires, so the verdict would otherwise depend on the machine the
+        # suite runs on. --arch/--targets narrow it to one board of the matrix.
         out = self._run(
             tmp_path,
             monkeypatch,
             capsys,
-            self._native(make_meta_fn),
+            make_meta_fn(requires_python=">=3.13"),
             make_meta_fn,
+            "--python-version",
+            "3.12",
             "--arch",
             "aarch64",
             "--targets",
-            "x86"
+            "x86",
         )
         assert "INCOMPATIBLE" in out
         assert "cannot build for at least one target" in out

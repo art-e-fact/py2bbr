@@ -30,6 +30,47 @@ from py2bbr.recipe import (
 )
 
 
+def gnu_sed() -> str:
+    """Path of a GNU ``sed``, skipping the test when the host has none.
+
+    The programs under test are the ones the generated recipe hands to bitbake,
+    and bitbake runs them with the GNU sed of a Yocto build host. macOS ships
+    BSD sed, which cannot run them at all: it needs an explicit argument after
+    ``-i`` (it reads the program as the backup suffix), and it only parses a
+    ``{ ... }`` block whose closing brace sits on a line of its own - the
+    single-line form the recipe emits. So the host sed is only usable when it
+    understands ``--version``. ``gsed`` (Homebrew's ``gnu-sed``) is tried first
+    so a Mac that has it still runs these tests; otherwise they skip rather
+    than assert the behaviour of a sed the recipe will never meet.
+    """
+    for candidate in ("gsed", "sed"):
+        path = shutil.which(candidate)
+        if path is None:
+            continue
+        # GNU sed answers --version; BSD sed takes the unknown flag for a file
+        # name and exits non-zero.
+        if (
+            subprocess.run(
+                [path, "--version"], capture_output=True, check=False
+            ).returncode
+            == 0
+        ):
+            return path
+    pytest.skip("no GNU sed on this host (macOS: brew install gnu-sed)")
+
+
+def apply_sed(programs: list[str], path) -> str:
+    """Run the recipe's ``sed -i -E`` programs on ``path`` in order, in place.
+
+    Same call the recipe makes, so the tests judge the programs bitbake will
+    run; the binary comes from :func:`gnu_sed`.
+    """
+    sed = gnu_sed()
+    for program in programs:
+        subprocess.run([sed, "-E", "-i", program, str(path)], check=True)
+    return path.read_text()
+
+
 class TestDependsRendersSingleLine:
     def test_depends_single_line_quoted_literal_pn(self, meta, yocto):
         text, _ = render_recipe(meta, yocto)
@@ -699,8 +740,6 @@ class TestClassifierPruning:
         # xmod 1.10.0 declares every classifier on one line; the recipe's sed
         # must prune too-new entries out of that array (not just whole
         # classifier-only lines) and leave valid TOML behind.
-        if shutil.which("sed") is None:
-            pytest.skip("sed not available")
         text, _ = render_recipe(meta, yocto)
         program = next(
             line.split('"', 1)[1].rsplit('"', 1)[0]
@@ -719,8 +758,7 @@ class TestClassifierPruning:
             '"Programming Language :: Python :: 3.13", '
             '"Programming Language :: Python :: 3.14"]\n'
         )
-        subprocess.run(["sed", "-E", "-i", program, str(pyproject)], check=True)
-        pruned = pyproject.read_text()
+        pruned = apply_sed([program], pyproject)
         assert (
             "classifiers = ["
             '"Programming Language :: Python :: 3", '
@@ -747,19 +785,13 @@ class TestLicenseFilesDroppedWithTableLicense:
 
     def _run_license_sed(self, text: str, pyproject) -> str:
         """Apply the recipe's license-related sed programs, in order."""
-        if shutil.which("sed") is None:
-            pytest.skip("sed not available")
         programs = [
             line.split('"', 1)[1].rsplit('"', 1)[0]
             for line in text.splitlines()
             if "license" in line and line.strip().startswith("sed -i -E")
         ]
         assert programs, "recipe has no license-rewriting sed"
-        for program in programs:
-            subprocess.run(
-                ["sed", "-E", "-i", program, str(pyproject)], check=True
-            )
-        return pyproject.read_text()
+        return apply_sed(programs, pyproject)
 
     def test_mesonpy_recipe_drops_license_files(self, make_meta_fn, yocto):
         meta = make_meta_fn(build_backend="mesonpy")
