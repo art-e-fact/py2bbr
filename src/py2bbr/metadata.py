@@ -1,27 +1,3 @@
-"""Fetch and parse authoritative package metadata.
-
-Current approach
-----------------
-1. ``pip download`` the package into an isolated temp dir, honouring the user's
-   pip index flags (``--index-url`` / ``--extra-index-url`` / ``--trusted-host``
-   / arbitrary ``--pip-arg``). This works against PyPI *and* private indexes.
-2. Prefer the **sdist** (what ``inherit pypi`` fetches, so its sha256 is the
-   correct ``SRC_URI[sha256sum]``); fall back to a **wheel** if sdist is absent.
-   That fallback is pinned to the *target* runtime (Python version, and CPU
-   architecture when it differs from the build host's) so pip cannot answer with
-   an artifact built for the machine py2bbr happens to run on.
-3. Parse ``PKG-INFO`` / ``METADATA`` with the stdlib ``email`` parser.
-4. Read ``pyproject.toml`` ``[build-system]`` for the backend + build deps.
-5. Locate the license file and compute its MD5 (for ``LIC_FILES_CHKSUM``).
-6. Classify ``Requires-Dist`` into runtime / build / dropped using ``packaging``
-   marker evaluation against the target runtime (Python version and CPU).
-7. Inspect the sdist for code that has to be *compiled* and for build config
-   that hard-codes an x86 assumption, so the generated recipe can be judged
-   per target architecture (see ``py2bbr.targets``).
-"""
-
-from __future__ import annotations
-
 import email
 import email.message
 import hashlib
@@ -63,7 +39,8 @@ from py2bbr.targets import KNOWN_TARGETS
 
 logger = logging.getLogger(__name__)
 
-# Map PEP 561 "License :: OSI Approved :: X" classifier tails to SPDX ids.
+# Map PEP 561 "License :: OSI Approved :: X" to SPDX ids.
+# Did not find a package to do this, likely because messy.
 _CLASSIFIER_TO_SPDX: dict[str, str] = {
     "MIT License": "MIT",
     "Apache Software License": "Apache-2.0",
@@ -82,7 +59,7 @@ _CLASSIFIER_TO_SPDX: dict[str, str] = {
     "EUPL 1.1": "EUPL-1.1",
 }
 
-# Keyword hints used to sniff a license from free-form ``License:`` text.
+# Keyword hints used to get a license from `License:` text.
 _LICENSE_TEXT_HINTS: list[tuple[str, str]] = [
     ("apache license", "Apache-2.0"),
     ("apache-2.0", "Apache-2.0"),
@@ -107,6 +84,7 @@ _LICENSE_TEXT_HINTS: list[tuple[str, str]] = [
     ("eclipse public license", "EPL-2.0"),
 ]
 
+# Common licence file names
 _LICENSE_FILE_NAMES = (
     "LICENSE",
     "LICENSE.txt",
@@ -125,15 +103,17 @@ _LICENSE_FILE_NAMES = (
 
 @dataclass
 class PipOptions:
-    """pip index options forwarded to ``pip download``."""
+    """
+    pip options forwarded to `pip download`.
+    """
 
     index_url: str | None = None
     extra_index_urls: list[str] = field(default_factory=list)
     trusted_hosts: list[str] = field(default_factory=list)
-    #: Extra raw arguments appended verbatim (e.g. ``--proxy``, ``--retries``).
+    # Extra raw arguments appended verbatim (e.g. ``--proxy``, ``--retries``).
     pip_args: list[str] = field(default_factory=list)
-    #: Timeout in seconds for pip network operations (0 = pip default).
-    timeout: int = 0
+    # Timeout for pip network operations (0 = pip default).
+    timeout: int = 0  # seconds
 
     def build_args(self) -> list[str]:
         args: list[str] = []
@@ -149,7 +129,6 @@ class PipOptions:
         return args
 
     def describe(self) -> list[str]:
-        """Human-readable index flags, for reproducibility reporting."""
         out: list[str] = []
         if self.index_url:
             out.append(f"--index-url={self.index_url}")
@@ -162,24 +141,17 @@ class PipOptions:
 
 @dataclass
 class FetchedSource:
-    """A downloaded upstream artifact and its computed facts."""
-
     path: Path
     kind: SourceKind
     sha256: str
     filename: str
-    #: None = not checked; otherwise whether the pypi class' fetch URL for this
-    #: sdist responds on public PyPI (False -> the recipe must vendor instead).
+    # True: sdist reachable on PyPi
+    # False: Process as vendored file (includes wheels)
+    # None: Check deactivated
     public_reachable: bool | None = None
 
 
 def _pip_executable() -> list[str]:
-    """
-    Find a working pip: prefer the running interpreter's, else a system one.
-
-    ``uv``-managed environments do not always ship ``pip`` in the venv, so fall
-    back to a ``pip``/``pip3`` on PATH (``pip download`` only needs to fetch).
-    """
     import importlib.util
 
     if importlib.util.find_spec("pip") is not None:
@@ -192,12 +164,11 @@ def _pip_executable() -> list[str]:
 
 
 def _pip_python_version(yocto: YoctoVersion | None) -> str | None:
-    """The ``<major>.<minor>`` to hand pip as ``--python-version``, or None.
+    """
+    Get and normalise the Python version for the target Yocto.
 
-    pip only understands a major.minor spec. ``YoctoVersion.python_version`` is
-    major.minor by contract, but a patch component must not silently disable the
-    pin (that failure mode is invisible: the download just resolves for the
-    wrong interpreter again).
+    This logic is likely to move to src/py2bbr/model.py in the
+    YoctoVersion class.
     """
     target = getattr(yocto, "python_version", "") or ""
     parts = target.split(".")

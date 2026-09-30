@@ -1,8 +1,5 @@
 """
 py2bbr exception types
-
-Every expected failure is expressed as a subclass of `Py2BbrError` so the
-CLI can turn them into clean, non-traceback error messages.
 """
 
 
@@ -39,6 +36,10 @@ class RecipeError(Py2BbrError):
 
 class LicenseError(RecipeError):
     """No usable license could be determined for the recipe."""
+
+
+class VersionError(RecipeError):
+    """No usable version could be determined for the recipe."""
 
 
 class CheckError(Py2BbrError):

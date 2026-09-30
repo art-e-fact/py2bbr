@@ -60,6 +60,19 @@ class YoctoVersion:
     #: Branch of the meta-python layer matching this series.
     meta_python_branch: str = ""
 
+    # def __post_init__(self):
+    #     # Check for valid Python version and normalise it
+    #     parts = self.python_version.split(".")
+    #     if len(parts) < 2 or parts[0] != "3" or not parts[1].isdigit():
+    #         # raise VersionError(f"Invalid Python version: {self.python_version}. Expecting a semver for Python 3 or later.")
+    #         return None
+    #     # Yes, sorry. A frozen dataclass does not allow any
+    #     # change to attributes, even in post inits.
+    #     # See:
+    #     # - https://docs.python.org/3/library/dataclasses.html#frozen-instances
+    #     # - https://stackoverflow.com/questions/53756788/how-to-set-the-value-of-dataclass-field-in-post-init-when-frozen-true#comment130807314_54119384
+    #     object.__setattr__(self, "python_version", f"3.{int(parts[1])}")
+
     @property
     def python_pn(self) -> str:
         """The Bitbake Python package prefix, e.g. ``python3``."""
