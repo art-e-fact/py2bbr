@@ -600,8 +600,17 @@ class TestTargetReport:
     def test_incompatible_target_adds_a_warning(
         self, tmp_path, monkeypatch, capsys, make_meta_fn
     ):
-        meta = make_meta_fn(requires_python=">=3.13")
-        out = self._run(tmp_path, monkeypatch, capsys, meta, make_meta_fn)
+        out = self._run(
+            tmp_path,
+            monkeypatch,
+            capsys,
+            self._native(make_meta_fn),
+            make_meta_fn,
+            "--arch",
+            "aarch64",
+            "--targets",
+            "x86"
+        )
         assert "INCOMPATIBLE" in out
         assert "cannot build for at least one target" in out
 
