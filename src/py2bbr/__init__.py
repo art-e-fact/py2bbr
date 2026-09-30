@@ -1,5 +1,4 @@
-# Flexibility of declaring types by string names ahead of time.
-from __future__ import annotations
+from importlib.metadata import version
 
 __all__ = [
     "Dependency",
@@ -10,7 +9,7 @@ __all__ = [
     "render_recipe",
 ]
 
-__version__ = "0.1.0"
+__version__ = version("py2bbr")
 
 
 def __dir__() -> list[str]:
