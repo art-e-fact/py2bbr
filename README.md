@@ -41,6 +41,10 @@ uv run py2bbr --help
 uv run pytest
 ```
 
+Tests note: Some tests need GNU `sed` available in the environment. On BSD
+systems, these tests are skipped. They can be run by installing the GNU
+version, either named `sed` or `gsed`.
+
 
 ## Usage
 
