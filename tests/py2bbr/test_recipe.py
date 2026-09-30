@@ -31,24 +31,17 @@ from py2bbr.recipe import (
 
 
 def gnu_sed() -> str:
-    """Path of a GNU ``sed``, skipping the test when the host has none.
+    """
+    Path to a GNU `sed`, skipping the test when the host has none.
 
-    The programs under test are the ones the generated recipe hands to bitbake,
-    and bitbake runs them with the GNU sed of a Yocto build host. macOS ships
-    BSD sed, which cannot run them at all: it needs an explicit argument after
-    ``-i`` (it reads the program as the backup suffix), and it only parses a
-    ``{ ... }`` block whose closing brace sits on a line of its own - the
-    single-line form the recipe emits. So the host sed is only usable when it
-    understands ``--version``. ``gsed`` (Homebrew's ``gnu-sed``) is tried first
-    so a Mac that has it still runs these tests; otherwise they skip rather
-    than assert the behaviour of a sed the recipe will never meet.
+    Bitbake relies on GNU sed. BSD-like systems ship BSD sed, which
+    misses the `-i` flag used by `bitbake`.
     """
     for candidate in ("gsed", "sed"):
         path = shutil.which(candidate)
         if path is None:
             continue
-        # GNU sed answers --version; BSD sed takes the unknown flag for a file
-        # name and exits non-zero.
+        # GNU sed accepts --version; BSD sed rejects with non-zero exit.
         if (
             subprocess.run(
                 [path, "--version"], capture_output=True, check=False
@@ -56,7 +49,7 @@ def gnu_sed() -> str:
             == 0
         ):
             return path
-    pytest.skip("no GNU sed on this host (macOS: brew install gnu-sed)")
+    pytest.skip("no GNU sed on this host, skipping test")
 
 
 def apply_sed(programs: list[str], path) -> str:
