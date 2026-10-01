@@ -5,6 +5,8 @@ Python to Bitbake Recipe.
 Convert a Python package into a Yocto Project *Bitbake recipe* typically
 for use in a Yocto layer, including PetaLinux projects.
 
+### Outline and status
+
 `py2bbr` fetches a package from any PyPI-compatible index (honouring pip flags
 such as `--extra-index-url`, so private indexes work), derives the Bitbake
 variables from it, and generates a `python3-<name>.bb` recipe---optionally
@@ -15,8 +17,7 @@ the local toolchain allows.
 
 There is experimental support for `kas`, but very little testing so far.
 
-
-## Why
+### Rationale
 
 Writing recipe by hand is difficult and repetitive, meaning hunting down license
 file, computing `LIC_FILES_CHKSUM`, mapping `Requires-Dist` to `RDEPENDS`, and
@@ -235,6 +236,14 @@ petalinux-build
 ```
 python3 -c "import async_pyserial"
 ```
+
+## Disclosure
+
+This work has involved manual and generated code, using:
+
+* Local version of Qwen 3.8
+* Online version of OpenCode Big Pickle
+
 
 ## License
 
