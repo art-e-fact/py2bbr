@@ -12,8 +12,6 @@ and the machine py2bbr runs on is not the machine the image will boot, so both
 axes are overridable per run.
 """
 
-from __future__ import annotations
-
 import logging
 import platform
 import re

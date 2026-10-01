@@ -61,8 +61,6 @@ assignment line and survive such passes intact.
   poky's own recipes do. An explicit ``--build-class`` override opts out.
 """
 
-from __future__ import annotations
-
 import re
 import shutil
 import textwrap

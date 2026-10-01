@@ -39,8 +39,6 @@ cross-compatibility and x86-specific build flags. A ``RISK`` verdict means
 "check this", an ``INCOMPATIBLE`` verdict means "this cannot work".
 """
 
-from __future__ import annotations
-
 from dataclasses import dataclass, field
 from enum import StrEnum
 
