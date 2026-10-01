@@ -1,16 +1,11 @@
-"""Core data model shared across py2bbr modules."""
-
-from __future__ import annotations
-
 from dataclasses import dataclass, field
 from enum import StrEnum
 
-#: Default Yocto series py2bbr targets when ``--yocto-version`` is omitted.
 DEFAULT_YOCTO_VERSION = "5.0"
 
 
 class SourceKind(StrEnum):
-    """Kind of upstream artifact the recipe fetches."""
+    """Kind of file the recipe fetches."""
 
     SDIST = "sdist"
     WHEEL = "wheel"
@@ -26,39 +21,29 @@ class DepKind(StrEnum):
 
 @dataclass(frozen=True)
 class YoctoVersion:
-    """A concrete Yocto Project series and the build data derived from it.
-
-    The mapping is owned by py2bbr (kas is data-driven and does not ship a
-    release->branch table). ``poky_branch`` is the poky git branch and is also
-    the value used in the generated ``kas`` build file.
-
-    It doubles as the resolved *target runtime*: :attr:`python_version` and
-    :attr:`platform_machine` are what the image will actually run, and every
-    consumer downstream (marker evaluation, the artifact the recipe installs,
-    the build-for-target report) reads them from here. They default to the
-    series' own values, and ``--python-version`` / ``--target-arch`` override
-    them per run (see :func:`py2bbr.yocto.resolve_target_runtime`).
+    """
+    Information on a Yocto Project series and the build data derived from it.
     """
 
     version: str
     codename: str
     poky_branch: str
     python_version: str
-    #: ``platform_machine`` value as Python reports it *on the target* (the CPU
-    #: the image runs on), e.g. ``aarch64``. Not part of the release: it
-    #: defaults to the build host's, which is only right when the image runs
-    #: there too, and ``--target-arch`` overrides it. Kept here so the PEP 508
-    #: evaluation environment, the wheel-tag checks and the report all describe
-    #: one single target.
+
+    # `platform_machine` value as Python reports it *on the target* (the CPU
+    # the image runs on), e.g. `aarch64`. Not part of the output: it
+    # defaults to the build host architecture.
     platform_machine: str = "x86_64"
-    #: Layer that provides the ``python3-*`` recipes we depend on.
+
+    # Layer that provides the ``python3-*`` recipes we depend on.
     meta_python: str = "meta-python"
-    #: Base URL of the poky repository (overridable for mirrors).
-    poky_url: str = "https://git.yoctoproject.org/poky"
-    #: URL of the meta-python layer.
+    # URL of the meta-python layer.
     meta_python_url: str = "https://git.openembedded.org/meta-python"
-    #: Branch of the meta-python layer matching this series.
+    # Branch of the meta-python layer matching this series.
     meta_python_branch: str = ""
+
+    # Base URL of the poky repository.
+    poky_url: str = "https://git.yoctoproject.org/poky"
 
     # def __post_init__(self):
     #     # Check for valid Python version and normalise it
@@ -75,7 +60,11 @@ class YoctoVersion:
 
     @property
     def python_pn(self) -> str:
-        """The Bitbake Python package prefix, e.g. ``python3``."""
+        """
+        The Bitbake Python package prefix, e.g. `python3`.
+
+        Note we focus and test only with `python3`.
+        """
         return "python3" if self.python_version.startswith("3") else "python"
 
     @property
@@ -84,49 +73,50 @@ class YoctoVersion:
 
     @property
     def runtime_label(self) -> str:
-        """The runtime the layer targets, e.g. ``Python 3.12 on aarch64``.
+        """
+        Formatted runtime name the layer targets, e.g. ``Python 3.12 on aarch64``.
 
-        Recorded in the recipe and the layer README so the artifact is never
-        mistaken for one built for the machine that happened to run py2bbr.
+        Recorded in the recipe and the layer README for transparency and
+        debugging.
         """
         return f"Python {self.python_version} on {self.platform_machine}"
 
 
 @dataclass(frozen=True)
 class Dependency:
-    """A single dependency derived from a ``Requires-Dist`` entry."""
+    """
+    A single dependency derived from an `Requires-Dist` entry.
+    """
 
     name: str
     kind: DepKind
-    #: Original PEP 508 requirement string (for debugging / reporting).
+
+    # Original requirement string (for debugging / reporting).
     requirement: str = ""
-    #: The version specifier, e.g. ``>=8.0.0``.
+
+    # The version specifier, e.g. `>=8.0.0,<8.2.0`.
     specifier: str = ""
-    #: The environment marker guarding this entry, e.g. ``sys_platform == "ios"``.
-    #: Empty for an unconditional dependency. Set for ``Requires-Dist`` and
-    #: ``[build-system].requires`` entries that carry a marker, so callers can
-    #: tell a floor that always applies from one gated on an environment the
-    #: target may never have.
+
+    # The environment marker guarding this entry, e.g. ``sys_platform == "ios"``.
     marker: str = ""
-    #: Reason this dependency was dropped (only for :attr:`DepKind.DROPPED`).
+
+    # Reason this dependency was dropped (only for `DepKind.DROPPED`).
     reason: str = ""
 
     @property
     def bitbake_name(self) -> str:
-        """The runtime Bitbake package this maps to (without the python prefix).
+        """
+        The runtime Bitbake package this maps to (without the python prefix).
 
-        e.g. ``mypy-extensions``. The recipe renders it as a single-line,
-        quoted ``python3-<name>`` value (never ``${PYTHON_PN}-<name>``).
+        Returns `mypackage`, not `python3-mypackage` as in the recipe.
         """
         return self.name
 
 
-#: ``platform.machine()`` -> the ``MACHINEOVERRIDES`` tokens poky guarantees
-#: for that architecture (see ``meta/conf/machine/include/*/arch-*.inc``:
-#: ``arch-x86.inc`` adds ``x86``/``x86_64``, ``arch-armv7a.inc`` ``armv7a``,
-#: ``arch-arm64.inc`` ``aarch64``). They are the override suffixes a recipe may
-#: use in ``RDEPENDS:${PN}:append:<token>``, so a recipe stays correct on every
-#: machine of the family instead of only on the machine py2bbr ran on.
+# Override suffixes a recipe may use in ``RDEPENDS:${PN}:append:<token>``,
+# so a recipe stays correct on every machine of the family instead of only
+# on the machine py2bbr ran on.
+# See Poky `meta/conf/machine/include/*/arch-*.inc`
 MACHINE_OVERRIDE_TOKENS: dict[str, tuple[str, ...]] = {
     "aarch64": ("aarch64",),
     "aarch64_be": ("aarch64",),
@@ -145,35 +135,38 @@ MACHINE_OVERRIDE_TOKENS: dict[str, tuple[str, ...]] = {
 
 
 def machine_override_tokens(machine: str) -> tuple[str, ...]:
-    """``MACHINEOVERRIDES`` tokens for a ``platform_machine`` value."""
     return MACHINE_OVERRIDE_TOKENS.get(machine.lower(), (machine.lower(),))
 
 
 @dataclass(frozen=True)
 class MachineDep:
-    """A runtime dependency gated on the target's ``platform_machine``.
+    """
+    A runtime dependency conditional to `platform_machine` specs.
 
-    ``Requires-Dist`` markers such as ``foo; platform_machine == "x86_64"``
-    must not be baked into the recipe's unconditional RDEPENDS: the layer is
-    cross-built (x86_64 host) for a different target CPU, and baking the
-    *host* machine's answer in ships the wrong dependency set (and drops the
-    one the target actually needs). Such deps are rendered as
-    ``RDEPENDS:${PN}:append:<MACHINEOVERRIDES token>`` instead, so the
-    selection happens inside bitbake on the real target.
+    `Requires-Dist` such as `mypackage; platform_machine == "x86_64"`
+    must not be baked into the recipe's unconditional RDEPENDS (arch mismatch
+    when cross-building). These deps are rendered as
+    `RDEPENDS:${PN}:append:<MACHINEOVERRIDES token>`, so the arch selection
+    happens inside bitbake on the real target.
     """
 
     name: str
-    #: Original PEP 508 requirement string.
+
+    # Original requirement string.
     requirement: str = ""
-    #: The marker as written upstream, e.g. ``platform_machine == "aarch64"``.
+
+    # The original marker, e.g. `platform_machine == "aarch64"`.
     marker: str = ""
-    #: ``platform_machine`` values on which the dependency applies.
+
+    # `platform_machine` values on which the dependency applies.
     machines: tuple[str, ...] = ()
 
 
 @dataclass
 class PackageMetadata:
-    """Authoritative metadata for one Python package version."""
+    """
+    Metadata for one Python package version.
+    """
 
     name: str
     canonical_name: str
@@ -181,86 +174,81 @@ class PackageMetadata:
     summary: str = ""
     description: str = ""
     homepage: str = ""
-    #: SPDX license expression (e.g. ``MIT``, ``Apache-2.0``).
+
+    # Standardised SPDX license.
     license: str = ""
-    #: The raw license text / expression as found in the metadata.
+
+    # Raw license text.
     license_raw: str = ""
-    #: License file name (relative to the source root), e.g. ``LICENSE``.
+
+    # License file name (relative to the source root), e.g. `LICENSE`.
     license_file: str | None = None
-    #: MD5 hex digest of the license file (for ``LIC_FILES_CHKSUM``).
+
+    # MD5 hex digest of the license file (for `LIC_FILES_CHKSUM`).
     license_md5: str | None = None
+
     requires_python: str = ""
-    #: ``Project-URL`` entries as ``(label, url)``.
+
+    # `Project-URL` entries as `(label, url)`.
     project_urls: list[tuple[str, str]] = field(default_factory=list)
-    #: Where ``build_backend`` came from: ``""`` for the package's own
-    #: ``pyproject.toml``, or a provenance label like
-    #: ``github.com/vizion/pyvizionsdk@pyproject.toml`` when the wheel shipped
-    #: none and it was read from the upstream repository instead. Empty means
-    #: the artifact did not say and no source could be reached, so the backend
-    #: is the implicit-setuptools default rather than a finding.
+
+    # Where `build_backend` came from the package's own `pyproject.toml`,
+    # or a label like `github.com/mecompany/myproprietarysdk@pyproject.toml`
+    # when a wheel shipped no project file and it was read from the
+    # repository instead. Empty means the sdist/wheel did not say and no
+    # source could be reached, so the backend is the implicit setuptools
+    # default.
     build_backend_source: str = ""
 
-    # --- source artifact -------------------------------------------------
     source_kind: SourceKind = SourceKind.SDIST
     source_filename: str = ""
     source_sha256: str | None = None
-    #: True when the sdist is not reachable on public PyPI at the URL the
-    #: ``pypi`` class fetches, so the recipe vendors it (file:// SRC_URI).
+
+    # True when the sdist is not reachable on public PyPI at the URL the
+    # `pypi` class fetches, so the recipe vendors it (file:// SRC_URI).
     vendored: bool = False
-    #: PEP 517 ``[build-system].build-backend`` (e.g. ``setuptools.build_meta``).
+
+    # PEP 517 `[build-system].build-backend`.
     build_backend: str = ""
-    #: Every ``Requires-Dist`` entry as published, before marker evaluation
-    #: (the target compatibility report re-evaluates them per architecture).
+
+    # Every `Requires-Dist` entry as published, before marker evaluation.
     requires_dist: list[str] = field(default_factory=list)
 
-    # --- build-for-target shape -------------------------------------------
-    #: True when the sdist ships code that must be *compiled* (C/C++/Cython/
-    #: Rust/Go/Fortran/... sources, or an explicit ``ext_modules``). Such a
-    #: package only works on a foreign architecture if the recipe drives the
-    #: target toolchain; a backend that runs under ``nativepython3`` produces
-    #: host binaries otherwise.
+    # True when the sdist ships code that must be *compiled* (C/C++/Cython/
+    # Rust/Go/Fortran/... sources, or an explicit ``ext_modules``).
     has_native_code: bool = False
-    #: Human-readable evidence for :attr:`has_native_code` (paths / build
-    #: requirements), empty for a pure-Python sdist.
+
+    # Human-readable evidence for debugging (paths / build requirements).
+    # Empty for a pure-Python sdist.
     native_code_evidence: list[str] = field(default_factory=list)
-    #: Build-config lines that hard-code an x86 assumption (``-march=native``,
-    #: ``avx2``, ``x86_64``), i.e. code that may not compile for ARM.
+
+    # Build-config lines that hard-code an x86 assumption (`-march=native`,
+    # `avx2`, `x86_64`), i.e. code that may not compile for ARM.
     host_assumptions: list[str] = field(default_factory=list)
-    #: True when the artifact is a wheel whose tag admits prebuilt,
-    #: architecture-specific binaries (so it carries already-stripped ELF
-    #: objects). Bitbake's ``already-stripped`` QA check is a fatal error on
-    #: those, and a recipe that only unpacks cannot undo the strip, so the
-    #: generated recipe waives it - see :data:`py2bbr.recipe._WHEEL_QA_SKIP`.
-    #: False for a pure-Python (``py3-none-any``) wheel and for every sdist,
-    #: which bitbake compiles and strips itself.
+
+    # Essential with many vendor wheels: True when a wheel contains
+    # architecture-specific binaries (likely with already stripped ELF
+    # objects). Bitbake's `already-stripped` QA check is a fatal error and
+    # blocks if the recipe is not explicit.
     ships_prebuilt_binaries: bool = False
-    #: Sonames (``libgstreamer-1.0.so.0``) that the wheel's ELF binaries link
-    #: against but that the wheel does not bundle itself and the C toolchain is
-    #: not assumed to provide - i.e. shared libraries that must already exist
-    #: in the target rootfs. Populated only for wheels, best-effort (an
-    #: unparsable archive yields ``[]``). The recipe cannot discover their
-    #: providing packages for every distro, so they are surfaced in the report
-    #: and recommended in the recipe rather than guessed into ``RDEPENDS``.
+
+    # Sonames (`libgstreamer-1.0.so.0`) that the wheel's ELF binaries link
+    # against but that the wheel does not bundle, that is shared libraries
+    # that must already exist in the target rootfs.
     external_needed_libs: list[str] = field(default_factory=list)
-    #: For a vendored wheel, the symbol versions each bundled sidecar shared
-    #: library defines, keyed by its (auditwheel-renamed) ``DT_SONAME``. The
-    #: recipe re-provides ``<soname>(<version>)(64bit)`` for these: rpm
-    #: generates those tokens as *requires* (consumers' ``DT_NEEDED`` names the
-    #: renamed soname) but provides them under neither the renamed nor the
-    #: original name, so without them ``do_rootfs`` fails with "nothing
-    #: provides". Only populated for wheels that bundle libraries.
+
+    # Lib map to retrieve correct names for wheel bundled libraries.
     bundled_lib_versions: dict[str, list[str]] = field(default_factory=dict)
 
-    # --- dependencies ----------------------------------------------------
     runtime_deps: list[Dependency] = field(default_factory=list)
     build_deps: list[Dependency] = field(default_factory=list)
     dropped_deps: list[Dependency] = field(default_factory=list)
-    #: Runtime deps whose ``platform_machine`` marker makes them target
-    #: specific; rendered as machine-conditional RDEPENDS.
+    # Runtime deps with `platform_machine` marker that makes them arch
+    # specific,
     machine_deps: list[MachineDep] = field(default_factory=list)
 
-    # --- provenance ------------------------------------------------------
-    #: The index/base URL the package was resolved from (best effort).
+    # The index/base URL the package was resolved from (best effort).
     resolved_from: str = ""
-    #: Index flags that were used (for reproducibility reporting).
+
+    # Index flags that were used.
     index_flags: list[str] = field(default_factory=list)
