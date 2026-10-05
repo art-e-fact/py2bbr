@@ -85,28 +85,16 @@ def canonical_name(name: str) -> str:
     return re.sub(r"[-_.]+", "-", name).lower()
 
 
-# PEP 517 build backends that are standalone external dev tooling (uv, ...)
-# with no python3-*-native provider in vanilla Yocto/PetaLinux, so a DEPENDS on
-# them breaks recipe resolution ("Nothing PROVIDES 'python3-uv-build-native'").
-# Value: canonical (PEP 503) distribution name as it would appear in DEPENDS.
+# List of build backends with no python3-*-native provider in Yocto/PetaLinux,
+# Maintained and used to avoid errors like:
+#
+#     "Nothing PROVIDES 'python3-uv-build-native'"
+#
+# The values here must be distribution names as would appear in DEPENDS.
 _EXTERNAL_BUILD_BACKENDS = frozenset({"uv-build"})
 
 
-# Non-Python build tools that PEP 517 backends make pypa/build's
-# ``--no-isolation`` dependency check demand: directly via their
-# ``get_requires_for_build_*`` hook (meson-python appends ``ninja>=...`` when no
-# ninja binary is on PATH; scikit-build-core appends cmake/ninja), or
-# transitively via the backend's own Requires-Dist chain (meson-python's
-# ``meson>=1.2.3`` on py>=3.12, resolved recursively by build 1.1's
-# check_dependency). Bitbake does not stage a native dependency's own
-# ``-native`` deps into the consuming recipe's sysroot, so the recipe must name
-# the tools itself. Key: canonical (PEP 503) build-backend name as found in
-# ``[build-system].build-backend``; value: literal OE-native packages to add to
-# DEPENDS (all shipped by poky core for the supported series). The mesonpy
-# backend's ``get_requires_for_build_wheel`` appends ``patchelf>=0.11.0`` on
-# every Linux wheel build even when the project's metadata omits it (meson-
-# python 0.21.1's own pyproject does not), so patchelf-native is part of the
-# backend tool deps, exactly as poky's meson-python recipe hardcodes it.
+# Non-Python build tool dependencies.
 _BUILD_BACKEND_TOOL_DEPS: dict[str, str] = {
     "mesonpy": "meson-native ninja-native patchelf-native",
     "meson-python": "meson-native ninja-native patchelf-native",
@@ -114,28 +102,12 @@ _BUILD_BACKEND_TOOL_DEPS: dict[str, str] = {
 }
 
 
-# Non-Python tool recipes poky core ships WITHOUT the ``python3-`` prefix:
-# ``meson`` / ``meson-native`` (meta/recipes-devtools/meson), ``ninja``,
-# ``cmake`` and ``patchelf``. A dependency on them must render as the bare
-# name (``meson`` in RDEPENDS, ``meson-native`` in DEPENDS): the ``python3-``
-# prefix yields ``python3-meson``, which the native-variant rename (from
-# ``BBCLASSEXTEND = "native nativesdk"``) turns into the unprovidable
-# ``python3-meson-native`` ("Nothing RPROVIDES", seen for the provisioned
-# python3-meson-python_0.21.1.bb under PetaLinux). poky's own scarthgap
-# python3-meson-python recipe renders exactly these bare names.
+# Non-Python tool dependencies without the ``python3-`` prefix.
+# Maintained and used to avoid errors like: "Nothing RPROVIDES".
 _OE_BARE_TOOL_PROVIDERS = frozenset({"meson", "ninja", "cmake", "patchelf"})
 
 
-# Build classes that compile extension modules against the *target* toolchain.
-# All of them inherit ``setuptools3-base``, which exports the target compiler
-# and sysroot into the build environment and DEPENDS the target interpreter;
-# ``python_mesonpy`` additionally runs meson with the target cross file. The
-# generic ``python_pep517`` class does not - its PEP 517 frontend is driven by
-# ``nativepython3`` (a build-host tool, which is correct: the frontend has to
-# run on the machine doing the building) - so a package with compiled code that
-# lands on it is cross-built only if its backend picks up the exported
-# toolchain. See ``py2bbr.targets`` for the per-target report, which reuses
-# these sets.
+# Build classes that compile extension modules against the target toolchain.
 CROSS_CAPABLE_CLASSES = frozenset(
     {
         "python_flit_core",
@@ -145,34 +117,14 @@ CROSS_CAPABLE_CLASSES = frozenset(
     }
 )
 
-#: Classes that run the PEP 517 frontend under the *host* interpreter. Usable
-#: for pure-Python packages; for compiled code the outcome depends on the
-#: backend honouring the exported target toolchain, so they earn a RISK.
+# Build classes that run under the host interpreter. Used for pure-Python
+# packages.
 HOST_ONLY_CLASSES = frozenset({"python_pep517"})
 
 
-# PEP 517 bootstrap-tool recipes that must mirror poky's own bootstrap shape.
+# Ready to use recipe snippets, per build tool.
 #
-# These four tools are the native build chain python_pep517 recipes pull in:
-# python_pep517.bbclass appends ``DEPENDS += " python3-build-native
-# python3-installer-native"``, while poky's build/installer/pyproject-hooks all
-# ``inherit python_flit_core``, whose class adds ``DEPENDS += "python3
-# python3-flit-core-native"`` (scarthgap; walnascar drops the bare ``python3``).
-# When py2bbr provisions a *newer* flit-core (e.g. ``3.12.0`` because a package
-# demands ``flit_core>=3.12`` while Scarthgap ships ``3.9.0``), the provisioned
-# recipe shadows poky's and closes the loop
-# ``flit-core -> build/installer-native -> flit-core-native`` (the SPDX-task
-# cycle do_create_spdx <-> do_collect_spdx_deps PetaLinux reported). Poky breaks
-# the knot in its own recipes by inheriting ``python_flit_core`` and
-# overriding the *class-native* compile/install to build by hand, removing the
-# self-referential class-native DEPENDS. py2bbr mirrors those shapes verbatim
-# (minus poky's ``PYPI_PACKAGE = "flit"`` tarball trick: the provisioned sdist
-# is the standalone ``flit_core`` artifact, so the generic PYPI_PACKAGE logic
-# already pins the underscore name).
-#
-# Key: canonical (PEP 503) distribution name; value: recipe lines emitted in
-# place of the inherit-time DEPENDS block (the class provides
-# ``python3-flit-core-native`` itself, so no extra_* DEPENDS is rendered).
+# Tool names (keys here) must be the formal distribution name.
 _BOOTSTRAP_TOOL_SHAPES: dict[str, tuple[str, ...]] = {
     "flit-core": (
         (
@@ -249,24 +201,13 @@ _BOOTSTRAP_TOOL_SHAPES: dict[str, tuple[str, ...]] = {
 }
 
 
-#: Post-install fixups that poky's *own* recipes for a build tool apply, which a
-#: py2bbr-generated recipe has to mirror. Bitbake keys tasks by recipe name, so
-#: provisioning a newer tool *replaces* the distro's recipe wholesale: any
-#: adaptation that recipe performed is silently lost, and the consumers relying
-#: on it stop resolving.
-#:
-#: cython: poky's ``python3-cython`` renames its console scripts to the
-#: versioned names (``cython`` -> ``cython3``) because the unversioned ones
-#: collide with a Python 2 build of Cython. That rename is also what consumers
-#: look for: meson resolves its ``cython`` compiler by running ``cython3 -V``
-#: and nothing else (meson 1.11's ``defaults['cython'] = ['cython3']``), so a
-#: provisioned Cython that keeps upstream's script names leaves the compiler
-#: unfindable and numpy 2.5.3's do_compile aborts with ``meson.build:1:0: ERROR:
-#: Unknown compiler(s): [['cython3']]``. Mirroring poky keeps the generated
-#: recipe a drop-in replacement; the guards keep a future Cython that drops a
-#: script from failing the build.
-#:
-#: Key: canonical (PEP 503) distribution name; value: recipe lines appended.
+# Recipe commands to mirror what Poky does.
+#
+# Necessary as recipes that override Poky's completely mask what Poky would do
+# (Bitbake replaces, no inheritance or overlay-like application). So here are
+# plugs to fullfil what Poky would have done and end up with working layers.
+#
+# Tool names (keys here) must be the formal distribution name.
 _TOOL_INSTALL_ADAPTATIONS: dict[str, tuple[str, ...]] = {
     "cython": (
         "do_install:append() {",
@@ -287,20 +228,15 @@ _TOOL_INSTALL_ADAPTATIONS: dict[str, tuple[str, ...]] = {
 }
 
 
-# Emitted into every recipe: PetaLinux's ``python_pep517_do_install`` (the
-# install step all build classes route through: setuptools3, python_pep517,
-# python_setuptools_build_meta, python_mesonpy) runs pypa installer with only
-# ``--destdir=${D}`` and no ``--prefix``. Installer 0.7.0 then derives its
-# scheme from the *native* python's sysconfig, whose base is the absolute
-# recipe-sysroot-native path, and pathlib-joins that onto ${D} -- so the wheel
-# payload lands under ``${D}/output/.../recipe-sysroot-native/...`` and
-# do_package fails with "installed but not shipped" (xmod 1.10.0 under
-# PetaLinux 2024.2). Pinning ``--prefix ${prefix}`` makes every scheme path
-# relative to ${D} again (target /usr, native /usr, nativesdk /usr/local).
+# Fix for installed Python package to be "found".
+#
+# Basically adds a common prefix flag the install command.
+#
+# Avoids errors like "installed but not shipped" at build time.
 _INSTALL_PREFIX_OVERRIDE = """\
 # Work around PetaLinux's python_pep517_do_install calling pypa installer
-# without --prefix: the wheel payload would land under
-# ${D}/output/.../recipe-sysroot-native/... and do_package would fail with
+# without --prefix: Wheels end up under
+# ${D}/output/.../recipe-sysroot-native/... and do_package fails with
 # "installed but not shipped". A --prefix keeps every path relative to ${D}.
 python_pep517_do_install() {
     nativepython3 -m installer ${INSTALL_WHEEL_COMPILE_BYTECODE} --interpreter "${USRBINPATH}/env ${PEP517_INSTALL_PYTHON}" --prefix ${prefix} --destdir=${D} ${PEP517_WHEEL_PATH}/*.whl
@@ -308,17 +244,7 @@ python_pep517_do_install() {
 """
 
 
-#: ``sed -E`` programs dropping ``project.license-files`` from a pyproject.toml.
-#:
-#: PEP 639 only allows that key next to an SPDX *string* expression, so it
-#: cannot stay behind once the license is rewritten to the legacy table form
-#: (:data:`_INSTALL_PREFIX_OVERRIDE` describes the sibling workaround for the
-#: same reason). Enforced by meson-python, which aborts with ``"project
-#: .license-files" must not be used when "project.license" is not a SPDX license
-#: expression``. Two programs, order significant: the first drops a value whose
-#: array closes on the same line, the second an array that opens on one line and
-#: closes on a later one. Scoped to ``[project]`` so another table's identically
-#: named key is left alone.
+# Cleanup regex for licence files.
 _LICENSE_FILES_DROP = (
     (
         r"/^[[:space:]]*\[project\]/,/^[[:space:]]*\[/ "
