@@ -1,15 +1,5 @@
 """
 Yocto series handling, layer generation and ``kas`` build-file emission.
-
-The release -> series mapping is owned here (kas is data-driven and does not
-ship a release/branch table). ``kas`` is used to (a) validate the generated
-``kas`` build file against the official JSON schema and (b) drive the optional
-``--check build`` stage.
-
-The *target runtime* (Python version + CPU architecture) is resolved here too
-(:func:`resolve_target_runtime`): the series only says which Python it ships,
-and the machine py2bbr runs on is not the machine the image will boot, so both
-axes are overridable per run.
 """
 
 import logging
@@ -26,8 +16,7 @@ from py2bbr.recipe import bitbake_pn, canonical_name, recipe_filename
 
 logger = logging.getLogger(__name__)
 
-# Known Yocto Project series. ``poky_branch`` == the codename (poky release
-# branches are named after the codename). ``meta_python_branch`` matches.
+# Known Yocto Project series.
 _YOCTO_SERIES: dict[str, YoctoVersion] = {
     "6.0": YoctoVersion(
         "6.0",
@@ -67,15 +56,23 @@ _YOCTO_SERIES: dict[str, YoctoVersion] = {
 }
 
 # Index by codename too, so ``--yocto-version scarthgap`` works.
+#
+# Note: No conflict as codenames are not numbers, while versions
+#       must be numbers.
 for _v in list(_YOCTO_SERIES.values()):
     _YOCTO_SERIES.setdefault(_v.codename, _v)
 
-#: Default kas file format version (within the schema's 1..23 range).
+# Default kas file format version (within the schema's 1..23 range).
 DEFAULT_KAS_VERSION = 5
 
 
 def known_versions() -> list[YoctoVersion]:
-    """The known series, newest first (deduplicated)."""
+    """
+    The known series, newest first.
+
+    Only presented per version numbers. Codenames are not used to index know
+    versions here.
+    """
     seen: dict[str, YoctoVersion] = {}
     for v in _YOCTO_SERIES.values():
         seen.setdefault(v.version, v)
@@ -96,20 +93,25 @@ def _version_key(version: str) -> tuple[int, ...]:
 
 def resolve_yocto_version(spec: str | None) -> YoctoVersion:
     """
-    Resolve a ``--yocto-version`` value to a :class:`YoctoVersion`.
+    Resolve a ``--yocto-version`` value to a `YoctoVersion`.
 
     Accepts a version (``5.0``, ``5``, ``5.0.0``) or a codename (``scarthgap``).
+
     Defaults to the 5.0 series (Scarthgap).
     """
     if spec is None:
         spec = "5.0"
+
     key = spec.strip().lower()
     if key in _YOCTO_SERIES:
         return _YOCTO_SERIES[key]
-    if key.isdigit():
+
+    # Both "5" and "5.0" are accepted and resolved.
+    if key.isdigit() or key[0:1].isdigit():
         candidate = f"{key}.0"
         if candidate in _YOCTO_SERIES:
             return _YOCTO_SERIES[candidate]
+
     available = ", ".join(
         f"{v.version} ({v.codename})" for v in known_versions()
     )
