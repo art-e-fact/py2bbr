@@ -10,6 +10,7 @@ import sys
 from dataclasses import replace
 from pathlib import Path
 
+from py2bbr import __version__
 from py2bbr.errors import TargetRuntimeError, YoctoVersionError
 from py2bbr.model import PackageMetadata, YoctoVersion
 from py2bbr.recipe import bitbake_pn, canonical_name, recipe_filename
@@ -121,33 +122,17 @@ def resolve_yocto_version(spec: str | None) -> YoctoVersion:
 
 
 def current_python_version() -> str:
-    """``major.minor`` of the interpreter py2bbr itself runs under.
-
-    The default for ``--python-version``: the artifacts on PyPI a developer
-    machine resolves are the ones its own interpreter matches, so that is the
-    least surprising answer. A target that differs (an older PetaLinux on
-    Python 3.12, say) has to be named explicitly.
-    """
+    """`major.minor` of the interpreter py2bbr itself runs under."""
     return f"{sys.version_info.major}.{sys.version_info.minor}"
 
 
 def current_platform_machine() -> str:
-    """``platform.machine()`` of the build host, lower-cased.
-
-    Falls back to ``x86_64`` - the build architecture py2bbr assumes
-    everywhere else - if the platform does not report one, so the
-    ``--target-arch`` default is never a value that has to be rejected. A host
-    that cannot say what it is is a host whose target gets named explicitly,
-    which is the situation anyway.
-    """
+    """`platform.machine()` of the build host, lower-cased."""
+    # TODO Perhaps no default, and error report.
     return platform.machine().strip().lower() or "x86_64"
 
 
-#: Spellings of one architecture that differ between the command line,
-#: ``platform.machine()`` and wheel platform tags. Normalising to the value PEP
-#: 508 markers use on the target is what makes ``--target-arch arm64`` evaluate
-#: ``platform_machine == "aarch64"`` the way the target's own Python would.
-#: Key: a non-canonical spelling; value: the canonical ``platform_machine``.
+# Common name normalisation.
 _ARCH_ALIASES: dict[str, str] = {
     "amd64": "x86_64",
     "x64": "x86_64",
@@ -168,12 +153,7 @@ _ARCH_ALIASES: dict[str, str] = {
 
 
 def normalize_python_version(spec: str) -> str:
-    """Reduce a ``--python-version`` value to ``major.minor``.
-
-    ``3.12``, ``3.12.4`` and ``312`` all name 3.12. A patch component is
-    dropped on purpose: ``python_full_version`` is derived by appending
-    ``.0`` to this value, and bitbake/pypi name runtimes by major.minor.
-    """
+    """Reduce a ``--python-version`` value to ``major.minor``."""
     raw = (spec or "").strip()
     if not raw:
         raise TargetRuntimeError(
@@ -181,7 +161,7 @@ def normalize_python_version(spec: str) -> str:
         )
     candidate = raw
     if candidate.isdigit() and len(candidate) > 2:
-        # pip's dotted-or-not form: "312" -> "3.12".
+        # Normalise "312" -> "3.12".
         candidate = f"{candidate[0]}.{candidate[1:]}"
     match = re.fullmatch(r"(\d+)\.(\d+)(?:\.\d+)*", candidate)
     if not match:
@@ -192,7 +172,7 @@ def normalize_python_version(spec: str) -> str:
 
 
 def normalize_platform_machine(spec: str) -> str:
-    """Canonicalise a ``--target-arch`` value into a ``platform_machine``."""
+    """Normalise a ``--target-arch`` value into a ``platform_machine``."""
     raw = (spec or "").strip().lower()
     if not raw:
         raise TargetRuntimeError(
@@ -212,19 +192,10 @@ def resolve_target_runtime(
     python_version: str | None = None,
     platform_machine: str | None = None,
 ) -> YoctoVersion:
-    """Return ``yocto`` with the target runtime the run asked for.
+    """
+    Return the target runtime the run asked for.
 
-    Both axes default to what py2bbr runs on (the machine doing the generating),
-    which is a guess about the image; ``--python-version`` / ``--target-arch``
-    replace it. The result is a plain :class:`YoctoVersion` copy, so every
-    downstream consumer - marker evaluation, the wheel the recipe installs, the
-    classifier pruning, the build-for-target report - sees one consistent target
-    without any of them having to know which flags were passed.
-
-    Raises :class:`~py2bbr.errors.TargetRuntimeError` on a value that is not a
-    version / architecture: silently falling back to the series' answer would
-    generate a layer for the wrong target, which is the failure this flag
-    exists to prevent.
+    Defaults to the local machine information.
     """
     changes: dict[str, str] = {}
     if python_version is not None:
@@ -253,18 +224,22 @@ def default_layer_name(package_name: str) -> str:
 
 
 def _layer_conf(collection: str, codename: str) -> str:
-    # BBFILES: bitbake only scans files matching BBFILES globs, so a layer
-    # that never adds its recipe tree is invisible ("No bb files ... matched
-    # BBFILE_PATTERN_<c>") even though the layer itself loads.
-    # LAYERDEPENDS: only hard-depend on "core". bitbake refuses to load a
-    # layer whose LAYERDEPENDS names a collection not enabled in BBLAYERS and
-    # silently drops every recipe in it ("Nothing PROVIDES ..."). The classes
-    # py2bbr emits (pypi, setuptools3, python_pep517,
-    # python_setuptools_build_meta) all live in poky core for the supported
-    # series, so meta-python ("python") must not be a hard layer dependency;
-    # recipe-level needs of it fail per-recipe with a precise error instead.
-    # LAYERSERIES_COMPAT: the modern series-compatibility variable; the old
-    # LAYERCOMPATIBLE is no longer read by bitbake.
+    """
+    Typical layer elements.
+
+    - BBFILES: bitbake only scans files matching BBFILES globs, so a layer
+      that never adds its recipe tree is invisible ("No bb files ... matched
+      BBFILE_PATTERN_<c>") even though the layer itself loads.
+    - LAYERDEPENDS: Only depends on "core". bitbake refuses to load a
+      layer whose LAYERDEPENDS names a collection not enabled in BBLAYERS and
+      *silently* drops every recipe in it ("Nothing PROVIDES ...").
+      meta-python must not be a hard layer dependency. Recipe-level needs for
+      it fail per-recipe with an error.
+    - LAYERSERIES_COMPAT: the modern series-compatibility variable.
+    - BBFILE_PRIORITY set to 5, lower than the default 7 in poky to prioritise
+      "official" layers if they exist (assuming most people would prefer
+      *not* having to use py2bbr).
+    """
     return (
         f'BBPATH .= ":${{LAYERDIR}}"\n'
         f'BBFILES += "${{LAYERDIR}}/recipes-*/*/*.bb"\n'
@@ -281,7 +256,7 @@ def _layer_readme(meta: PackageMetadata, yocto: YoctoVersion) -> str:
     return (
         f"# py2bbr-generated layer\n"
         f"\n"
-        f"Generated by py2bbr. This layer provides a Bitbake recipe for the\n"
+        f"Generated by py2bbr {__version__}. This layer provides a Bitbake recipe for the\n"
         f"Python package `{meta.name}` ({meta.version}) targeting\n"
         f"{yocto.label}, {yocto.runtime_label}.\n"
         f"\n"
@@ -296,13 +271,10 @@ def render_layer(
     build_class: str | None = None,
     extra_metas: list[PackageMetadata] | None = None,
 ) -> dict[str, str]:
-    """Render a full Yocto layer as ``{relative_path: content}``.
+    """Render a full Yocto layer as a dict `{relative_path: content}`.
 
-    ``extra_metas`` (the other members of the runtime-dependency closure, in
-    BFS order, ``extra_metas[0]`` excluded — ``meta`` is the top recipe) each
-    render their own recipe into the *same* layer. One recipe per member;
-    ``RDEPENDS:${PN}`` on each member pulls the next recipe transitively
-    (bitbake follows RDEPENDS), so the kas target stays ``meta``'s PN.
+    One recipe per member (dependency, etc). `RDEPENDS:${PN}` on each member
+    pulls the next recipe transitively (bitbake follows RDEPENDS).
     """
     from py2bbr.recipe import render_recipe
 
@@ -339,14 +311,12 @@ def write_layer(
     extra_metas: list[PackageMetadata] | None = None,
     vendor_sources: dict[str, Path] | None = None,
 ) -> Path:
-    """Write the layer tree under ``layer_dir``; return the top recipe path.
+    """Write the layer tree under `layer_dir` and return the top recipe path.
 
-    ``vendor_sources`` maps recipe file names (e.g. ``python3-x_1.0.bb``) to
-    the artifact each vendored recipe must ship; each is copied into the
-    layer's ``recipes-devtools/python/files/`` so the ``file://`` SRC_URI
-    resolves through FILESPATH. A vendored recipe without its source is an
-    error: the generated recipe would reference a file the layer does not
-    carry.
+    `vendor_sources` maps recipe file names (e.g. `python3-x_1.0.bb`) to
+    the file each vendored recipe must contain, copied into the layer tree
+    under `recipes-devtools/python/files/` so that `file://` SRC_URI
+    resolves through FILESPATH.
     """
     layer_dir = Path(layer_dir)
     files = render_layer(
@@ -407,13 +377,9 @@ def render_kas_file(
     include_meta_python: bool = True,
 ) -> str:
     """
-    Render a ``kas`` build file (YAML) that builds the generated recipe.
+    Render a `kas` build file (YAML) that builds the generated recipe.
 
-    The file references poky at the matching branch and includes the generated
-    layer as a local (non-URL) repo. ``include_meta_python`` adds the
-    meta-python layer (needed only when deps are left to it, i.e. ``--no-deps``;
-    a self-contained layer must exclude it or its recipes would duplicate the
-    generated member recipes).
+    TODO Experimental and barely tested.
     """
     import yaml
 
@@ -453,8 +419,10 @@ def validate_kas_file(config: dict) -> list[str]:
     """
     Validate a kas config dict against the official kas JSON schema.
 
-    Returns a list of error strings (empty if valid). Falls back to a minimal
-    structural check if ``kas``/``jsonschema`` are unavailable.
+    Returns a list of error strings if any.
+
+    Falls back to a minimal structural check if `kas`/`jsonschema` are
+    not available in the executing environment.
     """
     try:
         import jsonschema  # type: ignore
