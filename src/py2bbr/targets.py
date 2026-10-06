@@ -58,25 +58,29 @@ from py2bbr.recipe import (
 
 @dataclass(frozen=True)
 class Target:
-    """One CPU family py2bbr reports on."""
+    """One arch py2bbr reports on."""
 
     key: str
-    #: Short human label, e.g. ``cortex-a72 (32-bit ARM)``.
+
+    #: Short human label, e.g. ``cortex-a72 (64-bit ARM)``.
     label: str
-    #: ``platform.machine()`` value as Python reports it on this target.
+
+    #: `platform.machine()` value reported on this target.
     platform_machine: str
-    #: Tokens poky puts in ``MACHINEOVERRIDES`` for this architecture (see
-    #: ``meta/conf/machine/include/*/arch-*.inc``): ``x86`` / ``x86_64`` /
-    #: ``armv7a`` / ``aarch64`` / ``riscv64`` / ... They are the override
-    #: suffixes a recipe may use in ``RDEPENDS:${PN}:append:<token>``.
+
+    # Tokens poky puts in ``MACHINEOVERRIDES`` for this architecture (see
+    # `meta/conf/machine/include/*/arch-*.inc`): `x86` / `x86_64` /
+    # `armv7a` / `aarch64` / `riscv64` / etc. They are override
+    # suffixes a recipe can use in `RDEPENDS:${PN}:append:<token>`.
     machine_overrides: tuple[str, ...]
-    #: Example Yocto machine names, for the report.
+
+    # Example Yocto machine names, for the report.
     machines: str = ""
 
 
-#: Major targets we report on. ARM Cortex-A cores get one entry each because
-#: they differ in TUNE (``cortexa53`` / ``cortexa57`` / ``cortexa72``), and the
-#: 32-bit / 64-bit split changes the ``MACHINEOVERRIDES`` token as well.
+# Major targets we report on. ARM Cortex-A cores get one entry each because
+# they differ in TUNE (`cortexa53` / `cortexa57` / `cortexa72`), and the
+# 32-bit / 64-bit split changes the `MACHINEOVERRIDES` token as well.
 KNOWN_TARGETS: tuple[Target, ...] = (
     Target(
         key="x86",
@@ -152,15 +156,17 @@ KNOWN_TARGETS: tuple[Target, ...] = (
 
 
 def target_by_key(key: str) -> Target | None:
-    """Look up a target by key or by ``platform_machine`` value."""
+    """Look up a target by key or by `platform_machine` value."""
     for t in KNOWN_TARGETS:
         if key == t.key or key == t.platform_machine:
             return t
     return None
 
 
-#: Backends that cannot produce target binaries without extra infrastructure
-#: (a Rust toolchain poky does not ship, or a host-oriented driver).
+# Backends that cannot produce target binaries without extra infrastructure
+# (e.g. a Rust toolchain poky does not ship).
+#
+# TODO Experimental and future work as Rust wrappers are more frequent these days.
 _HOST_ONLY_BACKENDS = {
     "maturin": "maturin builds for the running interpreter; cross builds need "
     "a Rust cross toolchain and a target runner",
@@ -171,39 +177,40 @@ _HOST_ONLY_BACKENDS = {
     "cffi-rust": "cffi-rust compiles Rust for the host",
 }
 
-#: Build requirements that imply a Rust toolchain for the recipe's DEPENDS.
+# Build requirements that imply a Rust toolchain for the recipe's DEPENDS.
 _RUST_BUILD_DEPS = frozenset(
     {"cffi-rust", "maturin", "setuptools-rust", "setuptools_rust"}
 )
 
 
 class Verdict(StrEnum):
-    """Per-target build compatibility."""
+    """Compatibility conclusion (verdict)."""
 
-    #: Nothing target specific found: the package builds (or is pure Python)
-    #: everywhere in the matrix.
+    # All good: The package builds or is pure Python.
     OK = "OK"
-    #: Builds for the target, but something needs verifying by hand.
+
+    # Builds for the target, but something needs verifying by hand.
     RISK = "RISK"
-    #: Cannot work on this target.
+
+    # Cannot work on this target.
     INCOMPATIBLE = "INCOMPATIBLE"
 
 
 @dataclass
 class TargetVerdict:
-    """One target's verdict plus the reasons specific to that target."""
+    """Report on target compatibility and extra notes."""
 
     target: Target
     verdict: Verdict = Verdict.OK
     notes: list[str] = field(default_factory=list)
 
     def add(self, verdict: Verdict, note: str) -> None:
-        """Record ``note``; ``INCOMPATIBLE`` outranks the softer verdicts."""
+        """Record a verdict and associated note."""
         self.notes.append(note)
         self.mark(verdict)
 
     def mark(self, verdict: Verdict) -> None:
-        """Raise the verdict without a per-target note (shared reason)."""
+        """Mark the target as the "worse" compatibility level detected in the process."""
         if verdict is Verdict.INCOMPATIBLE:
             self.verdict = Verdict.INCOMPATIBLE
         elif (
@@ -214,21 +221,26 @@ class TargetVerdict:
 
 @dataclass
 class TargetReport:
-    """The full build-for-target verdict for one package."""
+    """The full report and conclusions for one package."""
 
     verdicts: list[TargetVerdict] = field(default_factory=list)
-    #: Findings that hold for every target (printed once).
+
+    # Findings that hold for every target.
     notes: list[str] = field(default_factory=list)
-    #: The build class the report was computed for.
+
+    # The build class the report was computed for.
     build_class: str = ""
-    #: Architecture that builds the layer (the x86_64/-native side).
+
+    # Architecture that builds the layer (the x86_64/-native side).
     build_host: str = "x86_64"
-    #: ``platform_machine`` of the architecture the recipe targets
-    # (``--target-arch``), i.e. the one row of the matrix the layer is for.
+
+    # `platform_machine` of the architecture the recipe targets
     target_arch: str = ""
-    #: True when the sdist ships no compiled code.
+
+    # True when the sdist/wheel contains no compiled code.
     pure_python: bool = True
-    #: True when ``build_class`` compiles against the target toolchain.
+
+    # True when `build_class` compiles against the target toolchain.
     cross_builds: bool = True
 
     @property
@@ -248,7 +260,7 @@ class TargetReport:
         return None
 
     def render(self) -> list[str]:
-        """Human-readable: shared findings once, then one line per target."""
+        """Reports findings once, then one line per target."""
         out = [
             (
                 f"Build for target (build class {self.build_class}, "
@@ -271,26 +283,25 @@ class TargetReport:
         return out
 
 
-#: ``platform_machine`` values that are x86, i.e. targets an x86-tuned build
-#: (AVX/SSE flags) is at home on.
+# `platform_machine` values that are x86, i.e. targets an x86-tuned build
+# (AVX/SSE flags) works on.
 _X86_MACHINES = frozenset({"amd64", "i386", "i486", "i586", "i686", "x86_64"})
 
 
 def _wheel_platform(filename: str) -> tuple[str, str]:
-    """``(arch, platform)`` a wheel filename pins, both empty if arch-agnostic.
-
-    ``py3-none-any`` is architecture independent. Anything else ships binaries
-    built for one platform: ``cp312-cp312-manylinux_2_17_aarch64.whl`` pins both
-    the OS and the CPU family, ``...-macosx_11_0_arm64.whl`` pins an OS this
-    image never runs.
+    """
+    `py3-none-any` is architecture independent. Anything else includes binaries
+    built for one platform, like `cp312-cp312-manylinux_2_17_aarch64.whl`
     """
     try:
         _name, _version, _build, tags = parse_wheel_filename(filename)
     except (InvalidWheelFilename, ValueError):
         return "", ""
+
     platforms = {t.platform for t in tags}
     if platforms == {"any"}:
         return "", ""
+
     # Several tags of one wheel can name different platforms (compatibility
     # tags); report the lowest so the message names one platform, not a set.
     platform = min(platforms)
@@ -304,11 +315,12 @@ def _wheel_platform(filename: str) -> tuple[str, str]:
     ):
         if family in platform:
             return family, platform
+
     return "", platform
 
 
 def _python_verdict(meta: PackageMetadata, yocto: YoctoVersion) -> str:
-    """Reason the target Python cannot build the package, or ``""``."""
+    """Reason the target Python cannot build the package, or `""`."""
     if not meta.requires_python:
         return ""
     try:
@@ -324,7 +336,7 @@ def _python_verdict(meta: PackageMetadata, yocto: YoctoVersion) -> str:
 
 
 def _rust_reason(meta: PackageMetadata) -> str:
-    """Reason a Rust toolchain blocks the build, or ``""``."""
+    """Reason a Rust toolchain blocks the build, or `""`."""
     names = {canonical_name(d.name) for d in meta.build_deps} | {
         canonical_name(meta.build_backend or "")
     }
@@ -340,13 +352,10 @@ def evaluate(
     *,
     targets: tuple[Target, ...] | None = None,
 ) -> TargetReport:
-    """Judge ``meta`` against every target in the matrix.
+    """
+    Evaluate `meta` against all targets.
 
-    ``build_class`` is the class the recipe inherits, so an explicit
-    ``--build-class`` override is reflected in the verdict. Findings that do
-    not depend on the target (the Python version gate, a missing Rust
-    toolchain, how the build class cross-compiles) are collected once in
-    :attr:`TargetReport.notes`; only genuinely per-target findings repeat.
+    `build_class` is the class the recipe inherits.
     """
     report = TargetReport(
         build_class=build_class,
@@ -355,7 +364,7 @@ def evaluate(
     )
     targets = targets or KNOWN_TARGETS
 
-    # --- findings that hold for every target ------------------------------
+    # For all targets.
     python_block = _python_verdict(meta, yocto)
     rust_block = _rust_reason(meta)
     wheel_arch, wheel_platform = (
@@ -401,11 +410,7 @@ def evaluate(
                 f"{driver}, or the image gets {report.build_host} binaries"
             )
     else:
-        # The note answers "why is nothing a compile problem here?", and the
-        # noun has to match the artifact: an sdist is compiled into a wheel, a
-        # py3-none-any wheel is already a finished artifact, and a wheel pinned
-        # to a machine was described above (the note can then only contradict
-        # it by claiming the payload is pure Python).
+        # Nothing to compile: Already wheel, or pure Python code.
         if meta.source_kind.value == "wheel":
             if not wheel_arch and not foreign_os:
                 report.notes.append(
@@ -417,6 +422,7 @@ def evaluate(
                 f"pure-Python sdist: {build_class} produces host-independent "
                 "wheels"
             )
+
     if meta.machine_deps:
         names = ", ".join(sorted(d.name for d in meta.machine_deps))
         report.notes.append(
@@ -425,11 +431,13 @@ def evaluate(
             "the set that matches the target"
         )
 
-    # --- per-target findings ----------------------------------------------
+    # Per target.
     for target in targets:
         v = TargetVerdict(target)
+
         if python_block or rust_block:
             v.mark(Verdict.INCOMPATIBLE)
+
         if foreign_os:
             v.add(
                 Verdict.INCOMPATIBLE,
@@ -448,20 +456,19 @@ def evaluate(
                 "the prebuilt wheel matches this architecture, so the image "
                 "works - but nothing is compiled for the target",
             )
+
         if (
             meta.has_native_code
             and not report.cross_builds
             and v.verdict is not Verdict.INCOMPATIBLE
         ):
-            # A shared reason (missing Rust toolchain, prebuilt wheel of the
-            # wrong OS) already decided this target: repeating the "confirm
-            # the sysroot" advice on top only buries the verdict.
             v.add(
                 Verdict.RISK,
                 f"confirm the {target.platform_machine} extension modules in "
                 f"the sysroot: {build_class} would otherwise ship "
                 f"{report.build_host} binaries",
             )
+
         if (
             meta.host_assumptions
             and v.verdict is not Verdict.INCOMPATIBLE
@@ -474,6 +481,7 @@ def evaluate(
                 + "): the compile may fail, or an optimization may be "
                 "silently dropped on this target",
             )
+
         needed = [
             d.name
             for d in meta.machine_deps
