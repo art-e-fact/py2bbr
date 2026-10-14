@@ -128,7 +128,7 @@ class PipOptions:
         args += list(self.pip_args)
         return args
 
-    def describe(self) -> list[str]:
+    def index_flags(self) -> list[str]:
         out: list[str] = []
         if self.index_url:
             out.append(f"--index-url={self.index_url}")
@@ -177,21 +177,9 @@ def _pip_python_version(yocto: YoctoVersion | None) -> str | None:
     return f"3.{int(parts[1])}"
 
 
-#: glibc versions a ``manylinux_X_Y`` tag exists for. pip resolves a
-#: ``--platform`` value as a *literal* platform tag (it does not expand
-#: ``manylinux_2_17_aarch64`` into the manylinux family the way it derives the
-#: build host's own tags), so the family has to be spelled out for the target.
-#: The range is deliberately generous: a tag for a glibc that has not shipped
-#: yet costs nothing, since no wheel can carry it, while one that is missing
-#: would reject a perfectly good artifact. (glibc is still on its 2.x series;
-#: a 3.0 would need the major in here too.)
 _MANYLINUX_FIRST_MINOR = 5  # glibc 2.5, the oldest manylinux1 baseline
 _MANYLINUX_LAST_MINOR = 45  # past every glibc released so far
 
-#: The pre-PEP 600 manylinux aliases, the two musl releases, and the plain
-#: linux tag a project uses when it wheels against a hand-built toolchain.
-#: None of these exist for every architecture, which is harmless: pip only
-#: needs a tag some wheel could carry.
 _LEGACY_FAMILIES = (
     "manylinux1",
     "manylinux2010",
@@ -203,33 +191,16 @@ _LEGACY_FAMILIES = (
 
 
 def _pip_platforms(yocto: YoctoVersion | None) -> list[str]:
-    """The ``--platform`` tags a wheel download is restricted to.
+    """
+    The `--platform` tags a wheel download is restricted to.
 
-    An empty list means "let pip decide", which is the right answer whenever
-    the target is the machine py2bbr runs on: pip then applies this host's own
-    tag set - the manylinux and musllinux baselines of the *host's* libc, this
-    interpreter's ABI, whatever else the host happens to support - and
-    enumerating a guessed family could only narrow that.
-
-    A *different* target architecture is the case pip cannot answer by itself:
-    its native tags describe the build host, so it hands over the host's
-    artifact (pyvizionsdk publishes a different version per architecture, so
-    the wrong wheel is the wrong *version*). The pin is then the only thing
-    that makes pip fetch the target's, and py2bbr goes on to record that exact
-    artifact's sha256 in ``SRC_URI[sha256sum]``.
-
-    The result mirrors what pip would accept on a machine of that CPU: every
-    manylinux glibc baseline, the legacy aliases, musllinux, and the bare
-    ``linux_<arch>``.
+    Arch families like manylinux, etc.
     """
     target = getattr(yocto, "platform_machine", "") or ""
     host = platform.machine().strip().lower()
-    # An empty host architecture means "unknown", not "x86_64": pip's native
-    # tags stay in charge there, since they are the only ones that can be right
-    # about a machine that cannot say what it is. Naming the target explicitly
-    # is what opts into a pin.
     if not target or not host or target == host:
         return []
+
     families = [
         f"manylinux_2_{minor}"
         for minor in range(_MANYLINUX_FIRST_MINOR, _MANYLINUX_LAST_MINOR + 1)
@@ -239,11 +210,7 @@ def _pip_platforms(yocto: YoctoVersion | None) -> list[str]:
 
 
 def _target_label(yocto: YoctoVersion | None) -> str:
-    """Name the target a constraint came from, e.g. ``Yocto 5.0 (scarthgap)``.
-
-    Without it these messages say "the target", and a reader has no way to tell
-    which of several targets in one layer the verdict applies to.
-    """
+    """Name the target a constraint came from, e.g. `Yocto 5.0 (scarthgap)`."""
     version = getattr(yocto, "version", "") or ""
     codename = getattr(yocto, "codename", "") or ""
     if version and codename and version != codename:
@@ -275,36 +242,12 @@ def _run_pip_download(
         + pip_opts.build_args()
     )
     if python_version:
-        # Pin the interpreter the artifact has to run on, or pip resolves
-        # against the interpreter py2bbr itself happens to run under. That is a
-        # property of the machine running py2bbr, not of the target: a CPython
-        # 3.12 layer generated from a 3.14 host would be handed a cp314 wheel
-        # (and skip packages gated on ``Requires-Python >= 3.13``), so the
-        # generated layer would only work on the host that made it.
         cmd += ["--python-version", python_version]
     if platform_tags:
-        # Same reasoning for the CPU: pip's platform tags describe the build
-        # host, so an x86_64 host is offered the x86_64 artifact for a target
-        # that runs aarch64. Only set for a target that *is* the build host's
-        # architecture away (see :func:`_pip_platforms`); pip requires
-        # ``--only-binary``/``--no-deps`` alongside it, both of which the
-        # caller passes.
-        #
-        # One ``--platform`` per tag, never a comma-joined list: pip's option
-        # is ``action="append"`` and it does not split its value, so
-        # ``--platform a,b`` is matched as the single literal tag ``a,b`` and
-        # matches nothing at all (pip reports "no matching distribution" for an
-        # index that serves exactly the requested wheel). That is why the
-        # cross-arch fetch of pyvizionsdk found no aarch64 wheel.
         for tag in platform_tags:
             cmd += ["--platform", tag]
     if no_build_isolation:
-        # Build the sdist's metadata with the environment py2bbr runs in rather
-        # than letting pip provision an isolated one from the index.
         cmd.append("--no-build-isolation")
-    # pip's isolated metadata build unpacks the sdist into $TMPDIR, which may
-    # be an inode-starved tmpfs (ENOSPC mid-extraction); route pip's scratch
-    # onto the workdir filesystem (dest as parent), where it is deleted with dest.
     scratch = dest / "pip-scratch"
     scratch.mkdir(exist_ok=True)
     env = os.environ.copy()
@@ -318,20 +261,12 @@ def _run_pip_download(
     )
 
 
-# Base URL the ``pypi`` bitbake class fetches sdists from (scarthgap
-# pypi.bbclass: ``PYPI_SRC_URI = .../packages/source/<first>/<pkg>/<pkg>-<pv>.tar.gz``).
+# Base URL the `pypi` bitbake class gets sdists from.
 _PYPI_FILES_BASE = "https://files.pythonhosted.org/packages/source"
 
 
 def _public_pypi_sdist_url(filename: str) -> str | None:
-    """The exact URL ``inherit pypi`` would fetch for an sdist, or None.
-
-    The class always requests ``.tar.gz`` (``PYPI_PACKAGE_EXT`` default) at
-    ``packages/source/<first-char>/<name>/<name>-<version>.tar.gz``; re-deriving
-    that URL lets us predict a ``do_fetch`` 404 for packages that only exist on
-    a private index (the pyvizionsdk failure). Wheels and undecodable names
-    have no derivable public sdist URL.
-    """
+    """The exact URL ``inherit pypi`` would fetch for an sdist, or None."""
     for ext in (".tar.gz", ".tar.bz2", ".tar.xz", ".zip"):
         if filename.endswith(ext):
             stem = filename[: -len(ext)]
@@ -347,11 +282,7 @@ def _public_pypi_sdist_url(filename: str) -> str | None:
 
 
 def _sdist_reachable(url: str, timeout: float = 5.0) -> bool:
-    """Whether the public PyPI sdist URL answers a HEAD request with success.
-
-    Any transport error (DNS, TLS, 4xx/5xx, timeout) means the pypi class'
-    ``do_fetch`` would fail the same way, so it counts as unreachable.
-    """
+    """Check if a URL answers a HEAD request successfully."""
     request = urllib.request.Request(url, method="HEAD")
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
@@ -363,16 +294,7 @@ def _sdist_reachable(url: str, timeout: float = 5.0) -> bool:
 def _warn_sdist_unavailable(
     requirement: str, proc: subprocess.CompletedProcess[str]
 ) -> None:
-    """Log why the sdist attempt produced no artifact, before wheel fallback.
-
-    pip downloads an sdist by preparing its PEP 517 metadata in an isolated
-    build env, which can fail for environmental reasons (e.g. ``ENOSPC`` on a
-    full ``/tmp``) even though the sdist exists on the index. A wheel-based
-    recipe then has no ``[build-system]`` of its own to read (backend, build
-    deps, bounds-relax): :func:`build_system_from_vcs` may recover it from the
-    project's repository when the metadata names one, but the pip diagnostics
-    must not be dropped either way.
-    """
+    """Log why the sdist attempt produced no artifact."""
     tail = "\n".join(
         f"  {line}"
         for line in (proc.stderr or proc.stdout or "").strip().splitlines()[-6:]
@@ -387,11 +309,7 @@ def _warn_sdist_unavailable(
 
 
 def _wheel_tags(filename: str) -> set[tuple[str, str]] | None:
-    """The ``(interpreter, abi)`` tag pairs a wheel filename claims.
-
-    ``None`` when the name is not a parsable wheel filename, so callers can
-    let the build report the real problem instead of guessing here.
-    """
+    """The `(interpreter, abi)` tag pairs a wheel filename claims."""
     try:
         _name, _version, _build, tags = parse_wheel_filename(filename)
     except (InvalidWheelFilename, ValueError):
@@ -402,13 +320,7 @@ def _wheel_tags(filename: str) -> set[tuple[str, str]] | None:
 def _tag_serves(
     target_major: str, target_minor: str, tag: str, abi: str
 ) -> bool:
-    """Whether one wheel tag runs on CPython ``target_major.target_minor``.
-
-    The stable ABI (``abi3``) is the case that needs care: a ``cp38-abi3`` wheel
-    is compiled once against the limited API and installs on every later CPython
-    3, so it is *not* version-locked to the 3.8 it was named after. Rejecting it
-    would be wrong. A version-specific ABI (``cp312``) is locked.
-    """
+    """Whether one wheel tag runs on CPython `target_major.target_minor`."""
     if tag in (f"py{target_major}", f"py{target_major}{target_minor}"):
         return True
     if tag == f"cp{target_major}{target_minor}":
@@ -427,30 +339,13 @@ def _tag_serves(
 def _wheel_rejection_reason(
     filename: str, yocto: YoctoVersion | None
 ) -> str | None:
-    """Why a wheel cannot serve the target interpreter, or None if it can.
-
-    A wheel is a *build product* for one exact ABI and platform, not source:
-    there is nothing left for bitbake to build. It is still the right artifact
-    when a package publishes no sdist, because the target runs the same Python
-    the wheel was compiled against. Those tags live in the file name
-    (``pyvizionsdk-26.9.1-cp38-abi3-manylinux_2_17_x86_64.whl`` is CPython
-    3.8 onwards), so the mismatch is decidable here - rather than surfacing
-    much later as a hard load error inside the target's Python.
-
-    The *platform* tag is deliberately not rejected: it is a *choosing* problem
-    rather than a parsing one. A wheel built for a foreign CPU is answered by
-    the download itself - pip is pinned to the target architecture when it
-    differs from the build host's (see :func:`_pip_platforms`) - and whatever
-    still arrives is judged per target by the build-for-target report (see
-    ``py2bbr.targets``), which knows the whole architecture matrix rather than
-    only the one arch py2bbr was told about.
-    """
+    """Why a wheel cannot serve the target interpreter, or None if it can."""
     target = getattr(yocto, "python_version", "") or ""
     if not target.startswith("3."):
-        return None  # not a CPython 3 target: nothing to compare against
+        return None  # not a CPython 3 target
     tags = _wheel_tags(filename)
     if tags is None:
-        return None  # unparsable name: let the build report it
+        return None  # unparsable name
     major, _, minor = target.partition(".")
     if any(_tag_serves(major, minor, tag, abi) for tag, abi in tags):
         return None
@@ -475,60 +370,19 @@ def fetch_source(
     check_public: bool = False,
     yocto: YoctoVersion | None = None,
 ) -> FetchedSource:
-    """Download the package (sdist preferred) into ``workdir``.
-
-    ``requirement``, when given, is used verbatim as the ``pip download``
-    requirement instead of ``name``/``version``. This is how the dependency
-    closure resolver passes a dependency's requirement (with its bounds, e.g.
-    ``tomli>=1.0.2``) through to pip so the declared bounds are honoured when
-    picking versions. The requirement has usually already been capped to the
-    same-major series by :func:`apply_major_cap` during classification
-    (``tomli>=1.0.2,<2``), unless ``--no-major-bump-cap`` was passed.
-
-    With ``check_public=True``, ``public_reachable`` records whether the
-    ``pypi`` class' fetch URL for the artifact answers on public PyPI
-    (S6/vendoring: packages only on a private index make do_fetch 404, so the
-    recipe must ship the sdist in the layer instead).
-
-    Each call downloads into its own fresh subdirectory of
-    ``workdir/download``: the closure resolver fetches many packages into the
-    same ``workdir``, and ``_pick_artifact`` must only ever see the artifacts
-    of *this* requirement (a shared dir would resolve every member to the
-    alphabetically-first artifact already present, and a reused per-package
-    dir would keep picking a stale version from an earlier run).
-
-    Raises :class:`MetadataNotFoundError` if no artifact is available, and as a
-    backstop for a wheel whose ABI tag cannot run on the target (``yocto``
-    enables that check; the wheel download itself is already restricted to the
-    target's interpreter).
-    """
+    """Download the package (sdist preferred) into `workdir`."""
     requirement = requirement or (f"{name}=={version}" if version else name)
     parent = workdir / "download"
     parent.mkdir(parents=True, exist_ok=True)
     dest = Path(tempfile.mkdtemp(prefix=f"{_canonical(name)}-", dir=parent))
 
-    # Prefer sdist so the sha256 matches what `inherit pypi` fetches. Both
-    # attempts demand an sdist explicitly: a wheel surfacing here means the
-    # sdist is not obtainable, which is what the fallback below (and its
-    # warning) exists to report.
     proc = _run_pip_download(requirement, dest, pip_opts, "--no-binary=:all:")
-    artifact = _pick_artifact(dest, prefer_sdist=True, sdists_only=True)
+    artifact = _pick_artifact(dest, sdists_only=True)
     if artifact is None:
-        # Retry without pip's build isolation. Building the sdist's metadata
-        # in isolation means pip first downloads the declared build backend
-        # from the index, which an index that carries only the package itself
-        # (or one reached through a narrow credential) cannot serve - and the
-        # download then fails even though the sdist is right there. py2bbr's own
-        # environment can build the metadata, so the second attempt drops the
-        # isolation and gets the sdist instead of falling through to a wheel.
         logger.debug(
             "%s: sdist download failed, retrying without build isolation",
             requirement,
         )
-        # ``proc`` deliberately keeps the *first* attempt's output: that is the
-        # root cause the retry works around, and it is the one whose diagnostic
-        # is specific (a transient tmpfs failure reads very differently from
-        # "no sdist published"). The retry is the mitigation, not the news.
         _run_pip_download(
             requirement,
             dest,
@@ -536,12 +390,10 @@ def fetch_source(
             "--no-binary=:all:",
             no_build_isolation=True,
         )
-        artifact = _pick_artifact(dest, prefer_sdist=True, sdists_only=True)
+        artifact = _pick_artifact(dest, sdists_only=True)
     if artifact is None:
+        # No sdist available, report and move on
         _warn_sdist_unavailable(requirement, proc)
-        # No sdist: fall back to a wheel, which bitbake installs instead of
-        # building. Pin the *target's* runtime - interpreter and CPU - so pip
-        # cannot answer with an artifact built for the machine py2bbr runs on.
         pinned = _pip_python_version(yocto)
         pinned_platform = _pip_platforms(yocto)
         proc = _run_pip_download(
@@ -552,13 +404,9 @@ def fetch_source(
             python_version=pinned,
             platform_tags=pinned_platform,
         )
-        artifact = _pick_artifact(dest, prefer_sdist=False)
+        artifact = _pick_artifact(dest)
     if artifact is None:
         tail = (proc.stderr or proc.stdout or "").strip().splitlines()[-6:]
-        # pip filters wheels by interpreter (and, when pinned, platform) tag,
-        # so an index that carries only artifacts for *other* targets reads as
-        # "no versions at all". Without the pins named, that is
-        # indistinguishable from a typo in the requirement or a wrong index URL.
         restrictions = []
         served_for = []
         if pinned:
@@ -566,17 +414,9 @@ def fetch_source(
             served_for.append(f"CPython {pinned}")
         if pinned_platform:
             arch = getattr(yocto, "platform_machine", "") or "the target's"
-            # The full platform list is a wall of ~45 manylinux baselines; name
-            # the CPU it is built around, which is what a reader has to check.
             served_for.append(f"{arch} wheels")
         hint = ""
         if restrictions:
-            # The reproduction command keeps the interpreter pin but drops the
-            # platform one: pip has no wildcard for --platform, so quoting a
-            # single tag would be arbitrary and quoting all ~45 is unreadable.
-            # What that command settles is the question the reader actually has
-            # - does this index serve a wheel for this Python at all? A success
-            # means the index is fine and simply carries nothing for the CPU.
             verdict = (
                 f" If this command finds a wheel, the index carries nothing "
                 f"for {arch}."
@@ -593,14 +433,10 @@ def fetch_source(
             )
         raise MetadataNotFoundError(
             f"could not download {requirement!r} from the configured index(es) "
-            f"{' '.join(pip_opts.describe()) or '(default PyPI)'}.\n"
+            f"{' '.join(pip_opts.index_flags()) or '(default PyPI)'}.\n"
             + "\n".join(f"  {line}" for line in tail)
             + hint
         )
-    # Backstop for the case pip's own target-interpreter filter cannot cover:
-    # a wheel it considers compatible still has to name an ABI the target runs.
-    # Report that now, not as a target-side load failure after a long cross
-    # build.
     if artifact.suffix == ".whl" and (
         reason := _wheel_rejection_reason(artifact.name, yocto)
     ):
@@ -636,29 +472,33 @@ def fetch_source(
     )
 
 
-def _pick_artifact(
-    dest: Path, prefer_sdist: bool, sdists_only: bool = False
-) -> Path | None:
-    # ``Path.suffix`` only returns the last suffix (``.gz``), so match the full
-    # sdist extension via ``name.endswith``.
+def _pick_artifact(dest: Path, sdists_only: bool = False) -> Path | None:
+    """
+    Choose a package distribution artifact based on priorities.
+
+    Note that we default to prefer sdist distributions, as the most
+    complete sources for py2bbr's purpose.
+    """
+    # `Path.suffix` only returns the last suffix, so using `name.endswith`.
     sdists = [
         p
         for p in dest.iterdir()
         if p.name.endswith((".tar.gz", ".tar.bz2", ".tar.xz", ".zip"))
     ]
-    wheels = [p for p in dest.iterdir() if p.suffix == ".whl"]
-    if prefer_sdist and sdists:
-        return min(sdists)
-    if sdists_only:
-        # A ``--no-binary=:all:`` attempt that produced only a wheel did *not*
-        # succeed: a wheel carries no pyproject.toml, so accepting it here
-        # would skip the fallback and the warning about the lost
-        # [build-system] detection.
-        return None
-    if wheels:
-        return min(wheels)
+
+    # Most frequent and desired exit
     if sdists:
         return min(sdists)
+
+    # Gate to decide whether we continue
+    if sdists_only:
+        return None
+
+    # Wheels if any
+    wheels = [p for p in dest.iterdir() if p.suffix == ".whl"]
+    if wheels:
+        return min(wheels)
+
     return None
 
 
@@ -667,7 +507,7 @@ def _kind_of(path: Path) -> SourceKind:
 
 
 def _read_text_from_archive(path: Path, predicate) -> tuple[str, bytes] | None:
-    """Return ``(member_name, data)`` of the first archive member matching."""
+    """Return `(member_name, data)` of the first archive member matching."""
     if path.suffix == ".whl" or path.suffix == ".zip":
         with zipfile.ZipFile(path) as zf:
             for info in zf.infolist():
@@ -694,13 +534,6 @@ def parse_metadata_file(source: FetchedSource) -> email.message.Message:
     """Parse the core metadata (PKG-INFO or METADATA) of a source artifact."""
 
     def is_metadata(name: str) -> bool:
-        # Root-level only (zero or one directory prefix), the same convention
-        # ``read_build_system`` / ``find_license_file`` use: an sdist can
-        # vendor other packages' dist-info (flit_core 3.12 vendors a
-        # ``flit_core/vendor/tomli-1.2.3.dist-info/METADATA`` that sorts ahead
-        # of the package's own root ``PKG-INFO`` inside the archive), and
-        # the archive member order must not decide which package's metadata
-        # this source artifact describes.
         depth = name.count("/") - (1 if name.startswith("./") else 0)
         base = name.rsplit("/", 1)[-1]
         return (base == "PKG-INFO" or base == "METADATA") and depth <= 1
@@ -715,11 +548,7 @@ def parse_metadata_file(source: FetchedSource) -> email.message.Message:
 
 
 def _first(msg: email.message.Message, key: str) -> str:
-    """The sole value of ``key``, or ``""`` when absent or repeated.
-
-    A repeated header (e.g. two ``License`` lines after a bad merge) is
-    ambiguous, so treat it as missing rather than guess.
-    """
+    """The sole value of `key`, or `""` when absent or repeated."""
     values = msg.get_all(key) or []
     if len(values) != 1:
         return ""
@@ -757,12 +586,7 @@ def _homepage(
 
 
 def detect_license(msg: email.message.Message) -> tuple[str, str]:
-    """
-    Return ``(spdx_id, raw)`` for the package license.
-
-    Prefers the PEP 639 ``License-Expression`` field, then the OSI ``Classifier``,
-    then keyword-sniffing of the free-form ``License:`` text.
-    """
+    """Return `(spdx_id, raw)` for the package license."""
     expression = _first(msg, "License-Expression")
     if expression:
         return expression, expression
@@ -784,13 +608,7 @@ def detect_license(msg: email.message.Message) -> tuple[str, str]:
 
 
 def find_license_file(source: FetchedSource) -> tuple[str, str] | None:
-    """
-    Locate the license file and return ``(name_relative_to_root, md5)``.
-
-    Only top-level (sdist) / any (wheel) license files are considered. The name
-    is relative to the unpacked source root so it can be used directly in
-    ``LIC_FILES_CHKSUM = "file://<name>;md5=<md5>"``.
-    """
+    """Locate the license file and return `(name_relative_to_root, md5)`."""
     names = {n.upper() for n in _LICENSE_FILE_NAMES}
 
     def is_license(member: str) -> bool:
@@ -848,25 +666,8 @@ def _parse_toml(data: bytes) -> dict | None:
 
 def read_build_system(source: FetchedSource) -> tuple[str, list[str]] | None:
     """
-    Return ``(build_backend, build_requires)`` from the package's build config,
-    or ``None`` when the artifact ships no ``pyproject.toml`` at all.
-
-    The *top-level* ``pyproject.toml`` (exactly one path separator) is
-    authoritative. An sdist can bundle many nested ``pyproject.toml`` files
-    (test fixtures, docs), so we never fall back to those when a top-level file
-    exists - a top-level file without ``[build-system]`` means the implicit
-    setuptools backend.
-
-    The three outcomes are kept distinct on purpose, because only the third is
-    a gap worth looking elsewhere for:
-
-    * ``("mesonpy", ["meson-python>=0.13"])`` - a declared backend.
-    * ``("", [])`` - a ``pyproject.toml`` that declares none: upstream
-      affirmatively means the implicit setuptools backend, and reading a
-      *different* file could only contradict that.
-    * ``None`` - the artifact says nothing, which is the normal state of a
-      wheel (a built artifact carries no build config) and the case
-      :func:`build_system_from_vcs` exists to fill.
+    Return `(build_backend, build_requires)` from the package's build config,
+    or `None` when the artifact has no `pyproject.toml`.
     """
     cands = _all_matching(source.path, lambda n: n.endswith("pyproject.toml"))
     if not cands:
@@ -888,8 +689,7 @@ def read_build_system(source: FetchedSource) -> tuple[str, list[str]] | None:
             return (
                 "",
                 [],
-            )  # authoritative top-level: implicit setuptools backend
-    # No top-level file: use the shallowest nested one that declares a backend.
+            )
     rest = sorted(
         (c for c in cands if c[0].count("/") != 1),
         key=lambda nv: (nv[0].count("/"), nv[0]),
@@ -907,25 +707,12 @@ def read_build_system(source: FetchedSource) -> tuple[str, list[str]] | None:
     return "", []
 
 
-#: ``pyproject.toml`` at a public git forge, as ``(host, raw-file URL)``.
-#: ``HEAD`` is the default branch: a repository URL in package metadata rarely
-#: pins a ref, and a forge that serves raw files by ref also serves ``HEAD``,
-#: so one URL covers the case where the version was never tagged there.
-#:
-#: Only forges whose raw-file URL is a fixed, documented shape are listed. A
-#: self-hosted Gitea/Gogs instance is deliberately absent: guessing its layout
-#: would produce a URL that 404s for a different reason, and a 404 is
-#: indistinguishable from "no pyproject.toml" anyway.
 _VCS_RAW_URLS: dict[str, str] = {
     "github.com": "https://raw.githubusercontent.com/{path}/HEAD/{name}",
     "gitlab.com": "https://gitlab.com/{path}/-/raw/HEAD/{name}",
     "bitbucket.org": "https://bitbucket.org/{path}/raw/HEAD/{name}",
 }
 
-#: ``Project-URL`` labels that denote the repository, in the order core
-#: metadata is read: a labelled "Repository" is a deliberate statement, while
-#: ``Home-page`` is only a fallback (a project homepage is often a docs site,
-#: not a checkout).
 _VCS_URL_LABELS = frozenset(
     {
         "repository",
@@ -941,12 +728,6 @@ _VCS_URL_LABELS = frozenset(
     }
 )
 
-#: Path segments that end the repository part of a forge URL. Everything from
-#: one of these on names a file or a subdirectory *inside* the repo
-#: (``/tree/main/sub``, ``/-/blob/master/x``, ``/src/branch``,
-#: ``/issues/123``), not the repo. Longer markers first: ``/-/tree/`` contains
-#: ``/tree/`` as a substring, so a GitLab URL must be cut by the ``/-/`` form
-#: or the slice lands four characters too late.
 _VCS_SUBPAGE_MARKERS = (
     "/-/tree/",
     "/-/blob/",
@@ -992,20 +773,7 @@ def _vcs_repo_candidates(
 
 
 def _vcs_repo(url: str) -> tuple[str, str] | None:
-    """``(host, "owner/repo")`` for a repository URL, or None if unrecognised.
-
-    Reduces the many shapes a project URL comes in to what the forge needs:
-
-    * ``git+https://github.com/o/r.git@v1.0#egg=r`` (a VCS requirement, which
-      a tool-generated ``Requires-Dist`` may carry) and
-      ``https://github.com/o/r/tree/main/sub`` both become ``o/r``;
-    * a ``github.com.evil.example`` host does not match ``github.com``, so it is
-      not read as GitHub - a forged host must not redirect the fetch to
-      content the user never pointed at.
-
-    Returns None for a URL on a host not in :data:`_VCS_RAW_URLS`, which is the
-    signal to stop looking (see that mapping).
-    """
+    """`(host, "owner/repo")` for a repository URL, or None if unrecognised."""
     url = url.strip()
     url = url.removeprefix("git+")
     # ``#egg=``/``#subdirectory=`` fragments and any trailing path/query.
@@ -1025,11 +793,6 @@ def _vcs_repo(url: str) -> tuple[str, str] | None:
     if match is None:
         return None
     path = parts.path.strip("/")
-    # ``git+https://.../r.git@v1.0`` puts the ref in the path, not the netloc,
-    # once the ``#egg=`` fragment is gone (urlsplit cannot tell ``@v1.0`` from
-    # a directory, and a repo name cannot contain ``@`` on any of these
-    # forges). It is cut before the ``.git`` suffix so ``r.git@v1.0`` still
-    # reduces to ``r``.
     path = path.split("@", 1)[0]
     path = path.removesuffix(".git")
     for marker in _VCS_SUBPAGE_MARKERS:
@@ -1038,18 +801,12 @@ def _vcs_repo(url: str) -> tuple[str, str] | None:
             path = path[:index]
     segments = [s for s in path.split("/") if s]
     if len(segments) < 2:
-        # A forge root or a single-segment path is not a repository.
         return None
     return match, "/".join(segments)
 
 
 def _fetch_bytes(url: str, timeout: float) -> bytes | None:
-    """GET ``url`` and return the body, or None on any failure.
-
-    One helper for the network-optional lookups in this module, so a probe
-    never raises into the fetch path: an unreachable forge must leave the
-    answer unknown, not fail the run.
-    """
+    """GET `url` and return the body, or None on any failure."""
     request = urllib.request.Request(url, headers={"User-Agent": "py2bbr"})
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
@@ -1066,31 +823,11 @@ def build_system_from_vcs(
     filename: str = "pyproject.toml",
     timeout: float = 5.0,
 ) -> tuple[str, list[str], str] | None:
-    """The project's declared ``[build-system]``, read from its own repository.
+    """
+    The project's declared `[build-system]`, read from its own repository.
 
-    Returns ``(build_backend, build_requires, provenance)``, or None when no
-    candidate repository serves a readable ``filename``.
-
-    This exists for the package that publishes no sdist. The metadata of such a
-    package is all there is, and it names the repository but not the build
-    system - so without this, every such package is reported as an implicit
-    setuptools build, which is a *guess*, and a wrong one for exactly the
-    packages that are likeliest to have moved to another backend
-    (meson-python, maturin, hatchling, scikit-build-core). The guess then
-    propagates: it picks the build class, the build-time dependencies, and
-    whether a from-source rebuild would be feasible at all.
-
-    The provenance string is part of the return value because the answer is
-    only as good as the ref it came from: the default branch describes the
-    project *today*, and a project that migrated its backend after the release
-    will answer with the backend it no longer used when the wheel was built.
-    Callers must surface it rather than present the result as the release's own
-    declaration.
-
-    Best effort by construction - a forge that is down, rate-limiting, behind
-    a proxy, or serving a different layout is reported as "unknown", never as
-    an error. Losing a convenience lookup must not fail a fetch that already
-    succeeded.
+    Returns `(build_backend, build_requires, provenance)`, or None when no
+    candidate repository has a project `filename`.
     """
     for host, path in _vcs_repo_candidates(project_urls, homepage):
         url = _VCS_RAW_URLS[host].format(path=path, name=filename)
@@ -1100,16 +837,10 @@ def build_system_from_vcs(
             continue
         parsed = _parse_toml(data)
         if parsed is None:
-            # Answered, but not usable as build config: a 200 HTML error page is
-            # the usual cause. Do not report a "backend" from it.
             logger.debug("unparsable %s at %s", filename, url)
             continue
         build_system = parsed.get("build-system", {}) or {}
         if not build_system:
-            # A pyproject.toml without [build-system] is a real answer (the
-            # implicit setuptools backend), but from a ref that is not the
-            # release, so it stays a weak one - keep looking for a repo whose
-            # file says more.
             logger.debug("no [build-system] in %s at %s", filename, url)
             continue
         return (
@@ -1121,22 +852,7 @@ def build_system_from_vcs(
 
 
 def marker_env(yocto: YoctoVersion | None) -> dict:
-    """
-    A PEP 508 evaluation environment approximating the Yocto target.
-
-    We target a CPython on Linux; the Python version and the CPU come from the
-    resolved target runtime (the Yocto series, overridable with
-    ``--python-version`` / ``--target-arch``) so that version- and
-    architecture-gated dependencies (``tomli; python_version < "3.11"``) are
-    classified correctly for the image rather than for the machine py2bbr runs
-    on.
-
-    ``platform_machine`` is the *target's* architecture and therefore still only
-    an approximation: the layer is cross-built, so the real answer belongs to
-    bitbake on the real target. Machine-gated requirements are split out (see
-    :func:`machine_gated_deps`) and rendered per ``MACHINEOVERRIDES`` token
-    rather than resolved against this value.
-    """
+    """An evaluation environment approximating the Yocto target."""
     env = dict(default_environment())
     env.update(
         {
@@ -1156,20 +872,6 @@ def marker_env(yocto: YoctoVersion | None) -> dict:
     return env
 
 
-#: Backwards-compatible private alias (same module).
-_marker_env = marker_env
-
-
-# --------------------------------------------------------------------------- #
-# build-for-target inspection (native code / x86 assumptions)
-# --------------------------------------------------------------------------- #
-
-#: Suffix -> language label. A member with one of these suffixes (outside the
-#: test/doc trees, see :func:`_is_ignored_member`) means the sdist ships code
-#: that has to be compiled for the target, so the recipe's build class must
-#: drive the target toolchain. Headers (``.h``) are not evidence on their own:
-#: every pure-Python sdist that vendors a C snippet for a build hook would
-#: otherwise look like a compiled package.
 _NATIVE_SUFFIX_KINDS: dict[str, str] = {
     ".c": "C",
     ".cc": "C++",
@@ -1188,7 +890,6 @@ _NATIVE_SUFFIX_KINDS: dict[str, str] = {
     ".cu": "CUDA",
 }
 
-#: Directories whose contents are never part of the installed/built package.
 _IGNORED_DIR_NAMES = frozenset(
     {
         "bench",
@@ -1205,8 +906,8 @@ _IGNORED_DIR_NAMES = frozenset(
     }
 )
 
-#: ``[build-system].requires`` entries that imply compiled code even when the
-#: sdist carries no source of that language (a generated one, typically).
+# `[build-system].requires` entries that imply compiled code even when the
+# sdist carries no source of that language (a generated one, typically).
 _NATIVE_BUILD_REQS = frozenset(
     {
         "cffi",
@@ -1219,14 +920,6 @@ _NATIVE_BUILD_REQS = frozenset(
     }
 )
 
-#: Build-config tokens that pin the build to an x86 CPU. Deliberately limited
-#: to *flag-shaped* tokens: a bare ``x86_64``/``amd64``/``i686`` string in a
-#: ``pyproject.toml`` is nearly always a cibuildwheel image name or a guarded
-#: ``platform_machine`` branch, not a hard-coded build, and flagging those
-#: buries the real hazard. A guarded machine test is fine; ``-march=native`` or
-#: ``-mavx2`` reaching the ARM compiler is not. Their presence does not prove
-#: the package is x86-only, so they only raise a RISK for non-x86 targets - with
-#: the file named, so the user can check it.
 _HOST_ISA_TOKENS = (
     "-march=",
     "-mtune=",
@@ -1265,11 +958,7 @@ def _member_names(path: Path) -> list[str]:
 
 
 def _is_ignored_member(name: str) -> bool:
-    """Whether a member lives in a test/doc/example tree or is a test file.
-
-    sdists routinely ship the CPython C-API test suite (``Lib/test/``) or a
-    Cython parser fixture; neither is compiled into the wheel.
-    """
+    """Whether a member lives in a test/doc/example tree or is a test file."""
     parts = PurePosixPath(name).parts
     if len(parts) < 2:
         return True
@@ -1283,35 +972,7 @@ def _is_ignored_member(name: str) -> bool:
 
 
 def wheel_ships_prebuilt_binaries(filename: str) -> bool:
-    """Whether a wheel's own tag admits prebuilt, architecture-specific code.
-
-    A wheel is upstream's build output, so a compiled one already carries
-    linked-and-stripped objects: the extension modules
-    (``pyVizionSDK.cpython-312-aarch64-linux-gnu.so``) and, from an auditwheel
-    build, the renamed system libraries bundled beside them
-    (``pyvizionsdk.libs/libblkid-e4a77f31.so.1.1.0``). Bitbake's
-    ``already-stripped`` QA error is raised on exactly those files, and a
-    recipe that installs such a wheel therefore has to waive the check.
-
-    The tag is the evidence, not a scan of the archive. PEP 427 makes the
-    platform field a promise about the payload: ``any`` (the
-    ``py3-none-any`` combination) means pure Python that runs anywhere, so no
-    ELF can be inside, while every other platform tag
-    (``manylinux_2_31_aarch64``, ``linux_aarch64``, even ``musllinux_1_2_*``)
-    is a claim about the *machine*, which pure-Python code has no reason to
-    make. That is the same distinction the build-for-target report draws when
-    it decides between "prebuilt wheel" and "pure-Python sdist", so the report
-    and the generated recipe cannot disagree.
-
-    Conservative in the right direction: the ``py3-none-<platform>`` shape (a
-    wheel pinning a platform while claiming to be pure Python) is treated as
-    possibly carrying binaries, so a needless waiver is possible but a
-    missing one is not.
-
-    An unparsable name is False, i.e. the check stays on: the recipe then
-    fails the QA check loudly, which is the right outcome for a name the
-    tooling cannot classify (see :func:`_wheel_rejection_reason`).
-    """
+    """Whether a wheel tag informs on prebuilt/architecture-specific code."""
     try:
         _name, _version, _build, tags = parse_wheel_filename(filename)
     except (InvalidWheelFilename, ValueError):
@@ -1319,10 +980,6 @@ def wheel_ships_prebuilt_binaries(filename: str) -> bool:
     return any(tag.platform != "any" for tag in tags)
 
 
-#: Sonames of the C runtime that every OE rootfs already ships with its Python
-#: (glibc/musl libc and its satellites, the compiler runtime, the C++ runtime).
-#: A wheel linking these is not a finding: the base system provides them
-#: whether or not this recipe's RDEPENDS list them.
 _TOOLCHAIN_LIB_NAMES = frozenset(
     {
         "libc.so.6",
@@ -1360,40 +1017,21 @@ _DT_NEEDED = 1
 _DT_STRTAB = 5
 _DT_STRSZ = 10
 _DT_SONAME = 14
-#: ``DT_VERDEF`` / ``DT_VERDEFNUM`` point at the ``.gnu.version_d`` table whose
-#: entries name the symbol versions (``BLKID_1.0``, ``LIBUDEV_183``, ...) a
-#: bundled library defines.
+# `.gnu.version_d` table
 _DT_VERDEF = 0x6FFFFFFC
 _DT_VERDEFNUM = 0x6FFFFFFD
-#: Long enough for any real .dynstr entry; guards against a corrupt strtab
-#: making the parser read to the end of file for a phantom index.
+# Long enough for any real .dynstr entry
 _MAX_DYNSTR = 512
-#: Sanity caps on the ``.gnu.version_d`` walk: a real library has a handful of
-#: version nodes (glibc's libc has ~40); anything beyond the cap is corrupt
-#: input, not a library.
+# Sanity caps on the ``.gnu.version_d`` walk
 _MAX_VERDEF = 256
 
 
 def _elf64_dynamic_tags(
     data: bytes,
 ) -> tuple[str | None, list[str], list[str]]:
-    """Read ``(DT_SONAME, DT_NEEDED, symbol versions)`` out of an ELF64
+    """
+    Read `(DT_SONAME, DT_NEEDED, symbol versions)` out of an ELF64
     little-endian blob.
-
-    Returns ``(None, [], [])`` for anything that is not a recognisable dynamic
-    ELF64 LSB file (32-bit, big-endian, or not ELF at all) - wheels for OE
-    targets are built by manylinux/musllinux toolchains in this one shape.
-
-    ``DT_STRTAB`` is a *virtual* address, and a wheel's DSOs are loaded at a
-    nonzero base, so the table is mapped back to a file offset through the
-    ``PT_LOAD`` segments before the ``DT_NEEDED``/``DT_SONAME`` string-table
-    indices are read.
-
-    The symbol versions are the version-definition names from
-    ``.gnu.version_d`` - the ``BLKID_1.0`` half of a versioned symbol - with
-    the table's own base entry (whose name repeats the library file, like
-    ``libblkid.so.1``) dropped, since that is a file name, not a symbol
-    version.
     """
     if len(data) < 0x40 or data[:4] != _ELF_MAGIC:
         return (None, [], [])
@@ -1475,16 +1113,9 @@ def _elf64_dynamic_tags(
 def _elf64_verdef_names(
     data: bytes, strtab: int, strsz: int, verdef: int, verdefnum: int
 ) -> list[str]:
-    """The symbol-version names a dynamic ELF64 defines, from
-    ``.gnu.version_d``.
-
-    Each version node carries one or more ``Elf64_Verdaux`` auxiliary entries;
-    the first names the version (``BLKID_1.0``, ``LIBUDEV_183``, ...). The
-    table's own base node names the library file itself (``libblkid.so.1``)
-    rather than a symbol version, and is dropped. ``verdef`` is the *file
-    offset* of the table (callers map the ``DT_VERDEF`` virtual address through
-    the load segments). Returns ``[]`` for corrupt or unexpected layouts -
-    best-effort, like every other wheel read here.
+    """
+    The symbol-version names a dynamic ELF64 defines, from
+    `.gnu.version_d`.
     """
     if verdefnum < 1 or verdefnum > _MAX_VERDEF:
         return []
@@ -1516,18 +1147,9 @@ def _elf_strtab_lookup(data: bytes, strtab: int, strsz: int, idx: int) -> str:
 
 
 def wheel_external_needed_libs(filename: str | os.PathLike[str]) -> list[str]:
-    """Shared libraries the wheel's ELF binaries need that the wheel does not
+    """
+    Shared libraries the wheel ELF binaries need, but the wheel does not
     bundle itself and the C toolchain is not assumed to provide.
-
-    Every ELF member of the archive is parsed for its ``DT_NEEDED`` and
-    ``DT_SONAME``; a soname that appears among the bundled ``DT_SONAME``s is
-    self-contained (an auditwheel build's renamed ``*.libs/*.so*`` sidecars),
-    and the toolchain runtime is a given, so neither is a finding.
-
-    Best-effort by design: an unparsable member or archive yields whatever the
-    rest of the wheel supports, and ``[]`` when nothing can be read. The recipe
-    and report use this as *information* (a hint about what the target rootfs
-    must provide), so a false negative must not fail the run.
     """
     needed: set[str] = set()
     provided: set[str] = set()
@@ -1561,22 +1183,9 @@ def wheel_external_needed_libs(filename: str | os.PathLike[str]) -> list[str]:
 def wheel_bundled_lib_versions(
     filename: str | os.PathLike[str],
 ) -> dict[str, list[str]]:
-    """The symbol versions each wheel-bundled shared library defines, keyed by
-    its ``DT_SONAME``.
-
-    An auditwheel build's renamed ``*.libs/*.so*`` sidecars declare versioned
-    symbols - ``.gnu.version_d`` names them ``BLKID_1.0``, ``LIBUDEV_183``,
-    ... - under the *original* soname, while ``DT_NEEDED`` in the binaries that
-    use them records the *renamed* one. rpm therefore requires the versioned
-    symbols under the renamed name (``libudev-8d5af18d.so.1.6.11(LIBUDEV_183)`)
-    and provides them under neither, and the rootfs dependency solver cannot
-    resolve the package. The libraries ship inside the wheel, so the recipe
-    re-provides those renamed tokens (see ``recipe._render_bundled_libs_block``);
-    this is the data it needs to do that.
-
-    Best-effort by design, mirroring :func:`wheel_external_needed_libs`: an
-    unparsable member or archive yields whatever the rest of the wheel
-    supports, and ``{}`` when nothing can be read.
+    """
+    The symbol versions each wheel-bundled shared library defines, keyed
+    by `DT_SONAME`.
     """
     so_member = re.compile(r"\.so(?:\.|$)")
     versions_by_soname: dict[str, list[str]] = {}
@@ -1607,13 +1216,7 @@ def wheel_bundled_lib_versions(
 def detect_native_code(
     source: FetchedSource, build_requires: list[str] = ()
 ) -> tuple[bool, list[str]]:
-    """Whether the artifact ships code that must be compiled, plus evidence.
-
-    Evidence strings name the language and an example path (or the build
-    requirement that pulls in a compiler). A pure-Python sdist yields
-    ``(False, [])``; the recipe then needs no target toolchain and the target
-    report has nothing to warn about.
-    """
+    """Whether the artifact ships code that must be compiled, plus detail."""
     found: dict[str, str] = {}
     for name in _member_names(source.path):
         kind = _NATIVE_SUFFIX_KINDS.get(PurePosixPath(name).suffix.lower())
@@ -1624,8 +1227,6 @@ def detect_native_code(
         f"{kind} source ({path})" for kind, path in sorted(found.items())
     ]
 
-    # ``[build-system].requires`` entries arrive as full PEP 508 requirements
-    # (``cython>=3.1``), so compare the parsed project name, not the raw string.
     for req in build_requires:
         try:
             name = _canonical(Requirement(req).name)
@@ -1648,12 +1249,7 @@ def detect_native_code(
 
 
 def detect_host_assumptions(source: FetchedSource) -> list[str]:
-    """Top-level build config lines that pin the build to an x86 host.
-
-    ``"<file>: <tokens>"`` per file, e.g. ``"setup.py: -march=, -mavx"``. Only
-    consulted for non-x86 targets, where such a flag either fails the compile
-    or silently disables an optimization.
-    """
+    """Top-level build config lines that pin the build to an x86 host."""
     out: list[str] = []
     for name, data in _all_matching(
         source.path,
@@ -1672,22 +1268,11 @@ def detect_host_assumptions(source: FetchedSource) -> list[str]:
 def machine_gated_deps(
     requires_dist: list[str], yocto: YoctoVersion | None
 ) -> tuple[list[MachineDep], list[str]]:
-    """Split machine-specific requirements from the arch-independent ones.
-
-    ``foo; platform_machine == "aarch64"`` must not be resolved here: the layer
-    is cross-built, so the answer depends on the *target*, not on the host that
-    runs bitbake. Such entries are returned as :class:`MachineDep` (with the
-    target list they apply to) and the recipe renders them as machine-conditional
-    ``RDEPENDS:${PN}:append:<token>``; everything else is returned unchanged for
-    the normal marker classification.
-
-    A requirement no known target satisfies is dropped entirely (e.g.
-    ``win32``-only machine values cannot appear in a POSIX ``platform_machine``).
-    """
-    base = _marker_env(yocto)
+    """Split machine-specific requirements from the arch-independent ones."""
+    base = marker_env(yocto)
     # Several matrix entries share one platform_machine (aarch64 covers
     # ZynqMP, Versal and the generic Cortex-A targets), so dedupe while keeping
-    # the matrix order: the recipe groups the deps per MACHINEOVERRIDES token.
+    # the matrix order.
     machines_all = tuple(
         dict.fromkeys(t.platform_machine for t in KNOWN_TARGETS)
     )
@@ -1722,40 +1307,18 @@ def machine_gated_deps(
 
 
 def apply_major_cap(raw: str) -> tuple[str, str]:
-    """Cap ``raw`` at its lower bound's major series.
-
-    Returns ``(requirement, specifier)`` under the same-major dependency
-    policy: a requirement with a version *floor* (``>=``/``>``) in the 1.y+
-    series and no upper bound of its own gets a ``,<major+1`` ceiling
-    appended, so resolution picks the newest release of the floor's major
-    series instead of a later major that upstream bounds alone would allow.
-
-        >>> apply_major_cap("numpy>=1.21.0")
-        ("numpy>=1.21.0,<2", ">=1.21.0,<2")
-
-    The ceiling guards the whole pipeline: the requirement string is what
-    ``pip download`` resolves with, so a parity jump that upstream only
-    discovers years later (numpy 1.x -> 2.x breaking OpenCV generators,
-    auditwheel ABI churn) never silently lands in a rebuilt layer.
-
-    Everything else passes through unchanged (``requirement`` == ``raw``):
-    requirements already bounded above (``<``/``<=``/``~=``), exact pins
-    (``==``/``===``), requirements with only exclusions (``!=``) or no
-    specifier at all, floors in the 0.y series (a 0.x floor is no "major
-    series" promise - some projects live there permanently, and capping one
-    to ``<1`` would prefer a years-old release), and strings ``packaging``
-    cannot parse. Pass ``--no-major-bump-cap`` to keep every bound verbatim.
-    """
+    """Cap `raw` at its lower bound's major series."""
     try:
         req = Requirement(raw)
     except InvalidRequirement:
         return raw, ""
+
+    # Find floor
     floor: Version | None = None
     for item in req.specifier:
         op = item.operator
         if op in ("==", "===", "<", "<=", "~="):
-            # Already pinned or bounded above: adding a ceiling would be
-            # redundant at best, contradictory at worst.
+            # Already pinned or up-bounded.
             return raw, str(req.specifier)
         if op in (">=", ">"):
             try:
@@ -1766,6 +1329,7 @@ def apply_major_cap(raw: str) -> tuple[str, str]:
                 floor = candidate
     if floor is None or floor.major == 0:
         return raw, str(req.specifier)
+
     specifier = f"{req.specifier},<{floor.major + 1}"
     parts = [req.name]
     if req.extras:
@@ -1773,6 +1337,7 @@ def apply_major_cap(raw: str) -> tuple[str, str]:
     parts.append(specifier)
     if req.marker is not None:
         parts.append(f"; {req.marker}")
+
     return "".join(parts), specifier
 
 
@@ -1783,19 +1348,17 @@ def classify_requires_dist(
     cap_major_bump: bool = True,
 ) -> tuple[list[Dependency], list[Dependency], list[Dependency]]:
     """
-    Split ``Requires-Dist`` into (runtime, build, dropped).
+    Split `Requires-Dist` into (runtime, build, dropped).
 
-    Rules:
-    * anything gated on an ``extra ==`` marker is optional -> dropped
-    * otherwise the marker is evaluated against the Yocto target; if it does not
-      hold on this target (e.g. Windows-only, or a lower Python) -> dropped
-    * unconditional (or target-satisfied) deps -> runtime
+    Drop rules:
+    * Anything gated on an `extra ==` marker (as optional)
+    * Incompatible with the Yocto target (e.g. Windows-only, lower Python)
 
-    Unless ``cap_major_bump=False``, every runtime requirement carries the
-    same-major ceiling from :func:`apply_major_cap`: ``numpy>=1.21.0`` is held
-    and resolved as ``numpy>=1.21.0,<2`` (newest 1.x, never 2.x).
+    Unless `cap_major_bump=False`, every runtime requirement carries the
+    same-major ceiling from `apply_major_cap`: ``numpy>=1.21.0`` is held
+    and resolved as `numpy>=1.21.0,<2` (newest 1.x, never 2.x).
     """
-    env = _marker_env(yocto)
+    env = marker_env(yocto)
     runtime: list[Dependency] = []
     dropped: list[Dependency] = []
 
@@ -1831,7 +1394,7 @@ def classify_requires_dist(
             try:
                 satisfied = marker.evaluate(env)
             except:  # noqa: E722
-                satisfied = True  # be conservative: keep if we cannot evaluate
+                satisfied = True  # Keep for now
             if not satisfied:
                 dropped.append(
                     Dependency(
@@ -1894,16 +1457,7 @@ def build_metadata(
     check_public: bool = False,
     cap_major_bump: bool = True,
 ) -> tuple[PackageMetadata, FetchedSource]:
-    """Fetch + parse a package into a fully-populated :class:`PackageMetadata`.
-
-    ``check_public`` forwards to :func:`fetch_source`; an sdist that is not
-    reachable at the ``pypi`` class' public URL marks the metadata ``vendored``
-    so the recipe ships the sdist in the layer instead of inheriting ``pypi``.
-
-    ``cap_major_bump`` forwards to the dependency classifiers: dependency
-    bounds are resolved within the lower bound's major series
-    (``numpy>=1.21.0`` -> ``numpy>=1.21.0,<2``) unless the flag is cleared.
-    """
+    """Build a `PackageMetadata` from target requirements."""
     source = fetch_source(
         name,
         version,
@@ -1929,13 +1483,8 @@ def build_metadata(
     declared = read_build_system(source)
     build_backend_source = ""
     if declared is None and source.kind is SourceKind.WHEEL:
-        # A wheel ships no build config, so ``declared`` being None is the
-        # normal case here and the build backend is otherwise a guess. The
-        # metadata names the repository, which does publish one, so ask it.
-        # Gated to wheels on purpose: an sdist without the file is a legacy
-        # setuptools project - the sdist is the truth (``setup.py``), and
-        # letting the repository's default branch override it could name a
-        # backend the project migrated to after this release.
+        # A wheel has no build information. Let's try to check any
+        # public information on available VCSs.
         found = build_system_from_vcs(project_urls, homepage)
         if found is not None:
             backend, build_requires, build_backend_source = found
@@ -1968,17 +1517,7 @@ def build_metadata(
     )
     host_assumptions = detect_host_assumptions(source)
 
-    # The recipe must fetch *exactly* the artifact whose sha256 is recorded. The
-    # pypi class can only do that for an sdist it can reach at its derived
-    # public URL; anything else has to be vendored into the layer as a file://
-    # SRC_URI. That covers two cases:
-    #  - an sdist on a private index (its derived URL 404s), and
-    #  - a wheel, which the pypi class never fetches - it would request the
-    #    .tar.gz instead, so do_fetch either 404s (no sdist) or dies on
-    #    "sha256 mismatch" (one exists) while the recipe claims a different
-    #    artifact than the one it was hashed from.
-    # None means the public URL was not checked, which is equally not a proof
-    # that it resolves, so only an explicit True leaves the fetch to pypi.
+    # vendored means to package directly into the layer/recipe.
     vendored = source.public_reachable is not True
     if vendored:
         logger.info(
@@ -2025,17 +1564,11 @@ def build_metadata(
             and wheel_ships_prebuilt_binaries(source.filename)
         ),
         external_needed_libs=(
-            # source.filename is the bare artifact name; the ELF scan needs the
-            # actual file on disk, which is source.path (the download may be
-            # kept or cleaned, but it is present for the span of build_metadata).
             wheel_external_needed_libs(source.path)
             if source.kind is SourceKind.WHEEL
             else []
         ),
         bundled_lib_versions=(
-            # The renamed sidecar libraries' symbol versions, so the recipe can
-            # re-provide the tokens rpm requires under the renamed sonames (see
-            # wheel_bundled_lib_versions).
             wheel_bundled_lib_versions(source.path)
             if source.kind is SourceKind.WHEEL
             else {}
@@ -2056,7 +1589,7 @@ def build_metadata(
                 else "https://pypi.org"
             )
         ),
-        index_flags=pip_opts.describe(),
+        index_flags=pip_opts.index_flags(),
     )
     return meta, source
 
@@ -2074,35 +1607,7 @@ def resolve_closure(
     max_depth: int | None = None,
     workers: int = 1,
 ) -> tuple[list[PackageMetadata], list[str]]:
-    """Resolve the transitive **runtime** closure of ``top``.
-
-    BFS over ``runtime_deps``; each member is fetched through ``builder`` (the
-    network seam; tests inject a fake) with its requirement (bounds intact,
-    e.g. ``tomli>=1.0.2``) passed through verbatim so upstream bounds are
-    honoured when picking versions. The bounds a member ships may already
-    carry the ``<major+1`` ceiling added by :func:`apply_major_cap` during
-    classification, so the closure stays within each floor's major series.
-
-    With ``workers > 1`` fetches run in parallel through one shared thread
-    pool. A member's dependencies are unknowable until its own fetch has
-    completed, so instead of waiting for the whole BFS level to finish (a
-    level barrier that serialises deep or uneven dependency chains behind the
-    slowest member of each level), each completed fetch immediately hands its
-    newly discovered dependencies to the pool. ``builder`` must be
-    thread-safe — the fetch path already is: every call downloads into its
-    own fresh subdirectory of ``workdir``.
-
-    Closure order: ``closure[0]`` is always ``top`` (the kas target; bitbake
-    follows RDEPENDS transitively) and every other member appears after the
-    member that discovered it, in discovery order — so chain and
-    single-parent graphs match a sequential BFS exactly. With ``workers > 1``
-    members discovered by two *concurrent* parents can interleave at the same
-    depth; member order has no effect on the generated layer's build
-    correctness. Members are deduplicated by canonical name (cycle-safe);
-    ``skip`` is a set of canonical names to drop (the ``--skip-dep`` escape
-    hatch for distro-provided packages, e.g. ``numpy``); ``max_depth`` limits
-    recursion depth (``None`` = unlimited).
-    """
+    """Resolve the transitive **runtime** closure of ``top``."""
     from concurrent.futures import (
         FIRST_COMPLETED,
         Future,
@@ -2150,14 +1655,12 @@ def resolve_closure(
             closure.extend(members)
             frontier = [(member, depth + 1) for member in members]
     else:
-        # Greedy parallel: a completed fetch releases its deps into the pool
-        # immediately, so a deep chain keeps every worker busy instead of
-        # stalling behind the slowest member of each BFS level.
+        # Parallel and greedy BFS
         seq = 0
-        discovered: list[Future] = []  # submission order (== discovery order)
+        discovered: list[Future] = []  # discovery order
 
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            # future -> (submission sequence, the member's own depth)
+            # future -> (submission sequence, member depth)
             pending: dict[Future, tuple[int, int]] = {}
 
             def _submit(dep: Dependency, own_depth: int) -> None:
@@ -2167,7 +1670,7 @@ def resolve_closure(
                 pending[fut] = (seq, own_depth)
                 discovered.append(fut)
 
-            for _c, dep, depth in _discover(top, 0):
+            for _, dep, depth in _discover(top, 0):
                 _submit(dep, depth)
 
             while pending:
@@ -2189,6 +1692,6 @@ def resolve_closure(
 
 
 def default_yocto() -> YoctoVersion:
-    from py2bbr import yocto  # local import to avoid a cycle
+    from py2bbr import yocto
 
     return yocto.resolve_yocto_version(DEFAULT_YOCTO_VERSION)

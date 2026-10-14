@@ -4,7 +4,7 @@ from py2bbr.model import Dependency, DepKind, PackageMetadata, SourceKind
 
 
 def make_meta(**overrides) -> PackageMetadata:
-    """Build a realistic :class:`PackageMetadata` for tests (no I/O)."""
+    """Build a realistic yet simple `PackageMetadata` for tests (no I/O)."""
     base: dict = {
         "name": "black",
         "canonical_name": "black",

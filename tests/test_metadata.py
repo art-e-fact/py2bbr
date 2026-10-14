@@ -18,10 +18,10 @@ from py2bbr.errors import MetadataError, MetadataNotFoundError
 from py2bbr.metadata import (
     FetchedSource,
     PipOptions,
-    _marker_env,
     _pick_artifact,
     classify_requires_dist,
     detect_license,
+    marker_env,
 )
 from py2bbr.model import Dependency, DepKind, SourceKind
 from py2bbr.yocto import (
@@ -55,101 +55,120 @@ class TestPipOptions:
         assert ["--timeout", "30"] == args[8:10]
         assert args[-2:] == ["--retries", "3"]
 
-    def test_describe(self):
+    def test_index_flags(self):
+        opts = PipOptions()
+        assert opts.index_flags() == []
+
         opts = PipOptions(extra_index_urls=["https://extra1"])
-        assert opts.describe() == ["--extra-index-url=https://extra1"]
+        assert opts.index_flags() == ["--extra-index-url=https://extra1"]
+
+        opts = PipOptions(index_url="https://i", trusted_hosts=["h"])
+        assert opts.index_flags() == [
+            "--index-url=https://i",
+            "--trusted-host=h",
+        ]
 
 
 class TestPickArtifact:
     def test_prefers_sdist(self, tmp_path: Path):
         (tmp_path / "pkg-1.0.tar.gz").write_bytes(b"sdist")
         (tmp_path / "pkg-1.0-py3-none-any.whl").write_bytes(b"wheel")
-        assert _pick_artifact(tmp_path, prefer_sdist=True).name.endswith(
-            ".tar.gz"
-        )
+        assert _pick_artifact(tmp_path).name.endswith(".tar.gz")
+
+    def test_prefers_sdist_out_of_order(self, tmp_path: Path):
+        (tmp_path / "pkg-1.0-py3-none-any.whl").write_bytes(b"wheel")
+        (tmp_path / "pkg-1.0.tar.gz").write_bytes(b"sdist")
+        assert _pick_artifact(tmp_path).name.endswith(".tar.gz")
+
+    def test_picks_sdist(self, tmp_path: Path):
+        (tmp_path / "pkg-1.0.tar.gz").write_bytes(b"sdist")
+        assert _pick_artifact(tmp_path).name.endswith(".tar.gz")
 
     def test_falls_back_to_wheel(self, tmp_path: Path):
         (tmp_path / "pkg-1.0-py3-none-any.whl").write_bytes(b"wheel")
-        assert _pick_artifact(tmp_path, prefer_sdist=True).suffix == ".whl"
+        assert _pick_artifact(tmp_path).suffix == ".whl"
 
     def test_none_when_empty(self, tmp_path: Path):
-        assert _pick_artifact(tmp_path, prefer_sdist=True) is None
-
-    def test_tar_gz_detected_via_name(self, tmp_path: Path):
-        # Regression: Path.suffix for x.tar.gz is '.gz', must still be found.
-        (tmp_path / "black-26.5.1.tar.gz").write_bytes(b"x")
-        assert _pick_artifact(tmp_path, prefer_sdist=True) is not None
+        assert _pick_artifact(tmp_path) is None
 
 
 class TestClassifyRequiresDist:
     def setup_method(self):
-        self.y = resolve_yocto_version("5.0")  # Python 3.12
+        self.yo = resolve_yocto_version("5.0")  # Python 3.12
 
     def test_plain_dep_runtime(self):
-        runtime, _build, _dropped = classify_requires_dist(
-            ["click>=8.0"], self.y
-        )
+        runtime, _, _ = classify_requires_dist(["click>=8.0"], self.yo)
         assert [d.name for d in runtime] == ["click"]
 
     def test_extra_marker_dropped(self):
-        runtime, _b, dropped = classify_requires_dist(
-            ['colorama>=0.4.3; extra == "colorama"'], self.y
+        runtime, _, dropped = classify_requires_dist(
+            ['colorama>=0.4.3; extra == "colorama"'], self.yo
         )
         assert runtime == []
         assert dropped[0].reason.startswith("optional extra")
 
     def test_python_version_marker_dropped_on_312(self):
-        runtime, _b, dropped = classify_requires_dist(
-            ['tomli>=1.1.0; python_version < "3.11"'], self.y
+        runtime, _, dropped = classify_requires_dist(
+            ['tomli>=1.1.0; python_version < "3.11"'], self.yo
         )
         assert runtime == []
         assert dropped[0].name == "tomli"
 
-    # def test_python_version_marker_kept_when_satisfied(self):
-    #     # tomli is needed only for < 3.11; on a 3.9 target it should be kept.
-    #     y39 = resolve_yocto_version("3.1")  # Python 3.9
-    #     runtime, _b, _d = classify_requires_dist(
-    #         ['tomli>=1.1.0; python_version < "3.11"'], y39
-    #     )
-    #     assert [d.name for d in runtime] == ["tomli"]
+    def test_python_version_marker_kept_when_satisfied(self):
+        # Create a sound old Yocto version with Python 3.9
+        # to test against
+        from py2bbr.model import YoctoVersion
+
+        y39 = YoctoVersion(
+            "3.1",
+            "dunfell",
+            "dunfell",
+            "3.9",
+            meta_python_branch="dunfell",
+        )
+
+        # Evaluate with a constraint on Python version
+        runtime, _, _ = classify_requires_dist(
+            ['mepackage>=1.1.0; python_version < "3.11"'], y39
+        )
+
+        assert [d.name for d in runtime] == ["mepackage"]
 
     def test_windows_only_dropped_on_linux_target(self):
-        runtime, _b, dropped = classify_requires_dist(
-            ['pywin32; sys_platform == "win32"'], self.y
+        runtime, _, dropped = classify_requires_dist(
+            ['pywin32; sys_platform == "win32"'], self.yo
         )
         assert runtime == []
         assert dropped[0].name == "pywin32"
 
     def test_unparseable_dropped(self):
-        runtime, _b, dropped = classify_requires_dist(
-            ["this is not valid !!!"], self.y
+        runtime, _, dropped = classify_requires_dist(
+            ["this is not valid !!!"], self.yo
         )
         assert runtime == []
         assert dropped[0].kind is DepKind.DROPPED
 
     def test_floor_capped_to_same_major(self):
-        # Default behaviour: numpy>=1.21.0 resolves within 1.x (<2), never 2.x.
-        runtime, _b, _d = classify_requires_dist(["numpy>=1.21.0"], self.y)
+        runtime, _, _ = classify_requires_dist(["numpy>=1.21.0"], self.yo)
         assert runtime[0].requirement == "numpy>=1.21.0,<2"
         assert runtime[0].specifier == ">=1.21.0,<2"
 
     def test_cap_disabled_keeps_upstream_bounds(self):
         runtime, _b, _d = classify_requires_dist(
-            ["numpy>=1.21.0"], self.y, cap_major_bump=False
+            ["numpy>=1.21.0"], self.yo, cap_major_bump=False
         )
         assert runtime[0].requirement == "numpy>=1.21.0"
         assert runtime[0].specifier == ">=1.21.0"
 
 
 class TestApplyMajorCap:
-    def test_basic(self):
+    def test_usual_suspect(self):
         assert M.apply_major_cap("numpy>=1.21.0") == (
             "numpy>=1.21.0,<2",
             ">=1.21.0,<2",
         )
 
     def test_user_example(self):
-        # mypackage>=2.3.1 -> newest 2.x, never 3.x or later.
         assert M.apply_major_cap("mypackage>=2.3.1") == (
             "mypackage>=2.3.1,<3",
             ">=2.3.1,<3",
@@ -195,8 +214,6 @@ class TestApplyMajorCap:
         assert M.apply_major_cap("foo!=1.0")[0] == "foo!=1.0"
 
     def test_zero_floor_untouched(self):
-        # A 0.x floor is no "major series" promise: capping >=0.5 to <1 would
-        # prefer a years-old 0.x release over the current one upstream tests.
         assert M.apply_major_cap("foo>=0.5")[0] == "foo>=0.5"
         assert M.apply_major_cap("foo>=0")[0] == "foo>=0"
 
@@ -206,8 +223,6 @@ class TestApplyMajorCap:
         )
 
     def test_unversionable_floor_untouched(self, monkeypatch):
-        # A floor text packaging cannot turn into a Version (defensive guard
-        # against odd distro-patched metadata) passes through uncapped.
         def explode(text, *a, **k):
             raise InvalidVersion(text)
 
@@ -242,8 +257,6 @@ class TestDetectLicense:
         assert spdx == ""
 
     def test_classifier_mozilla_public_license_2(self):
-        # Real jinxed 2.1.0 metadata: classifier tail "Mozilla Public License
-        # 2.0 (MPL 2.0)" — must map to MPL-2.0 (PetaLinux required a LICENSE).
         msg = _msg(
             "Metadata-Version: 2.1\nName: jinxed\n"
             "Classifier: License :: OSI Approved :: "
@@ -253,8 +266,6 @@ class TestDetectLicense:
         assert spdx == "MPL-2.0"
 
     def test_license_text_mplv2(self):
-        # Real jinxed 2.1.0 also ships free-form "License: MPLv2.0"; the
-        # keyword sniff must catch the MPLv2 shorthand.
         msg = _msg("Metadata-Version: 2.1\nName: jinxed\nLicense: MPLv2.0\n")
         spdx, _ = detect_license(msg)
         assert spdx == "MPL-2.0"
@@ -263,31 +274,26 @@ class TestDetectLicense:
 class TestMarkerEnv:
     def test_target_python_version(self):
         y = resolve_yocto_version("5.0")
-        env = _marker_env(y)
+        env = marker_env(y)
         assert env["python_version"] == "3.12"
         assert env["sys_platform"] == "linux"
 
     def test_no_yocto_keeps_host_python(self):
-        env = _marker_env(None)
+        env = marker_env(None)
         assert env["sys_platform"] == "linux"
         assert "python_version" in env
 
     def test_platform_machine_is_the_target_cpu(self):
-        # Markers are evaluated for the target, not for the machine that
-        # happened to run py2bbr: an x86_64 host generating for aarch64 has to
-        # see the aarch64 answer.
         y = resolve_target_runtime(
             resolve_yocto_version("5.0"), platform_machine="arm64"
         )
-        assert _marker_env(y)["platform_machine"] == "aarch64"
+        assert marker_env(y)["platform_machine"] == "aarch64"
 
     def test_platform_machine_falls_back_to_the_legacy_default(self):
-        # A target that names no CPU (a hand-built YoctoVersion) keeps x86_64,
-        # the value this function has always assumed.
         y = dataclasses.replace(
             resolve_yocto_version("5.0"), platform_machine=""
         )
-        assert _marker_env(y)["platform_machine"] == "x86_64"
+        assert marker_env(y)["platform_machine"] == "x86_64"
 
 
 _PKG_INFO = """\
@@ -408,10 +414,6 @@ class TestRunPipDownload:
         assert cmd[-3:] == ["--index-url", "https://i", "--x"]
 
     def test_routes_pip_scratch_under_dest(self, monkeypatch, tmp_path):
-        # pip's PEP 517 metadata build unpacks the sdist into $TMPDIR; the
-        # ambient /tmp may be an inode-starved tmpfs (ENOSPC mid-extraction,
-        # cf. numpy's vendored meson), so pip's scratch must land next to the
-        # artifact on the workdir filesystem instead.
         captured: dict = {}
 
         def fake_run(cmd, **kw):
@@ -430,8 +432,6 @@ class TestRunPipDownload:
         scratch = Path(captured["env"]["TMPDIR"])
         assert scratch.is_relative_to(tmp_path)
         assert scratch.exists() and scratch.is_dir()
-        # The scratch dir must be usable for new files (inode budget), on the
-        # same filesystem as the download destination.
         probe = scratch / "probe"
         probe.write_text("x")
         assert probe.stat().st_dev == tmp_path.stat().st_dev
@@ -456,11 +456,6 @@ class TestRunPipDownload:
         return [cmd[n + 1] for n in range(len(cmd) - 1) if cmd[n] == flag]
 
     def test_target_interpreter_is_pinned(self, monkeypatch, tmp_path):
-        # Without --python-version, pip resolves wheels against the interpreter
-        # py2bbr itself runs under. That is a property of the machine running
-        # py2bbr, not of the target: a CPython 3.12 layer generated on a 3.14
-        # host got handed a cp314 wheel, so the layer only worked on the host
-        # that produced it.
         cmd = self._capture(
             monkeypatch,
             tmp_path,
@@ -474,9 +469,6 @@ class TestRunPipDownload:
         assert "--python-version" not in cmd
 
     def test_target_platform_is_pinned(self, monkeypatch, tmp_path):
-        # The platform pin is a list because pip resolves each --platform value
-        # as a literal tag (it does not expand manylinux_2_17_aarch64 into the
-        # manylinux family), so the whole family has to be named.
         cmd = self._capture(
             monkeypatch,
             tmp_path,
@@ -490,10 +482,6 @@ class TestRunPipDownload:
         ]
 
     def test_platform_tags_are_never_comma_joined(self, monkeypatch, tmp_path):
-        # pip's --platform is action="append" and does NOT split its value on
-        # commas, so a single "a,b" argument is matched as the one literal tag
-        # "a,b" and rejects every wheel - including the exact aarch64 one the
-        # index serves (the reported pyvizionsdk failure). One flag per tag.
         cross = (
             "x86_64" if current_platform_machine() == "aarch64" else "aarch64"
         )
@@ -537,13 +525,6 @@ class TestRunPipDownload:
 
 
 class TestPublicSdistUrl:
-    """S6: packages absent from public PyPI need vendoring, not a pypi fetch.
-
-    py2bbr must predict whether ``inherit pypi``'s fetch URL will 404 (the
-    pyvizionsdk do_fetch failure) so the recipe can vendor the sdist instead.
-    The prediction re-derives that exact URL from the sdist filename.
-    """
-
     def test_tar_gz_url_derived(self):
         assert M._public_pypi_sdist_url("pyvizionsdk-26.9.1.tar.gz") == (
             "https://files.pythonhosted.org/packages/source/"
@@ -551,8 +532,6 @@ class TestPublicSdistUrl:
         )
 
     def test_dashed_name_rpartition_keeps_full_name(self):
-        # Versions never contain '-' (PEP 440), so the LAST '-' always splits
-        # name from version; `typed-ast` must not be cut down to `typed`.
         assert M._public_pypi_sdist_url("typed-ast-1.5.4.tar.gz") == (
             "https://files.pythonhosted.org/packages/source/"
             "t/typed-ast/typed-ast-1.5.4.tar.gz"
@@ -565,8 +544,6 @@ class TestPublicSdistUrl:
         )
 
     def test_zip_sdist_maps_to_tar_gz_url(self):
-        # The pypi class always fetches .tar.gz (PYPI_PACKAGE_EXT default), so
-        # even a zip sdist maps to the .tar.gz URL the build will request.
         assert M._public_pypi_sdist_url("black-26.5.1.zip") == (
             "https://files.pythonhosted.org/packages/source/"
             "b/black/black-26.5.1.tar.gz"
@@ -706,10 +683,6 @@ class TestFetchSource:
 
 
 class TestPickArtifactExtra:
-    def test_sdist_when_not_preferred(self, tmp_path):
-        (tmp_path / "pkg-1.0.tar.gz").write_bytes(b"x")
-        assert _pick_artifact(tmp_path, prefer_sdist=False) is not None
-
     def test_kind_of(self, tmp_path):
         w = tmp_path / "a.whl"
         w.write_bytes(b"")
@@ -920,13 +893,6 @@ class TestMiscMetadata:
 
     def test_default_yocto(self):
         assert M.default_yocto().version == "5.0"
-
-    def test_describe_full(self):
-        opts = PipOptions(index_url="https://i", trusted_hosts=["h"])
-        assert opts.describe() == [
-            "--index-url=https://i",
-            "--trusted-host=h",
-        ]
 
 
 class TestResolveClosure:
