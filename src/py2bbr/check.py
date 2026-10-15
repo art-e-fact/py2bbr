@@ -1,21 +1,4 @@
-"""Capability-gated recipe validation ladder.
-
-Stages, cheapest first:
-
-* ``structural``  - pure-Python checks on the generated ``.bb`` (always runs).
-* ``parse``       - ``bitbake -p <pn>`` (parse-only; needs bitbake + a
-                    sourced BUILDDIR).
-* ``checklayer``  - ``yocto-check-layer <layer>`` (needs the tool + BUILDDIR;
-                    runs ``bitbake world`` and is expensive).
-* ``build``       - ``kas build -c <kasfile>`` (needs kas + network; full build).
-
-``--check LEVEL`` selects the ceiling; every stage up to it that is not runnable
-in the current environment is reported as ``SKIPPED`` with the reason, so the
-output always shows exactly what was validated and what was not.
-"""
-
-from __future__ import annotations
-
+import logging
 import os
 import re
 import shutil
@@ -27,8 +10,10 @@ from pathlib import Path
 from py2bbr.model import PackageMetadata
 from py2bbr.recipe import bitbake_pn
 
-#: Ordered stages, cheapest first. ``--check`` names the ceiling.
-STAGES = ("structural", "parse", "checklayer", "build")
+logger = logging.getLogger(__name__)
+
+# Ordered levels, cheapest first.
+LEVELS = ("structural", "parse", "checklayer", "build")
 
 DEFAULT_LEVEL = "parse"
 _DEFAULT_TIMEOUT = 1800
@@ -44,10 +29,10 @@ class Status(StrEnum):
 
 @dataclass
 class CheckResult:
-    stage: str
+    level: str
     status: Status
     detail: str = ""
-    #: Individual sub-checks (for the structural stage).
+    #: Individual sub-checks (for the structural level).
     items: list[tuple[str, Status, str]] = field(default_factory=list)
 
     @property
@@ -56,18 +41,21 @@ class CheckResult:
 
 
 def _bitbake_available() -> tuple[bool, str]:
-    bitbake = shutil.which("bitbake")
-    if not bitbake:
+    """
+    Note we consider bitbake usable only if also with BUILDDIR set.
+    """
+    if not shutil.which("bitbake"):
         return False, "bitbake not found on PATH"
-    builddir = os.environ.get("BUILDDIR")
-    if not builddir:
+    if not os.environ.get("BUILDDIR"):
         return False, "BUILDDIR not set (source oe-init-build-env first)"
     return True, ""
 
 
 def _checklayer_available() -> tuple[bool, str]:
-    tool = shutil.which("yocto-check-layer")
-    if not tool:
+    """
+    Note we consider yocto-check-layer usable only if also with BUILDDIR set.
+    """
+    if not shutil.which("yocto-check-layer"):
         return False, "yocto-check-layer not found on PATH"
     if not os.environ.get("BUILDDIR"):
         return False, "BUILDDIR not set (source oe-init-build-env first)"
@@ -82,9 +70,6 @@ def _kas_available(kas_file: Path | None) -> tuple[bool, str]:
     return True, ""
 
 
-# --------------------------------------------------------------------------- #
-# structural
-# --------------------------------------------------------------------------- #
 def _check_required(text: str, pattern: str, what: str, required: bool):
     found = re.search(pattern, text, re.MULTILINE) is not None
     status = (
@@ -93,7 +78,10 @@ def _check_required(text: str, pattern: str, what: str, required: bool):
     return (what, status, "present" if found else "missing")
 
 
-def _balanced_quotes(text: str) -> tuple[bool, str]:
+def _balanced_double_quotes(text: str) -> tuple[bool, str]:
+    """
+    Simple heuristic that does not work with escaped quotes.
+    """
     bad = []
     for i, line in enumerate(text.splitlines(), 1):
         if line.lstrip().startswith("#"):
@@ -105,8 +93,27 @@ def _balanced_quotes(text: str) -> tuple[bool, str]:
     return True, ""
 
 
+def _balanced_single_quotes(text: str) -> tuple[bool, str]:
+    """
+    Simple heuristic that does not work with escaped quotes.
+    """
+    bad = []
+    for i, line in enumerate(text.splitlines(), 1):
+        if _comment_or_blank(line):
+            continue
+        if line.count("'") % 2 != 0:
+            bad.append(i)
+    if bad:
+        return False, f"unbalanced single-quotes on lines {bad}"
+    return True, ""
+
+
 def _balanced_braces(text: str) -> tuple[bool, str]:
-    # Count ${ ... } openers vs closers (rough; ignores escaped braces).
+    """
+    Simple heuristic that does not work with escaped braces.
+
+    TODO: Check on equality instead?
+    """
     opens = text.count("${")
     closes = text.count("}")
     if opens > closes:
@@ -119,8 +126,10 @@ def _comment_or_blank(line: str) -> bool:
 
 
 def _timestamp_residue(text: str) -> tuple[bool, str]:
-    # Signature of the PetaLinux corruption: a shell timestamp appended to a
-    # joined continuation line (``... '00:00``). Never valid in a recipe.
+    """
+    TODO This is a bandaid against timestamps showing in PetaLinux builds
+    There must be a better way.
+    """
     bad = [
         i
         for i, line in enumerate(text.splitlines(), 1)
@@ -133,9 +142,10 @@ def _timestamp_residue(text: str) -> tuple[bool, str]:
 
 
 def _dep_token_prefix(text: str) -> tuple[bool, str]:
-    # A value token starting with '-' means the ``${PYTHON_PN}-`` prefix was
-    # emptied by expansion (``DEPENDS += -pybind11-native``). Legit dep names
-    # never start with '-'.
+    """
+    TODO This is a bandaid against wrong dep names rejecteda (correctly) by
+    PetaLinux builds. There must be a better way.
+    """
     bad = []
     for i, line in enumerate(text.splitlines(), 1):
         if not re.match(r"^(DEPENDS|RDEPENDS)\b", line.lstrip()):
@@ -151,101 +161,6 @@ def _dep_token_prefix(text: str) -> tuple[bool, str]:
     return True, ""
 
 
-def _balanced_single_quotes(text: str) -> tuple[bool, str]:
-    bad = []
-    for i, line in enumerate(text.splitlines(), 1):
-        if _comment_or_blank(line):
-            continue
-        if line.count("'") % 2 != 0:
-            bad.append(i)
-    if bad:
-        return False, f"unbalanced single-quotes on lines {bad}"
-    return True, ""
-
-
-def structural_check(recipe_path: Path) -> CheckResult:
-    """Cheap, dependency-free checks on a generated recipe."""
-    items: list[tuple[str, Status, str]] = []
-    try:
-        text = Path(recipe_path).read_text(encoding="utf-8")
-    except OSError as exc:
-        return CheckResult(
-            "structural", Status.ERROR, f"cannot read recipe: {exc}"
-        )
-
-    if not text.strip():
-        return CheckResult("structural", Status.FAIL, "recipe file is empty")
-
-    items.append(
-        _check_required(text, r"^SUMMARY\s*=", "SUMMARY", required=True)
-    )
-    items.append(
-        _check_required(text, r"^LICENSE\s*=", "LICENSE", required=True)
-    )
-    items.append(
-        _check_required(text, r"^inherit\s+pypi", "inherit pypi", required=True)
-    )
-    items.append(
-        _check_required(
-            text, r"^LIC_FILES_CHKSUM\s*=", "LIC_FILES_CHKSUM", required=False
-        )
-    )
-    items.append(
-        _check_required(text, r"^HOMEPAGE\s*=", "HOMEPAGE", required=False)
-    )
-    items.append(
-        _check_required(
-            text, r"^SRC_URI\[sha256sum\]", "SRC_URI[sha256sum]", required=False
-        )
-    )
-    items.append(
-        _check_required(text, r"^RDEPENDS:", "RDEPENDS", required=False)
-    )
-
-    ok_q, msg_q = _balanced_quotes(text)
-    items.append(
-        ("balanced quotes", Status.PASS if ok_q else Status.FAIL, msg_q)
-    )
-    ok_b, msg_b = _balanced_braces(text)
-    items.append(
-        ("balanced braces", Status.PASS if ok_b else Status.WARN, msg_b)
-    )
-    ok_ts, msg_ts = _timestamp_residue(text)
-    items.append(
-        ("timestamp residue", Status.PASS if ok_ts else Status.FAIL, msg_ts)
-    )
-    ok_dt, msg_dt = _dep_token_prefix(text)
-    items.append(
-        ("dep token prefix", Status.PASS if ok_dt else Status.FAIL, msg_dt)
-    )
-    ok_sq, msg_sq = _balanced_single_quotes(text)
-    items.append(
-        (
-            "balanced single-quotes",
-            Status.PASS if ok_sq else Status.WARN,
-            msg_sq,
-        )
-    )
-
-    failed = [i for i in items if i[1] is Status.FAIL]
-    status = (
-        Status.FAIL
-        if failed
-        else (
-            Status.WARN
-            if any(i[1] is Status.WARN for i in items)
-            else Status.PASS
-        )
-    )
-    summary = f"{len(items) - len(failed)}/{len(items)} checks passed"
-    if failed:
-        summary += f"; failed: {[i[0] for i in failed]}"
-    return CheckResult("structural", status, summary, items=items)
-
-
-# --------------------------------------------------------------------------- #
-# external stages
-# --------------------------------------------------------------------------- #
 def _run_cmd(
     cmd: list[str],
     cwd: str | None,
@@ -273,12 +188,129 @@ def _run_cmd(
     return proc.returncode, out.strip()
 
 
+# --------------------------------------------------------------------------- #
+# Level: structural
+# --------------------------------------------------------------------------- #
+def structural_check(recipe_path: Path) -> CheckResult:
+    """
+    Cheap checks on a generated recipe.
+    """
+    items: list[tuple[str, Status, str]] = []
+    try:
+        text = Path(recipe_path).read_text(encoding="utf-8")
+    except OSError as exc:
+        return CheckResult(
+            "structural", Status.ERROR, f"cannot read recipe: {exc}"
+        )
+
+    if not text.strip():
+        return CheckResult("structural", Status.FAIL, "recipe file is empty")
+
+    items.append(
+        _check_required(text, r"^SUMMARY\s*=", "SUMMARY", required=True)
+    )
+    items.append(
+        _check_required(text, r"^LICENSE\s*=", "LICENSE", required=True)
+    )
+    items.append(
+        _check_required(
+            text, r"^LIC_FILES_CHKSUM\s*=", "LIC_FILES_CHKSUM", required=False
+        )
+    )
+    items.append(
+        _check_required(text, r"^HOMEPAGE\s*=", "HOMEPAGE", required=False)
+    )
+    items.append(
+        _check_required(
+            text, r"^SRC_URI\[sha256sum\]", "SRC_URI[sha256sum]", required=False
+        )
+    )
+    items.append(
+        _check_required(text, r"^RDEPENDS:", "RDEPENDS", required=False)
+    )
+
+    vendored = bool(re.search(r'^SRC_URI\s*=\s*"file://', text, re.MULTILINE))
+    if vendored:
+        # When no sdist and only wheel --> vendor path (install binary only)
+        installs_wheel = bool(
+            re.search(r"^do_install\s*\(\)", text, re.MULTILINE)
+        )
+        if installs_wheel:
+            items.append(
+                _check_required(
+                    text,
+                    r"^DEPENDS.*python3-installer",
+                    "python3-installer (wheel install)",
+                    required=True,
+                )
+            )
+        else:
+            items.append(
+                _check_required(
+                    text,
+                    r'^S\s*=\s*"\$\{WORKDIR\}/',
+                    "S (vendored)",
+                    required=True,
+                )
+            )
+    else:
+        # PyPi path (not vendored)
+        items.append(
+            _check_required(
+                text, r"^inherit\s+pypi", "inherit pypi", required=True
+            )
+        )
+
+    ok_q, msg_q = _balanced_double_quotes(text)
+    items.append(
+        ("balanced quotes", Status.PASS if ok_q else Status.FAIL, msg_q)
+    )
+    ok_b, msg_b = _balanced_braces(text)
+    items.append(
+        ("balanced braces", Status.PASS if ok_b else Status.WARN, msg_b)
+    )
+    ok_ts, msg_ts = _timestamp_residue(text)
+    items.append(
+        ("timestamp residue", Status.PASS if ok_ts else Status.FAIL, msg_ts)
+    )
+    ok_dt, msg_dt = _dep_token_prefix(text)
+    items.append(
+        ("dep token prefix", Status.PASS if ok_dt else Status.FAIL, msg_dt)
+    )
+    ok_sq, msg_sq = _balanced_single_quotes(text)
+    items.append(
+        (
+            "balanced single-quotes",
+            Status.PASS if ok_sq else Status.WARN,
+            msg_sq,
+        )
+    )
+
+    failed = [i for i in items if i[1] is Status.FAIL]
+    status = (
+        Status.FAIL
+        # Here using the fact that [] is "falsy"
+        if failed
+        else (
+            Status.WARN
+            if any(i[1] is Status.WARN for i in items)
+            else Status.PASS
+        )
+    )
+    summary = f"{len(items) - len(failed)}/{len(items)} checks passed"
+    if failed:
+        summary += f"; failed: {[i[0] for i in failed]}"
+    return CheckResult("structural", status, summary, items=items)
+
+
+# --------------------------------------------------------------------------- #
+# Level: parse
+# --------------------------------------------------------------------------- #
 def bitbake_parse(
     meta: PackageMetadata, builddir: str, timeout: int
 ) -> CheckResult:
     pn = bitbake_pn(meta.name)
-    # '-p'/'--parse-only' is bitbake's real parse-only mode. '-c parse' would
-    # select a do_parse task that does not exist and can never succeed.
+    # Parse checking with -p/--parse-only
     code, out = _run_cmd(["bitbake", "-p", pn], cwd=builddir, timeout=timeout)
     if code == 0:
         return CheckResult("parse", Status.PASS, f"bitbake parsed {pn}")
@@ -288,6 +320,9 @@ def bitbake_parse(
     )
 
 
+# --------------------------------------------------------------------------- #
+# Level: checklayer
+# --------------------------------------------------------------------------- #
 def checklayer(layer_dir: Path, builddir: str, timeout: int) -> CheckResult:
     layer_dir = Path(layer_dir)
     code, out = _run_cmd(
@@ -309,6 +344,9 @@ def checklayer(layer_dir: Path, builddir: str, timeout: int) -> CheckResult:
     )
 
 
+# --------------------------------------------------------------------------- #
+# Level: build
+# --------------------------------------------------------------------------- #
 def kas_build(kas_file: Path, workdir: Path, timeout: int) -> CheckResult:
     kas_file = Path(kas_file)
     code, out = _run_cmd(
@@ -325,7 +363,7 @@ def kas_build(kas_file: Path, workdir: Path, timeout: int) -> CheckResult:
 
 
 # --------------------------------------------------------------------------- #
-# orchestration
+# Levels runner
 # --------------------------------------------------------------------------- #
 def run_checks(
     meta: PackageMetadata,
@@ -336,23 +374,30 @@ def run_checks(
     workdir: Path | None = None,
     timeout: int = _DEFAULT_TIMEOUT,
 ) -> list[CheckResult]:
-    """Run the validation ladder up to (and including) ``level``."""
-    if level not in STAGES:
+    """
+    Run the validation levels up to and including `level`.
+    """
+    if level not in LEVELS:
+        logger.warning(
+            "level %s unknown, running with %s ...", level, DEFAULT_LEVEL
+        )
         level = DEFAULT_LEVEL
-    ceiling = STAGES.index(level)
+    ceiling = LEVELS.index(level)
     builddir = os.environ.get("BUILDDIR", "")
 
     results: list[CheckResult] = []
-    for stage in STAGES[: ceiling + 1]:
-        if stage == "structural":
+    for level in LEVELS[: ceiling + 1]:
+        logger.info("check %s: running ...", level)
+        before = len(results)
+        if level == "structural":
             results.append(structural_check(recipe_path))
-        elif stage == "parse":
+        elif level == "parse":
             avail, reason = _bitbake_available()
             if not avail:
                 results.append(CheckResult("parse", Status.SKIP, reason))
             else:
                 results.append(bitbake_parse(meta, builddir, timeout))
-        elif stage == "checklayer":
+        elif level == "checklayer":
             if layer_dir is None:
                 results.append(
                     CheckResult(
@@ -361,13 +406,15 @@ def run_checks(
                         "no layer directory generated",
                     )
                 )
-                continue
-            avail, reason = _checklayer_available()
-            if not avail:
-                results.append(CheckResult("checklayer", Status.SKIP, reason))
             else:
-                results.append(checklayer(layer_dir, builddir, timeout))
-        elif stage == "build":
+                avail, reason = _checklayer_available()
+                if not avail:
+                    results.append(
+                        CheckResult("checklayer", Status.SKIP, reason)
+                    )
+                else:
+                    results.append(checklayer(layer_dir, builddir, timeout))
+        elif level == "build":
             wd = workdir or (
                 Path(kas_file).parent / "kas-workdir"
                 if kas_file
@@ -379,4 +426,6 @@ def run_checks(
                 results.append(CheckResult("build", Status.SKIP, reason))
             else:
                 results.append(kas_build(kas_file, wd, timeout))
+        for r in results[before:]:
+            logger.info("check %s: %s - %s", r.level, r.status.value, r.detail)
     return results

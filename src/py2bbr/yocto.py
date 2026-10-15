@@ -1,30 +1,32 @@
 """
 Yocto series handling, layer generation and ``kas`` build-file emission.
-
-The release -> series mapping is owned here (kas is data-driven and does not
-ship a release/branch table). ``kas`` is used to (a) validate the generated
-``kas`` build file against the official JSON schema and (b) drive the optional
-``--check build`` stage.
 """
 
-from __future__ import annotations
-
+import logging
+import platform
 import re
+import shutil
+import sys
+from dataclasses import replace
 from pathlib import Path
 
-from py2bbr.errors import YoctoVersionError
+from py2bbr import __version__
+from py2bbr.errors import TargetRuntimeError, YoctoVersionError
 from py2bbr.model import PackageMetadata, YoctoVersion
 from py2bbr.recipe import bitbake_pn, canonical_name, recipe_filename
 
-# Known Yocto Project series. ``poky_branch`` == the codename (poky release
-# branches are named after the codename). ``meta_python_branch`` matches.
+logger = logging.getLogger(__name__)
+
+# Known Yocto Project series. Newest first; ``python_version`` is the Python
+# the series ships (see ``_BUNDLED_TOOL_VERSIONS`` in ``recipe.py`` for the
+# matching build-tool versions).
 _YOCTO_SERIES: dict[str, YoctoVersion] = {
     "6.0": YoctoVersion(
         "6.0",
-        "wayne",
-        "wayne",
-        "3.13",
-        meta_python_branch="wayne",
+        "wrynose",
+        "wrynose",
+        "3.14",
+        meta_python_branch="wrynose",
     ),
     "5.0": YoctoVersion(
         "5.0",
@@ -35,37 +37,45 @@ _YOCTO_SERIES: dict[str, YoctoVersion] = {
     ),
     # "4.3": YoctoVersion(
     #     "4.3",
-    #     "styhead",
-    #     "styhead",
+    #     "nanbield",
+    #     "nanbield",
     #     "3.11",
-    #     meta_python_branch="styhead",
+    #     meta_python_branch="nanbield",
     # ),
     # "4.1": YoctoVersion(
     #     "4.1",
-    #     "mickledore",
-    #     "mickledore",
+    #     "langdale",
+    #     "langdale",
     #     "3.10",
-    #     meta_python_branch="mickledore",
+    #     meta_python_branch="langdale",
     # ),
     # "3.1": YoctoVersion(
     #     "3.1",
     #     "dunfell",
     #     "dunfell",
-    #     "3.9",
+    #     "3.8",
     #     meta_python_branch="dunfell",
     # ),
 }
 
 # Index by codename too, so ``--yocto-version scarthgap`` works.
+#
+# Note: No conflict as codenames are not numbers, while versions
+#       must be numbers.
 for _v in list(_YOCTO_SERIES.values()):
     _YOCTO_SERIES.setdefault(_v.codename, _v)
 
-#: Default kas file format version (within the schema's 1..23 range).
+# Default kas file format version (within the schema's 1..23 range).
 DEFAULT_KAS_VERSION = 5
 
 
 def known_versions() -> list[YoctoVersion]:
-    """The known series, newest first (deduplicated)."""
+    """
+    The known series, newest first.
+
+    Only presented per version numbers. Codenames are not used to index know
+    versions here.
+    """
     seen: dict[str, YoctoVersion] = {}
     for v in _YOCTO_SERIES.values():
         seen.setdefault(v.version, v)
@@ -86,26 +96,117 @@ def _version_key(version: str) -> tuple[int, ...]:
 
 def resolve_yocto_version(spec: str | None) -> YoctoVersion:
     """
-    Resolve a ``--yocto-version`` value to a :class:`YoctoVersion`.
+    Resolve a ``--yocto-version`` value to a `YoctoVersion`.
 
     Accepts a version (``5.0``, ``5``, ``5.0.0``) or a codename (``scarthgap``).
+
     Defaults to the 5.0 series (Scarthgap).
     """
     if spec is None:
         spec = "5.0"
+
     key = spec.strip().lower()
     if key in _YOCTO_SERIES:
         return _YOCTO_SERIES[key]
-    if key.isdigit():
+
+    # Both "5" and "5.0" are accepted and resolved.
+    if key.isdigit() or key[0:1].isdigit():
         candidate = f"{key}.0"
         if candidate in _YOCTO_SERIES:
             return _YOCTO_SERIES[candidate]
+
     available = ", ".join(
         f"{v.version} ({v.codename})" for v in known_versions()
     )
     raise YoctoVersionError(
         f"unknown Yocto version {spec!r}. Known versions: {available}"
     )
+
+
+def current_python_version() -> str:
+    """`major.minor` of the interpreter py2bbr itself runs under."""
+    return f"{sys.version_info.major}.{sys.version_info.minor}"
+
+
+def current_platform_machine() -> str:
+    """`platform.machine()` of the build host, lower-cased."""
+    # TODO Perhaps no default, and error report.
+    return platform.machine().strip().lower() or "x86_64"
+
+
+# Common name normalisation.
+_ARCH_ALIASES: dict[str, str] = {
+    "amd64": "x86_64",
+    "x64": "x86_64",
+    "x86-64": "x86_64",
+    "arm64": "aarch64",
+    "arm64-v8a": "aarch64",
+    "armv8": "aarch64",
+    "armv7": "armv7l",
+    "armv7hf": "armv7l",
+    "armhf": "armv7l",
+    "arm32": "armv7l",
+    "i386": "i686",
+    "i486": "i686",
+    "i586": "i686",
+    "x86": "i686",
+    "riscv": "riscv64",
+}
+
+
+def normalize_python_version(spec: str) -> str:
+    """Reduce a ``--python-version`` value to ``major.minor``."""
+    raw = (spec or "").strip()
+    if not raw:
+        raise TargetRuntimeError(
+            "empty --python-version; expected a version like 3.12"
+        )
+    candidate = raw
+    if candidate.isdigit() and len(candidate) > 2:
+        # Normalise "312" -> "3.12".
+        candidate = f"{candidate[0]}.{candidate[1:]}"
+    match = re.fullmatch(r"(\d+)\.(\d+)(?:\.\d+)*", candidate)
+    if not match:
+        raise TargetRuntimeError(
+            f"invalid --python-version {spec!r}; expected a version like 3.12"
+        )
+    return f"{int(match.group(1))}.{int(match.group(2))}"
+
+
+def normalize_platform_machine(spec: str) -> str:
+    """Normalise a ``--target-arch`` value into a ``platform_machine``."""
+    raw = (spec or "").strip().lower()
+    if not raw:
+        raise TargetRuntimeError(
+            "empty --target-arch; expected an architecture like aarch64"
+        )
+    machine = _ARCH_ALIASES.get(raw, raw)
+    if not re.fullmatch(r"[a-z0-9_]+", machine):
+        raise TargetRuntimeError(
+            f"invalid --target-arch {spec!r}; expected an architecture like "
+            "aarch64 (as platform.machine() reports it)"
+        )
+    return machine
+
+
+def resolve_target_runtime(
+    yocto: YoctoVersion,
+    python_version: str | None = None,
+    platform_machine: str | None = None,
+) -> YoctoVersion:
+    """
+    Return the target runtime the run asked for.
+
+    Defaults to the local machine information.
+    """
+    changes: dict[str, str] = {}
+    if python_version is not None:
+        changes["python_version"] = normalize_python_version(python_version)
+    if platform_machine is not None:
+        changes["platform_machine"] = normalize_platform_machine(
+            platform_machine
+        )
+    return replace(yocto, **changes) if changes else yocto
 
 
 def layer_collection(layer_name: str) -> str:
@@ -116,27 +217,27 @@ def layer_collection(layer_name: str) -> str:
 
 
 def default_layer_name(package_name: str) -> str:
-    """The default layer directory name for a package: ``meta-<canonical>``.
-
-    e.g. ``async_pyserial`` -> ``meta-async-pyserial``. One layer per package
-    (per PEP 503 canonical name), so generated layers never collide.
-    """
+    """The default layer directory name for a package: ``meta-<canonical>``."""
     return f"meta-{canonical_name(package_name)}"
 
 
 def _layer_conf(collection: str, codename: str) -> str:
-    # BBFILES: bitbake only scans files matching BBFILES globs, so a layer
-    # that never adds its recipe tree is invisible ("No bb files ... matched
-    # BBFILE_PATTERN_<c>") even though the layer itself loads.
-    # LAYERDEPENDS: only hard-depend on "core". bitbake refuses to load a
-    # layer whose LAYERDEPENDS names a collection not enabled in BBLAYERS and
-    # silently drops every recipe in it ("Nothing PROVIDES ..."). The classes
-    # py2bbr emits (pypi, setuptools3, python_pep517,
-    # python_setuptools_build_meta) all live in poky core for the supported
-    # series, so meta-python ("python") must not be a hard layer dependency;
-    # recipe-level needs of it fail per-recipe with a precise error instead.
-    # LAYERSERIES_COMPAT: the modern series-compatibility variable; the old
-    # LAYERCOMPATIBLE is no longer read by bitbake.
+    """
+    Typical layer elements.
+
+    - BBFILES: bitbake only scans files matching BBFILES globs, so a layer
+      that never adds its recipe tree is invisible ("No bb files ... matched
+      BBFILE_PATTERN_<c>") even though the layer itself loads.
+    - LAYERDEPENDS: Only depends on "core". bitbake refuses to load a
+      layer whose LAYERDEPENDS names a collection not enabled in BBLAYERS and
+      *silently* drops every recipe in it ("Nothing PROVIDES ...").
+      meta-python must not be a hard layer dependency. Recipe-level needs for
+      it fail per-recipe with an error.
+    - LAYERSERIES_COMPAT: the modern series-compatibility variable.
+    - BBFILE_PRIORITY set to 5, lower than the default 7 in poky to prioritise
+      "official" layers if they exist (assuming most people would prefer
+      *not* having to use py2bbr).
+    """
     return (
         f'BBPATH .= ":${{LAYERDIR}}"\n'
         f'BBFILES += "${{LAYERDIR}}/recipes-*/*/*.bb"\n'
@@ -153,8 +254,9 @@ def _layer_readme(meta: PackageMetadata, yocto: YoctoVersion) -> str:
     return (
         f"# py2bbr-generated layer\n"
         f"\n"
-        f"Generated by py2bbr. This layer provides a Bitbake recipe for the\n"
-        f"Python package `{meta.name}` ({meta.version}) targeting {yocto.label}.\n"
+        f"Generated by py2bbr {__version__}. This layer provides a Bitbake recipe for the\n"
+        f"Python package `{meta.name}` ({meta.version}) targeting\n"
+        f"{yocto.label}, {yocto.runtime_label}.\n"
         f"\n"
         f"Recipe: `recipes-devtools/python/{recipe_filename(bitbake_pn(meta.name, yocto.python_pn), meta.version)}`\n"
     )
@@ -165,8 +267,13 @@ def render_layer(
     yocto: YoctoVersion,
     layer_name: str,
     build_class: str | None = None,
+    extra_metas: list[PackageMetadata] | None = None,
 ) -> dict[str, str]:
-    """Render a full Yocto layer as ``{relative_path: content}``."""
+    """Render a full Yocto layer as a dict `{relative_path: content}`.
+
+    One recipe per member (dependency, etc). `RDEPENDS:${PN}` on each member
+    pulls the next recipe transitively (bitbake follows RDEPENDS).
+    """
     from py2bbr.recipe import render_recipe
 
     collection = layer_collection(layer_name)
@@ -174,11 +281,24 @@ def render_layer(
     recipe_path = f"recipes-devtools/python/{recipe_filename(pn, meta.version)}"
     recipe_text, _warnings = render_recipe(meta, yocto, build_class=build_class)
 
-    return {
+    files = {
         "conf/layer.conf": _layer_conf(collection, yocto.codename),
         "README": _layer_readme(meta, yocto),
         recipe_path: recipe_text,
     }
+
+    for member in extra_metas or ():
+        member_pn = bitbake_pn(member.name, yocto.python_pn)
+        member_path = (
+            "recipes-devtools/python/"
+            f"{recipe_filename(member_pn, member.version)}"
+        )
+        member_text, _warnings = render_recipe(
+            member, yocto, build_class=build_class
+        )
+        files[member_path] = member_text
+
+    return files
 
 
 def write_layer(
@@ -186,17 +306,62 @@ def write_layer(
     yocto: YoctoVersion,
     layer_dir: Path,
     build_class: str | None = None,
+    extra_metas: list[PackageMetadata] | None = None,
+    vendor_sources: dict[str, Path] | None = None,
 ) -> Path:
-    """Write the layer tree under ``layer_dir``; return the recipe path."""
+    """Write the layer tree under `layer_dir` and return the top recipe path.
+
+    `vendor_sources` maps recipe file names (e.g. `python3-x_1.0.bb`) to
+    the file each vendored recipe must contain, copied into the layer tree
+    under `recipes-devtools/python/files/` so that `file://` SRC_URI
+    resolves through FILESPATH.
+    """
     layer_dir = Path(layer_dir)
-    files = render_layer(meta, yocto, layer_dir.name, build_class=build_class)
+    files = render_layer(
+        meta,
+        yocto,
+        layer_dir.name,
+        build_class=build_class,
+        extra_metas=extra_metas,
+    )
+    vendored_recipes = {
+        recipe_filename(bitbake_pn(m.name, yocto.python_pn), m.version)
+        for m in [meta, *(extra_metas or [])]
+        if m.vendored
+    }
+    missing = vendored_recipes - set(vendor_sources or {})
+    if missing:
+        raise ValueError(
+            "vendored recipe(s) lack their sdist in vendor_sources: "
+            + ", ".join(sorted(missing))
+        )
     recipe_path = None
     for rel, content in files.items():
         dest = layer_dir / rel
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_text(content, encoding="utf-8")
-        if rel.endswith(".bb"):
+        if rel.endswith(".bb") and (
+            recipe_path is None
+            or rel.startswith(
+                f"recipes-devtools/python/{recipe_filename(bitbake_pn(meta.name, yocto.python_pn), meta.version)}"
+            )
+        ):
             recipe_path = dest
+    for src in (vendor_sources or {}).values():
+        files_dir = layer_dir / "recipes-devtools" / "python" / "files"
+        files_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, files_dir / Path(src).name)
+    if vendor_sources:
+        logger.info(
+            "vendored %d sdist(s) into %s",
+            len(vendor_sources),
+            layer_dir / "recipes-devtools" / "python" / "files",
+        )
+    logger.info(
+        "wrote layer %s (%d .bb recipe(s))",
+        layer_dir,
+        sum(1 for rel in files if rel.endswith(".bb")),
+    )
     return layer_dir if recipe_path is None else recipe_path
 
 
@@ -207,12 +372,12 @@ def render_kas_file(
     machine: str = "qemux86-64",
     kas_version: int = DEFAULT_KAS_VERSION,
     extra_targets: list[str] | None = None,
+    include_meta_python: bool = True,
 ) -> str:
     """
-    Render a ``kas`` build file (YAML) that builds the generated recipe.
+    Render a `kas` build file (YAML) that builds the generated recipe.
 
-    The file references poky + meta-python at the matching branch and includes
-    the generated layer as a local (non-URL) repo.
+    TODO Experimental and barely tested.
     """
     import yaml
 
@@ -220,29 +385,30 @@ def render_kas_file(
 
     layer_dir = Path(layer_dir).resolve()
     pn = bitbake_pn(meta.name, yocto.python_pn)
-    targets = [pn]
-    if extra_targets:
-        targets = list(dict.fromkeys([pn] + list(extra_targets)))
+    targets = list(dict.fromkeys([pn] + list(extra_targets or [])))
+
+    repos: dict[str, dict] = {
+        "poky": {
+            "url": yocto.poky_url,
+            "branch": yocto.poky_branch,
+        },
+        layer_dir.name: {
+            "url": None,
+            "path": str(layer_dir),
+        },
+    }
+    if include_meta_python:
+        repos["meta-python"] = {
+            "url": yocto.meta_python_url,
+            "branch": yocto.meta_python_branch or yocto.codename,
+        }
 
     config = {
         "header": {"version": kas_version},
         "build_system": "openembedded",
         "machine": machine,
         "target": targets,
-        "repos": {
-            "poky": {
-                "url": yocto.poky_url,
-                "branch": yocto.poky_branch,
-            },
-            "meta-python": {
-                "url": yocto.meta_python_url,
-                "branch": yocto.meta_python_branch or yocto.codename,
-            },
-            layer_dir.name: {
-                "url": None,
-                "path": str(layer_dir),
-            },
-        },
+        "repos": repos,
     }
     return yaml.safe_dump(config, sort_keys=False, default_flow_style=False)
 
@@ -251,8 +417,10 @@ def validate_kas_file(config: dict) -> list[str]:
     """
     Validate a kas config dict against the official kas JSON schema.
 
-    Returns a list of error strings (empty if valid). Falls back to a minimal
-    structural check if ``kas``/``jsonschema`` are unavailable.
+    Returns a list of error strings if any.
+
+    Falls back to a minimal structural check if `kas`/`jsonschema` are
+    not available in the executing environment.
     """
     try:
         import jsonschema  # type: ignore

@@ -1,14 +1,10 @@
-"""Shared fixtures and helpers for the py2bbr test-suite (no network required)."""
-
-from __future__ import annotations
-
 import pytest
 
 from py2bbr.model import Dependency, DepKind, PackageMetadata, SourceKind
 
 
 def make_meta(**overrides) -> PackageMetadata:
-    """Build a realistic :class:`PackageMetadata` for tests (no I/O)."""
+    """Build a realistic yet simple `PackageMetadata` for tests (no I/O)."""
     base: dict = {
         "name": "black",
         "canonical_name": "black",

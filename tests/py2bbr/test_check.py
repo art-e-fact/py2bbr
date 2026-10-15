@@ -1,7 +1,3 @@
-"""Tests for py2bbr.check stage plumbing (no bitbake / network required)."""
-
-from __future__ import annotations
-
 import subprocess
 
 from py2bbr import check
@@ -52,14 +48,10 @@ def _write(tmp_path, text: str):
 
 
 class TestStructuralCorruptionChecks:
-    """The PetaLinux field corruption leaves signatures we must reject.
-
-    The broken line looked like ``DEPENDS +=     -pybind11-native '00:00``
-    ('00:00 is a timestamp residue; ``-pybind11-native`` shows the
-    ``${PYTHON_PN}-`` prefix was gutted).
-    """
-
     def test_timestamp_residue_fails(self, tmp_path):
+        """
+        Note: A real problem in an early version of py2bbr.
+        """
         p = _write(
             tmp_path,
             _CLEAN.replace(
@@ -86,8 +78,6 @@ class TestStructuralCorruptionChecks:
         assert result.status is Status.FAIL
 
     def test_single_quote_imbalance_warns(self, tmp_path):
-        # Apostrophe inside a double-quoted value (legit in a free-text
-        # SUMMARY): double quotes stay balanced, single quotes do not.
         p = _write(tmp_path, _CLEAN.replace("python3-click", "python'3-click"))
         result = structural_check(p)
         item = next(i for i in result.items if i[0] == "balanced single-quotes")
@@ -116,6 +106,27 @@ class TestStructuralEdges:
         p = _write(tmp_path, 'SUMMARY = "x"\nLICENSE = "MIT"\ninherit pypi\n')
         r = structural_check(p)
         assert r.status is Status.WARN
+
+
+class TestVendoredStructural:
+    def test_vendored_form_without_pypi_class_passes(self, tmp_path):
+        text = _CLEAN.replace(
+            "inherit pypi\n",
+            'SRC_URI = "file://pyvizionsdk-26.9.1.tar.gz"\n'
+            'S = "${WORKDIR}/pyvizionsdk-26.9.1"\n',
+        )
+        result = structural_check(_write(tmp_path, text))
+        assert result.status is Status.PASS
+        assert "inherit pypi" not in [i[0] for i in result.items]
+
+    def test_vendored_form_requires_s(self, tmp_path):
+        text = _CLEAN.replace(
+            "inherit pypi\n", 'SRC_URI = "file://pyvizionsdk-26.9.1.tar.gz"\n'
+        )
+        result = structural_check(_write(tmp_path, text))
+        item = next(i for i in result.items if i[0] == "S (vendored)")
+        assert item[1] is Status.FAIL
+        assert result.status is Status.FAIL
 
     def test_unbalanced_double_quotes_fail(self, tmp_path):
         p = _write(
@@ -292,7 +303,7 @@ class TestRunChecks:
         results = check.run_checks(
             _meta(), _write(tmp_path, _CLEAN), None, None, level="bogus"
         )
-        assert [r.stage for r in results] == ["structural", "parse"]
+        assert [r.level for r in results] == ["structural", "parse"]
 
     def test_all_skipped(self, tmp_path, monkeypatch):
         p = _write(tmp_path, _CLEAN)
@@ -315,3 +326,58 @@ class TestRunChecks:
         results = check.run_checks(_meta(), p, None, None, level="checklayer")
         assert results[2].status is Status.SKIP
         assert "no layer" in results[2].detail
+
+
+class TestRunChecksAvailable:
+    def _run(self, tmp_path, monkeypatch, level, **kwargs):
+        monkeypatch.setattr(
+            check, "_bitbake_available", lambda: (True, "bitbake found")
+        )
+        monkeypatch.setattr(
+            check, "_checklayer_available", lambda: (True, "check-layer found")
+        )
+        monkeypatch.setattr(check, "_kas_available", lambda f: (True, "kas"))
+        monkeypatch.setattr(check, "_run_cmd", lambda *a, **k: (0, "ok"))
+        return check.run_checks(
+            _meta(),
+            _write(tmp_path, _CLEAN),
+            tmp_path / "layer",
+            tmp_path / "py2bbr.kas.yml",
+            level=level,
+            workdir=tmp_path / "wd",
+            **kwargs,
+        )
+
+    def test_parse_runs_bitbake(self, tmp_path, monkeypatch):
+        results = self._run(tmp_path, monkeypatch, "parse")
+        assert results[1].status is Status.PASS
+        assert "bitbake parsed" in results[1].detail
+
+    def test_checklayer_runs_the_tool(self, tmp_path, monkeypatch):
+        results = self._run(tmp_path, monkeypatch, "checklayer")
+        assert results[2].status is Status.PASS
+        assert "check-layer" in results[2].detail
+
+    def test_build_runs_kas(self, tmp_path, monkeypatch):
+        results = self._run(tmp_path, monkeypatch, "build")
+        assert results[3].status is Status.PASS
+        assert "kas build" in results[3].detail
+
+
+class TestRunCmdEnv:
+    def test_extra_env_is_merged(self, monkeypatch):
+        seen = {}
+
+        def fake_run(cmd, cwd, env, **kwargs):
+            seen.update(env)
+            return subprocess.CompletedProcess(cmd, 0, "out", "")
+
+        monkeypatch.setattr(check.subprocess, "run", fake_run)
+        monkeypatch.setenv("PY2BBR_SENTINEL", "from-parent")
+        code, out = check._run_cmd(
+            ["true"], cwd=None, timeout=5, extra_env={"BB_ENV_PY2BBR": "extra"}
+        )
+        assert (code, out) == (0, "out")
+        # The caller's overrides win over the inherited environment.
+        assert seen["BB_ENV_PY2BBR"] == "extra"
+        assert seen["PY2BBR_SENTINEL"] == "from-parent"
