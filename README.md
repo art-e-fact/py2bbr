@@ -1,5 +1,7 @@
 # py2bbr
 
+en | [ja](README_JA.md)
+
 Python to Bitbake Recipe.
 
 Convert a Python package into a Yocto Project *Bitbake recipe* typically
