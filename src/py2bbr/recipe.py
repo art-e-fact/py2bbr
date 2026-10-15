@@ -527,6 +527,7 @@ def _applies_to_target(dep: Dependency, yocto: YoctoVersion) -> bool:
 
     # TODO Import here to avoid cycles.
     from py2bbr.metadata import marker_env
+
     try:
         return bool(Marker(marker).evaluate(marker_env(yocto)))
     except (InvalidMarker, UndefinedEnvironmentName):
