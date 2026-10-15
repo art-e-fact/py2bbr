@@ -100,13 +100,6 @@ class TestRecipeEdges:
 
 
 class TestParseMetadataFileRootLevel:
-    """Regression: flit_core 3.12 vendors ``vendor/tomli-1.2.3.dist-info/
-    METADATA`` *before* its own root ``PKG-INFO`` in the sdist; an archive-
-    member-order scan picked the vendored metadata and recipe generation
-    produced a bogus ``python3-tomli_1.2.3.bb`` (with flit_core's sha256) for
-    the flit_core fetch. Only the root-level metadata may describe the source.
-    """
-
     def _source(self, tmp_path) -> FetchedSource:
         tar = tmp_path / "pkg-1.0.0.tar.gz"
         with tarfile.open(tar, "w:gz") as tf:

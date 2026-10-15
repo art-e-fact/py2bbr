@@ -60,8 +60,6 @@ class TestBuildParser:
         assert args.with_deps is True
 
     def test_target_runtime_defaults_to_this_machine(self):
-        # The layer is built here and (usually) runs here, so the running
-        # interpreter and this machine's CPU are the least surprising answers.
         args = cli.build_parser().parse_args(["black"])
         assert args.python_version == (
             f"{sys.version_info.major}.{sys.version_info.minor}"
@@ -212,9 +210,6 @@ class TestMain:
     def test_major_bump_cap_reaches_every_fetch(
         self, tmp_path, monkeypatch, meta, make_meta_fn
     ):
-        # The cap flag is threaded into build_metadata for the top package and
-        # every closure member; with --no-major-bump-cap every fetch must see
-        # the flag cleared.
         seen = []
         src = _source(tmp_path)
 
@@ -254,12 +249,6 @@ class TestMain:
     def test_wheel_report_and_recipe_waive_the_strip_check(
         self, tmp_path, monkeypatch, capsys, make_meta_fn
     ):
-        # A vendored wheel carries no build config, so build_metadata read
-        # [build-system] from the project's repository; the report says where
-        # the answer came from instead of letting it read as the release's own
-        # declaration. And upstream shipped the extension modules already
-        # stripped, so the recipe waives bitbake's fatal already-stripped QA
-        # check - the reported do_package failure for pyvizionsdk.
         meta = make_meta_fn(
             name="pyvizionsdk",
             canonical_name="pyvizionsdk",
@@ -356,21 +345,12 @@ class TestMain:
         assert cli.main(["black", "-o", str(tmp_path)]) == 130
 
     def test_module_entry_point(self, monkeypatch):
-        # ``python -m py2bbr`` goes through py2bbr/__main__.py. runpy can
-        # re-execute that here: the target is the package itself, so nothing
-        # is shadowed and runpy stays quiet.
         monkeypatch.setattr(sys, "argv", ["py2bbr", "--version"])
         with pytest.raises(SystemExit) as exc:
             runpy.run_module("py2bbr", run_name="__main__")
         assert exc.value.code == 0
 
     def test_submodule_entry_point(self):
-        # ``python -m py2bbr.cli`` cannot be checked with runpy in-process:
-        # this test module has already imported py2bbr.cli, and re-executing
-        # that source under the name __main__ here is not what -m does (it
-        # imports it fresh). runpy warns about exactly that ("found in
-        # sys.modules after import of package ... but prior to execution"),
-        # and the warning is right - a subprocess is the faithful check.
         proc = subprocess.run(
             [sys.executable, "-m", "py2bbr.cli", "--version"],
             capture_output=True,
@@ -432,8 +412,6 @@ class TestFetchProgress:
 
 
 class TestLogging:
-    """INFO stage progress on stderr; -q suppresses it, -v adds DEBUG."""
-
     def test_info_stage_progress_by_default(
         self, tmp_path, monkeypatch, meta, make_meta_fn, caplog
     ):
@@ -531,14 +509,6 @@ class TestLogging:
 
 
 class TestTargetReport:
-    """The build-for-target report: the cross-build answer for a recipe.
-
-    A layer is built on an x86_64 host for an ARM target, so the report has to
-    be printed unconditionally (a recipe can parse and build on the host and
-    still be useless for the target), and it has to name the *class* it judged,
-    because ``--build-class`` changes the verdict.
-    """
-
     def _run(
         self,
         tmp_path,
@@ -600,12 +570,6 @@ class TestTargetReport:
     def test_incompatible_target_adds_a_warning(
         self, tmp_path, monkeypatch, capsys, make_meta_fn
     ):
-        # An INCOMPATIBLE target has to say so per target *and* raise the
-        # run-wide warning. The target Python is named explicitly because
-        # --python-version defaults to the interpreter running the tests: a
-        # ">=3.13" gate that the host satisfies (any 3.13+ interpreter) never
-        # fires, so the verdict would otherwise depend on the machine the
-        # suite runs on. --arch/--targets narrow it to one board of the matrix.
         out = self._run(
             tmp_path,
             monkeypatch,
@@ -688,14 +652,6 @@ class TestTargetReport:
 
 
 class TestGapProvisioning:
-    """``--with-deps`` provisions a newer build tool into the layer.
-
-    A ``build-system.requires`` floor above the target series' native sysroot
-    (numpy wants Cython>=3.1.0, Scarthgap ships 3.0.8) otherwise fails the
-    ``--no-isolation`` check inside the build. With a layer to put it in, the
-    newer tool becomes a generated recipe of the layer itself.
-    """
-
     def _gapped(self, make_meta_fn, **kw):
         return make_meta_fn(
             build_deps=[
@@ -731,8 +687,6 @@ class TestGapProvisioning:
     def test_no_layer_warns_instead(
         self, tmp_path, monkeypatch, capsys, make_meta_fn
     ):
-        # Without a layer there is nowhere to put the recipe, so the gap has to
-        # be reported instead of silently ignored.
         meta = self._gapped(make_meta_fn)
         monkeypatch.setattr(
             cli,
@@ -755,9 +709,6 @@ class TestGapProvisioning:
     def test_dep_already_in_the_closure_is_not_provisioned_twice(
         self, tmp_path, monkeypatch, capsys, make_meta_fn
     ):
-        # Cython is both a runtime dep and a gapped build tool: it is already
-        # a closure member, so provisioning it again would write a second
-        # recipe for the same package into the layer.
         meta = self._gapped(
             make_meta_fn,
             runtime_deps=[
@@ -807,11 +758,6 @@ class TestGapProvisioning:
     def test_shadowing_recipe_warns_with_the_recovery(
         self, tmp_path, monkeypatch, capsys, make_meta_fn
     ):
-        # Cython is in the series' bundled-tool table, so provisioning it does
-        # not add a provider: it takes over poky's python3-cython. That swap
-        # invalidates the previous version's sstate manifests, and a
-        # signature-locked cache keeps the old setscene stamps, so the report
-        # has to name the shadowed recipe and the command that repairs it.
         meta = self._gapped(make_meta_fn)
         monkeypatch.setattr(
             cli,
@@ -830,19 +776,6 @@ class TestGapProvisioning:
 
 
 class TestTransitiveProvisioning:
-    """A provisioned build tool drags its own native companions with it.
-
-    Regression: numpy 2.5.3 wants ``meson-python>=0.18.0`` (Scarthgap's native
-    sysroot ships 0.15.0), so the layer gained ``python3-meson-python_0.22.0``.
-    That recipe could not build: meson-python 0.18.0+ passes a third
-    ``metadata_version`` argument to ``StandardMetadata.from_pyproject``, but the
-    sysroot's ``pyproject-metadata`` is 0.7.1, whose method takes two --
-    ``TypeError: ... takes from 2 to 3 positional arguments but 4 were given``.
-    The companion is declared *unversioned* by meson-python, so only the
-    companion table can supply the bound. Provisioning has to iterate: a single
-    pass would stop at meson-python and still emit the unbuildable recipe.
-    """
-
     def _gapped(self, make_meta_fn, **kw):
         return make_meta_fn(
             build_deps=[
@@ -894,14 +827,11 @@ class TestTransitiveProvisioning:
         assert rc == 0
         out = tmp_path / "out" / "meta-black" / "recipes-devtools" / "python"
         assert (out / "python3-meson-python_0.22.0.bb").is_file()
-        # The companion that makes the provisioned tool buildable.
         assert (out / "python3-pyproject-metadata_0.9.1.bb").is_file()
 
     def test_companion_skipped_when_sysroot_is_new_enough(
         self, tmp_path, monkeypatch, capsys, make_meta_fn
     ):
-        # Nothing to drag in: the target sysroot already ships a new-enough
-        # pyproject-metadata, so no shadowing recipe is written.
         meta = self._gapped(make_meta_fn)
         monkeypatch.setattr(
             cli,
@@ -921,8 +851,6 @@ class TestTransitiveProvisioning:
     def test_provisioning_terminates_on_a_cycle(
         self, tmp_path, monkeypatch, capsys, make_meta_fn
     ):
-        # A companion that demands the tool that pulled it in must not loop
-        # forever: the "already in the closure" check ends the fixpoint.
         meta = self._gapped(make_meta_fn)
         inner = _dep_aware_fake(meta, _source(tmp_path), make_meta_fn)
         calls = []
@@ -935,7 +863,7 @@ class TestTransitiveProvisioning:
                         name="meson-python",
                         canonical_name="meson-python",
                         version="0.22.0",
-                        # demands the tool that pulled it in, plus a new companion
+                        # Tool that pulled it in, plus a new companion
                         build_deps=[
                             Dependency(
                                 name="meson-python",
@@ -966,15 +894,6 @@ class TestTransitiveProvisioning:
 
 
 class TestTargetRuntimeFlags:
-    """--python-version / --target-arch must reach the generated layer.
-
-    The series table only knows the Python a Yocto release ships, and nothing
-    at all about the CPU. Without these flags an x86_64 developer generating
-    for a PetaLinux board running aarch64 gets a layer pinned to the host's
-    wheel (pyvizionsdk publishes one version per architecture, so that is the
-    wrong upstream version, not just the wrong file).
-    """
-
     def _run(self, tmp_path, monkeypatch, capsys, meta, *extra) -> str:
         monkeypatch.setattr(
             cli, "build_metadata", _fake_build_metadata(meta, _source(tmp_path))
@@ -1018,9 +937,6 @@ class TestTargetRuntimeFlags:
             "--target-arch",
             "aarch64",
         )
-        # The report header, the recipe's provenance comment and the layer
-        # README: an artifact built for one runtime must never be mistaken for
-        # one built for the machine that happened to run py2bbr.
         assert "Runtime      : Python 3.12 on aarch64" in text
         assert "# Runtime: Python 3.12 on aarch64" in text
         assert "Python 3.12 on aarch64" in text.split("README")[-1]
@@ -1028,8 +944,6 @@ class TestTargetRuntimeFlags:
     def test_target_report_names_the_target_arch(
         self, tmp_path, monkeypatch, capsys, make_meta_fn
     ):
-        # The per-target matrix is judged for every machine of the family, so
-        # its header has to say which one the recipe is actually for.
         out = self._run(
             tmp_path,
             monkeypatch,
@@ -1052,9 +966,6 @@ class TestTargetRuntimeFlags:
     def test_python_version_drives_the_requires_python_verdict(
         self, tmp_path, monkeypatch, capsys, make_meta_fn
     ):
-        # black's metadata here requires >=3.13, which the series' own 3.12
-        # rejects and an explicitly targeted 3.13 accepts. The override has to
-        # reach the report, not just the comment.
         meta = make_meta_fn(requires_python=">=3.13")
         rejected = self._run(
             tmp_path,
@@ -1088,8 +999,6 @@ class TestTargetRuntimeFlags:
     def test_unparsable_value_is_a_clean_error(
         self, tmp_path, capsys, flag, value, named
     ):
-        # Not an argparse "invalid choice" traceback: the value is validated
-        # once the target is being resolved, and has to read as a message.
         assert cli.main(["black", "-o", str(tmp_path), flag, value]) == 2
         err = capsys.readouterr().err
         assert f"error: invalid {named} '{value}'" in err

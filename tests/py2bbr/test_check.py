@@ -48,14 +48,10 @@ def _write(tmp_path, text: str):
 
 
 class TestStructuralCorruptionChecks:
-    """The PetaLinux field corruption leaves signatures we must reject.
-
-    The broken line looked like ``DEPENDS +=     -pybind11-native '00:00``
-    ('00:00 is a timestamp residue; ``-pybind11-native`` shows the
-    ``${PYTHON_PN}-`` prefix was gutted).
-    """
-
     def test_timestamp_residue_fails(self, tmp_path):
+        """
+        Note: A real problem in an early version of py2bbr.
+        """
         p = _write(
             tmp_path,
             _CLEAN.replace(
@@ -82,8 +78,6 @@ class TestStructuralCorruptionChecks:
         assert result.status is Status.FAIL
 
     def test_single_quote_imbalance_warns(self, tmp_path):
-        # Apostrophe inside a double-quoted value (legit in a free-text
-        # SUMMARY): double quotes stay balanced, single quotes do not.
         p = _write(tmp_path, _CLEAN.replace("python3-click", "python'3-click"))
         result = structural_check(p)
         item = next(i for i in result.items if i[0] == "balanced single-quotes")
@@ -115,13 +109,6 @@ class TestStructuralEdges:
 
 
 class TestVendoredStructural:
-    """S6: a vendored recipe replaces ``inherit pypi`` with file:// SRC_URI.
-
-    The structural check must not demand the pypi class when the recipe
-    vendors its sdist, but must demand the ``S`` unpack dir that replaces the
-    class's ``S = ${WORKDIR}/${PYPI_PACKAGE}-${PV}``.
-    """
-
     def test_vendored_form_without_pypi_class_passes(self, tmp_path):
         text = _CLEAN.replace(
             "inherit pypi\n",
@@ -342,14 +329,6 @@ class TestRunChecks:
 
 
 class TestRunChecksAvailable:
-    """When a tool *is* available, the level has to actually run it.
-
-    The skipped branches are cheap to reach (monkeypatch the probe to say
-    "unavailable"), so the running branches need their own tests - a level that
-    silently skips whenever bitbake/kas/check-layer exist would report success
-    without validating anything.
-    """
-
     def _run(self, tmp_path, monkeypatch, level, **kwargs):
         monkeypatch.setattr(
             check, "_bitbake_available", lambda: (True, "bitbake found")

@@ -326,13 +326,6 @@ class TestVerdictRanking:
 
 
 class TestSharedReasonsSuppressRowNotes:
-    """A shared reason already decided the verdict: do not pile notes on top.
-
-    Printing "confirm the aarch64 extension modules" on a row that is
-    INCOMPATIBLE for a different reason makes the reader hunt for which of the
-    two is the real blocker.
-    """
-
     def test_rust_block_silences_the_per_target_risk(self, make_meta_fn, yocto):
         report = evaluate(
             make_meta_fn(
