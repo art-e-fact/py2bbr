@@ -1217,6 +1217,9 @@ def detect_native_code(
     source: FetchedSource, build_requires: list[str] = ()
 ) -> tuple[bool, list[str]]:
     """Whether the artifact ships code that must be compiled, plus detail."""
+
+    # TODO Rename to detect_need_to_compile ?
+
     found: dict[str, str] = {}
     for name in _member_names(source.path):
         kind = _NATIVE_SUFFIX_KINDS.get(PurePosixPath(name).suffix.lower())

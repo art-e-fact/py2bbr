@@ -217,11 +217,7 @@ def layer_collection(layer_name: str) -> str:
 
 
 def default_layer_name(package_name: str) -> str:
-    """The default layer directory name for a package: ``meta-<canonical>``.
-
-    e.g. ``async_pyserial`` -> ``meta-async-pyserial``. One layer per package
-    (per PEP 503 canonical name), so generated layers never collide.
-    """
+    """The default layer directory name for a package: ``meta-<canonical>``."""
     return f"meta-{canonical_name(package_name)}"
 
 

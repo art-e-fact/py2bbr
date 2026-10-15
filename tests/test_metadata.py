@@ -333,8 +333,8 @@ def _sdist_src(p: Path) -> FetchedSource:
     return FetchedSource(p, SourceKind.SDIST, "sha", p.name)
 
 
-#: Metadata for a wheel-only package whose repository is known. There is no
-#: sdist, so build_metadata has to read [build-system] from the repository.
+# Metadata for a wheel-only package whose repository is known. There is no
+# sdist, so build_metadata has to read [build-system] from the repository.
 _WHEEL_META = """\
 Metadata-Version: 2.4
 Name: pyvizionsdk
@@ -388,7 +388,35 @@ class TestPipExecutable:
 
 
 class TestRunPipDownload:
-    def test_command_shape(self, monkeypatch, tmp_path):
+    @staticmethod
+    def _capture(monkeypatch, tmp_path, **kw) -> list[str]:
+        """
+        Run a pip download wrapped in test settings.
+        """
+        captured: dict = {}
+
+        def fake_run(cmd, **run_kw):
+            captured["cmd"] = cmd
+            return subprocess.CompletedProcess(cmd, 0, "ok", "")
+
+        monkeypatch.setattr(M, "_pip_executable", lambda: ["fake", "pip"])
+        monkeypatch.setattr(M.subprocess, "run", fake_run)
+        M._run_pip_download(
+            "pkg==1.0", tmp_path, PipOptions(), kw.pop("mode"), **kw
+        )
+        return captured["cmd"]
+
+    @staticmethod
+    def _values_after(cmd: list[str], flag: str) -> list[str]:
+        return [cmd[n + 1] for n in range(len(cmd) - 1) if cmd[n] == flag]
+
+    def test_command_plain(self, monkeypatch, tmp_path):
+        """
+        Plain check of the pip download function.
+
+        Logic is the same as the `_capture` helper here, with broader checks
+        on several details.
+        """
         captured: dict = {}
 
         def fake_run(cmd, **kw):
@@ -414,6 +442,11 @@ class TestRunPipDownload:
         assert cmd[-3:] == ["--index-url", "https://i", "--x"]
 
     def test_routes_pip_scratch_under_dest(self, monkeypatch, tmp_path):
+        """
+        Checks specific to scratch
+
+        Logic is the same as the `_capture` helper here, with specific checks.
+        """
         captured: dict = {}
 
         def fake_run(cmd, **kw):
@@ -435,25 +468,6 @@ class TestRunPipDownload:
         probe = scratch / "probe"
         probe.write_text("x")
         assert probe.stat().st_dev == tmp_path.stat().st_dev
-
-    @staticmethod
-    def _capture(monkeypatch, tmp_path, **kw) -> list[str]:
-        captured: dict = {}
-
-        def fake_run(cmd, **run_kw):
-            captured["cmd"] = cmd
-            return subprocess.CompletedProcess(cmd, 0, "ok", "")
-
-        monkeypatch.setattr(M, "_pip_executable", lambda: ["fake", "pip"])
-        monkeypatch.setattr(M.subprocess, "run", fake_run)
-        M._run_pip_download(
-            "pkg==1.0", tmp_path, PipOptions(), kw.pop("mode"), **kw
-        )
-        return captured["cmd"]
-
-    @staticmethod
-    def _values_after(cmd: list[str], flag: str) -> list[str]:
-        return [cmd[n + 1] for n in range(len(cmd) - 1) if cmd[n] == flag]
 
     def test_target_interpreter_is_pinned(self, monkeypatch, tmp_path):
         cmd = self._capture(
@@ -503,8 +517,6 @@ class TestRunPipDownload:
         assert all(v.endswith(f"_{cross}") for v in values)
 
     def test_abi_is_never_constrained(self, monkeypatch, tmp_path):
-        # The ABI is the one axis py2bbr cannot know: it belongs to the
-        # nativesdk sysroot, not to the target's Python release.
         cmd = self._capture(
             monkeypatch,
             tmp_path,
@@ -595,18 +607,15 @@ class TestFetchSource:
     def test_wheel_fallback_warns_when_sdist_fails(
         self, tmp_path, monkeypatch, caplog
     ):
-        # Regression: pip's isolated metadata build can fail environmentally
-        # (e.g. ENOSPC on a full /tmp) even though the sdist exists. The
-        # wheel fallback must surface pip's diagnostics, not silently lose
-        # [build-system] detection.
-        calls = {"n": 0}
+        # Track calls to switch logic.
+        # `calls` is not a plain integer, but a "non-primitive" object
+        # so that `fake` can reference it.
+        calls = [0]
 
         def fake(requirement, dest, *a, **k):
-            calls["n"] += 1
-            if calls["n"] == 1:
-                return subprocess.CompletedProcess(
-                    [], 1, "", "ERROR: No space left on device"
-                )
+            calls[0] += 1
+            if calls[0] == 1:
+                return subprocess.CompletedProcess([], 1, "", "ERROR")
             (dest / "black-26.5.1-py3-none-any.whl").write_bytes(b"data")
             return subprocess.CompletedProcess([], 0, "", "")
 
@@ -614,7 +623,7 @@ class TestFetchSource:
         with caplog.at_level("WARNING", logger="py2bbr.metadata"):
             src = M.fetch_source("black", "26.5.1", PipOptions(), tmp_path)
         assert src.kind is SourceKind.WHEEL
-        assert "No space left on device" in caplog.text
+        assert "ERROR" in caplog.text
         assert "[build-system]" in caplog.text
 
     def test_not_found(self, tmp_path, monkeypatch):
@@ -627,10 +636,6 @@ class TestFetchSource:
     def test_fetch_after_other_packages_picks_own_artifact(
         self, tmp_path, monkeypatch
     ):
-        # Regression: all fetches share workdir/download, and _pick_artifact
-        # used to return min() over the whole dir, so after "blessed" landed
-        # every later fetch (editor, readchar, ...) resolved to blessed.
-        # Each fetch must select the artifact pip placed for THIS requirement.
         def fake_download(req, dest_dir, *a, **k):
             name = req.split(">")[0].split("=")[0].strip()
             (dest_dir / f"{name}-1.0.tar.gz").write_bytes(name.encode())
@@ -643,8 +648,6 @@ class TestFetchSource:
     def test_second_fetch_same_package_picks_new_artifact(
         self, tmp_path, monkeypatch
     ):
-        # Regression: a re-run resolving a NEW upstream version must not pick
-        # the artifact left in workdir/download by the previous run.
         def fake_download(req, dest_dir, *a, **k):
             version = req.split("==")[1]
             (dest_dir / f"black-{version}.tar.gz").write_bytes(version.encode())
@@ -710,9 +713,6 @@ class TestArchiveReading:
         assert M.find_license_file(src) is None
 
     def test_license_mixed_case_extension(self, tmp_path):
-        # Real numpy sdist ships top-level LICENSE.txt; the name set is
-        # mixed-case while comparisons upper() the member, so lowercase
-        # extensions were never matched (no LIC_FILES_CHKSUM in the recipe).
         src = _sdist_src(
             _sdist(tmp_path, {"black-26.5.1/LICENSE.txt": "MIT license text\n"})
         )
@@ -734,9 +734,6 @@ class TestArchiveReading:
         assert M.read_build_system(src) == ("", [])
 
     def test_build_system_no_pyproject(self, tmp_path):
-        # None, not ("", []): the artifact says nothing about its build system,
-        # which is what tells build_system_from_vcs the wheel case apart from an
-        # upstream that affirmatively means implicit setuptools.
         src = _sdist_src(_sdist(tmp_path, {"black-26.5.1/PKG-INFO": _PKG_INFO}))
         assert M.read_build_system(src) is None
 
@@ -771,8 +768,7 @@ class TestArchiveReading:
         assert M.parse_metadata_file(src)["Version"] == "26.5.1"
         name, _md5 = M.find_license_file(src)
         assert name == "LICENSE"
-        # A wheel is a build product: it has no pyproject.toml at all, which is
-        # exactly the case build_system_from_vcs is asked to cover.
+        # A wheel is a build product: It has no pyproject.toml.
         assert M.read_build_system(src) is None
 
     def test_no_metadata_raises(self, tmp_path):
@@ -786,7 +782,7 @@ class TestArchiveReading:
 
 
 class TestMessageHelpers:
-    def test_first_non_string(self):
+    def test_reject_duplicates(self):
         m = email.message.Message()
         m.add_header("X", "a")
         m.add_header("X", "b")
@@ -835,9 +831,6 @@ class TestBuildMetadata:
         assert meta.resolved_from == "https://pypi.org"
 
     def test_major_cap_applied_by_default(self, tmp_path, monkeypatch):
-        # click>=8.0.0 -> click>=8.0.0,<9 and hatchling>=1.27.0 ->
-        # hatchling>=1.27.0,<2: the ceiling rides on the recorded requirements
-        # so resolution AND reporting agree.
         src = _sdist_src(_sdist(tmp_path, _FULL_MEMBERS))
         monkeypatch.setattr(M, "fetch_source", lambda *a, **k: src)
         meta, _ = M.build_metadata(
@@ -883,7 +876,7 @@ class TestBuildMetadata:
         assert meta.resolved_from == "https://extra"
 
     def test_build_deps_invalid_requirement_skipped(self):
-        deps = M._build_deps_from_requires(["ok>=1", "not a requirement !!!"])
+        deps = M._build_deps_from_requires(["ok>=1", "not ok !!!"])
         assert [d.name for d in deps] == ["ok"]
 
 
@@ -1234,8 +1227,6 @@ class TestDetectNativeCode:
         assert M.detect_native_code(src) == (False, [])
 
     def test_headers_alone_are_not_evidence(self, tmp_path):
-        # A vendored header is not a compiled artifact; flagging every sdist
-        # that ships one would drown the real signal.
         src = self._src(tmp_path, {"p-1.0/api.h": "int x;"})
         assert M.detect_native_code(src) == (False, [])
 
@@ -1310,14 +1301,15 @@ class TestDetectNativeCode:
         assert len(evidence) == M._MAX_EVIDENCE
 
     def test_wheel_members_count(self, tmp_path):
+        """
+        Check report nothing to compile when there is no source.
+        """
         path = tmp_path / "pkg-1.0-cp312-cp312-manylinux_2_17_x86_64.whl"
         with zipfile.ZipFile(path, "w") as zf:
             zf.writestr("pkg/_core.cpython-312-x86_64-linux-gnu.so", b"\0")
         native, _ = M.detect_native_code(
             FetchedSource(path, SourceKind.WHEEL, "sha", path.name)
         )
-        # A compiled extension module has no source extension, but the .so
-        # is not ignored either way: the wheel check reports the tag instead.
         assert native is False
 
     def test_unreadable_archive(self, tmp_path):
@@ -1471,8 +1463,6 @@ class TestMachineGatedDeps:
         assert plain == ["click>=8"]
 
     def test_other_markers_stay_plain(self):
-        # sys_platform markers are arch-independent: dropping them against the
-        # POSIX assumption is correct and needs no recipe-level override.
         gated, plain = M.machine_gated_deps(
             ['colorama; sys_platform == "win32"'], resolve_yocto_version("5.0")
         )
@@ -1495,16 +1485,6 @@ class TestMachineGatedDeps:
 
 
 class TestSdistDownloadRetry:
-    """A failed sdist attempt is retried without pip's build isolation.
-
-    pip prepares an sdist's PEP 517 metadata in an isolated build env, which it
-    populates *from the index*. An index that carries the package but not the
-    declared backend (or one reached through a narrower credential) then fails
-    the download even though the sdist is right there. py2bbr's own environment
-    can build that metadata, so the second attempt drops the isolation instead
-    of falling through to a wheel.
-    """
-
     def test_retry_drops_build_isolation(self, tmp_path, monkeypatch):
         seen: list[dict] = []
 
@@ -1521,8 +1501,7 @@ class TestSdistDownloadRetry:
         assert len(seen) == 2
         assert seen[0].get("no_build_isolation") is not True
         assert seen[1]["no_build_isolation"] is True
-        # The retry still demands an sdist: a wheel is not a successful sdist
-        # fetch, it is the fallback the retry exists to avoid.
+        # The retry still demands an sdist
         assert seen[1]["mode"] == "--no-binary=:all:"
 
     def test_no_retry_when_the_sdist_arrives(self, tmp_path, monkeypatch):
@@ -1540,9 +1519,6 @@ class TestSdistDownloadRetry:
     def test_wheel_on_a_no_binary_attempt_is_not_an_sdist(
         self, tmp_path, monkeypatch, caplog
     ):
-        # pip was told --no-binary and still produced only a wheel. Accepting
-        # it would skip both the fallback and the warning about the lost
-        # [build-system] detection that a wheel payload cannot carry.
         def fake(requirement, dest, *a, **kw):
             (dest / "pkg-1.0-py3-none-any.whl").write_bytes(b"data")
             return subprocess.CompletedProcess([], 0, "", "")
@@ -1555,13 +1531,6 @@ class TestSdistDownloadRetry:
 
 
 class TestWheelTagCompatibility:
-    """A wheel is only installable if its tags can run on the target.
-
-    A wheel is a build product for one exact ABI, so a mismatch is a hard load
-    error on the target - decidable from the file name, and worth reporting
-    before a long cross build rather than after it.
-    """
-
     @pytest.mark.parametrize(
         "filename",
         [
@@ -1600,8 +1569,6 @@ class TestWheelTagCompatibility:
         assert "3.12" in reason
 
     def test_unparsable_name_is_left_to_the_build(self):
-        # Guessing from a name we cannot read would produce a wrong verdict;
-        # let the build report the real problem.
         assert M._wheel_rejection_reason("not-a-wheel.txt", None) is None
         assert (
             M._wheel_rejection_reason(
@@ -1611,16 +1578,12 @@ class TestWheelTagCompatibility:
         )
 
     def test_non_cpython_target_is_not_checked(self):
-        # No target Python to compare against, so nothing is decidable.
         assert (
             M._wheel_rejection_reason("pkg-1.0-cp314-cp314-any.whl", None)
             is None
         )
 
     def test_platform_tag_alone_does_not_reject(self):
-        # py2bbr does not know the target architecture, so a foreign platform
-        # tag is advice, not a hard failure: ``any``/``linux_*``/
-        # ``manylinux_*`` are the only shapes it accepts as plausible.
         assert (
             M._wheel_rejection_reason(
                 "pkg-1.0-cp312-cp312-manylinux_2_31_x86_64.whl",
@@ -1651,21 +1614,12 @@ class TestWheelTagCompatibility:
         message = str(excinfo.value)
         assert "serves no artifact the target can use" in message
         assert "cp314-cp314" in message
-        # Says what was actually checked: the download is already restricted to
-        # the target's interpreter, so the verdict is about the index, not about
-        # whatever py2bbr's own interpreter would have accepted.
         assert "3.12" in message
-        # Names the target, so the reader knows which constraint applied.
         assert "Yocto 5.0" in message
-        # Actionable: name the fix rather than just the symptom.
         assert "--sdist" in message
         assert "--index-url" in message
 
     def test_wheel_miss_names_the_pin(self, tmp_path, monkeypatch):
-        # pip filters wheels by interpreter tag, so an index carrying only
-        # wheels for other Python versions reports "from versions: none". The
-        # message has to name the pin, or a reader cannot tell that apart from
-        # a bad requirement or a wrong --index-url.
         proc = subprocess.CompletedProcess(
             [], 1, "", "ERROR: No matching distribution found for multi==1.0"
         )
@@ -1709,17 +1663,7 @@ class TestWheelTagCompatibility:
 
 
 class TestTargetInterpreterPinned:
-    """py2bbr's own interpreter must never decide what a layer ships.
-
-    The reported failure: py2bbr ran under CPython 3.14, pip resolved the wheel
-    for *that* interpreter, and the CPython 3.12 target was declared unusable.
-    Artifact selection has to be driven by the target, which is the only
-    interpreter the generated layer will ever meet.
-    """
-
     def test_major_minor_only(self):
-        # pip's --python-version takes a major.minor spec. YoctoVersion carries
-        # one, but a patch component must not silently disable the pin.
         yocto = dataclasses.replace(
             resolve_yocto_version("5.0"), python_version="3.12.6"
         )
@@ -1754,8 +1698,6 @@ class TestTargetInterpreterPinned:
         assert M._target_label(None) == "the Yocto target"
 
     def test_only_the_wheel_fallback_is_pinned(self, tmp_path, monkeypatch):
-        # The sdist attempts must not be pinned: pip resolves them by building
-        # metadata, and the target interpreter plays no part in that.
         calls: list[tuple[str, str | None]] = []
 
         def fake(requirement, dest, pip_opts, mode, *a, **kw):
@@ -1784,8 +1726,6 @@ class TestTargetInterpreterPinned:
         ]
 
     def test_wheel_fallback_is_pinned(self, tmp_path, monkeypatch):
-        # The one attempt that has to be pinned: a wheel is picked by
-        # interpreter tag, so the answer depends on the target's version.
         calls: list[tuple[str, str | None]] = []
 
         def fake(requirement, dest, pip_opts, mode, *a, **kw):
@@ -1822,14 +1762,6 @@ class TestTargetInterpreterPinned:
 
 
 class TestTargetArchitecturePinned:
-    """py2bbr's own CPU must never decide what a layer ships either.
-
-    The reported failure: pyvizionsdk publishes one version per architecture,
-    so an x86_64 host resolving a wheel for a PetaLinux target that runs
-    aarch64 produced a layer installing a wheel the target cannot load (and
-    pinned the wrong upstream version to boot).
-    """
-
     @staticmethod
     def _cross(arch: str = "aarch64"):
         return resolve_target_runtime(
@@ -1837,18 +1769,10 @@ class TestTargetArchitecturePinned:
         )
 
     def test_native_target_is_left_to_pip(self):
-        # The target *is* the machine running py2bbr: pip's own tags already
-        # describe it, and they are wider than anything enumerated here (real
-        # glibc version, musl, the interpreter's ABI). Pinning could only lose
-        # a wheel.
         assert M._pip_platforms(self._cross(current_platform_machine())) == []
         assert M._pip_platforms(None) == []
 
     def test_family_is_named_for_the_target_cpu(self):
-        # pip resolves --platform values literally (a manylinux_2_17_aarch64
-        # value matches only wheels tagged exactly that), so the family has to
-        # be spelled out: every glibc baseline, the legacy aliases, musl, and
-        # the bare linux tag a hand-built toolchain produces.
         platforms = M._pip_platforms(self._cross())
         assert platforms == [
             *(f"manylinux_2_{minor}_aarch64" for minor in range(5, 46)),
@@ -1862,23 +1786,16 @@ class TestTargetArchitecturePinned:
         assert not any("_x86_64" in p for p in platforms)
 
     def test_family_uses_the_canonical_cpu_name(self):
-        # arm64 is a spelling; aarch64 is what a Linux target's Python reports
-        # in platform_machine, and what PEP 508 markers compare against.
         assert "linux_aarch64" in M._pip_platforms(self._cross("arm64"))
 
     def test_host_that_cannot_name_its_cpu_leaves_pip_in_charge(
         self, monkeypatch
     ):
-        # An empty platform.machine() means "unknown", not "x86_64": pip's own
-        # tags are the only ones that can be right about such a host, so no
-        # pin is invented for it.
         monkeypatch.setattr(M.platform, "machine", lambda: "")
         assert M._pip_platforms(self._cross("aarch64")) == []
         assert M._pip_platforms(self._cross("x86_64")) == []
 
     def test_only_the_wheel_fallback_is_pinned(self, tmp_path, monkeypatch):
-        # The sdist attempts must not carry a platform pin: an sdist is
-        # architecture independent and bitbake builds it on the target.
         calls: list[tuple[str, list[str] | None]] = []
 
         def fake(requirement, dest, pip_opts, mode, *a, **kw):
@@ -1902,9 +1819,6 @@ class TestTargetArchitecturePinned:
         ]
 
     def test_failure_names_the_cpu_it_sought(self, tmp_path, monkeypatch):
-        # "No matching distribution" is what a pin produces when the index has
-        # wheels for other CPUs only. The message has to say so, or the run
-        # reads as a bad requirement or a wrong index URL.
         monkeypatch.setattr(
             M,
             "_run_pip_download",
@@ -1918,29 +1832,13 @@ class TestTargetArchitecturePinned:
             )
         message = str(exc.value)
         assert "aarch64 wheels" in message
-        # The reproduction command must be pasteable: pip has no wildcard for
-        # --platform, so '*_aarch64' would itself fail and teach nothing. It
-        # keeps the interpreter pin and drops the platform one, which is what
-        # tells "no aarch64 wheel" apart from "no wheel at all".
         assert "--python-version 3.12" in message
         assert "--platform" not in message
         assert "carries nothing for aarch64" in message
 
 
 class TestWheelShipsPrebuiltBinaries:
-    """Whether a recipe must waive bitbake's fatal already-stripped QA check.
-
-    The reported failure: a wheel recipe for pyvizionsdk failed do_package with
-    ``QA Issue: File '.../pyVizionSDK.cpython-312-aarch64-linux-gnu.so' was
-    already stripped, this will prevent future debugging! [already-stripped]``.
-    Upstream strips the wheel before upload, so the check has to be waived - but
-    only where it would fire, or a pure-Python wheel recipe disables a check for
-    a file it does not ship.
-    """
-
     def test_platform_tag_admits_prebuilt_binaries(self):
-        # What the failing case looks like: an extension-module wheel for one
-        # ABI and one CPU, plus an auditwheel sidecar set beside it.
         assert M.wheel_ships_prebuilt_binaries(
             "pyvizionsdk-26.9.1-cp312-cp312-manylinux_2_31_aarch64.whl"
         )
@@ -1953,19 +1851,14 @@ class TestWheelShipsPrebuiltBinaries:
         ],
     )
     def test_pure_python_wheel_keeps_the_check(self, filename):
-        # ``any`` is the promise that the payload is pure Python, so no ELF can
-        # be inside and the check must stay on.
         assert not M.wheel_ships_prebuilt_binaries(filename)
 
     def test_stable_abi_wheel_on_a_foreign_cpu(self):
-        # abi3 wheels are interpreter-portable but still CPU-specific.
         assert M.wheel_ships_prebuilt_binaries(
             "foo-1.0-cp38-abi3-manylinux_2_17_x86_64.whl"
         )
 
     def test_unparsable_name_keeps_the_check(self):
-        # Better to fail the build loudly on a name the tooling cannot classify
-        # than to waive a check that would have caught a real problem.
         assert not M.wheel_ships_prebuilt_binaries("not-a-wheel.txt")
         assert not M.wheel_ships_prebuilt_binaries("")
 
@@ -1979,17 +1872,11 @@ def _elf64_bytes(
     elf_data: int = 1,
     versions: tuple[str, ...] = (),
 ) -> bytes:
-    """A minimal dynamic ELF64 that py2bbr's reader understands.
+    """
+    A minimal dynamic ELF64 that py2bbr's reader understands.
 
-    DT_STRTAB intentionally carries a *virtual* address (``vaddr_base +
-    table``), not the file offset: wheel DSOs sit at a nonzero load base, and
-    the vaddr->offset mapping through PT_LOAD is exactly what the parser has to
-    get right.
-
-    ``versions`` appends a minimal ``.gnu.version_d`` - a base node named by
-    the library file (which the reader must drop) followed by one node per
-    version - so tests can exercise the renamed-soname/symbol-version cross
-    that rpm cannot resolve on its own.
+    TODO At this point completely generated by an LLM (forgot which one)
+         and used as-is.
     """
     strings: dict[str, int] = {}
     table = b"\x00"
@@ -2085,16 +1972,6 @@ def _elf64_bytes(
 
 
 class TestWheelExternalNeededLibs:
-    """Which shared libraries a vendored wheel still needs from the target.
-
-    The QA error this guards: an auditwheel wheel's sidecar libraries reference
-    each other and system libraries by soname; bitbake's file-rdeps check fails
-    on exactly the ones no package can provide - the renamed sidecars (their
-    versioned symbols cross rpm's original/renamed namespace split) and, really
-    and truly, the external system libraries. The recipe waives file-rdeps, so
-    py2bbr has to surface those external sonames itself.
-    """
-
     @staticmethod
     def _wheel(
         tmp_path: Path, members: dict[str, bytes], name: str = "pkg-1.0-any.whl"
@@ -2106,9 +1983,6 @@ class TestWheelExternalNeededLibs:
         return path
 
     def test_external_vs_self_provided_split(self, tmp_path):
-        # The extension module links the glib family and the bundled sidecar;
-        # the sidecar itself provides its own (mangled) soname. net: only the
-        # glib family is a true external system-library finding.
         core = _elf64_bytes(
             [
                 "libglib-2.0.so.0",
@@ -2128,14 +2002,14 @@ class TestWheelExternalNeededLibs:
             },
             "pkg-1.0-cp312-cp312-manylinux_2_31_aarch64.whl",
         )
+        # All that are leaf libs, and no part of OE rootfs already.
         assert M.wheel_external_needed_libs(whl) == [
             "libglib-2.0.so.0",
             "libgobject-2.0.so.0",
         ]
 
     def test_toolchain_runtime_is_not_a_finding(self, tmp_path):
-        # glibc and its satellites, the compiler runtime, the dynamic linker:
-        # every OE rootfs with python3 ships them, so they are noise.
+        # All OE rootfs with python3 has these, so not "external"
         core = _elf64_bytes(
             [
                 "libc.so.6",
@@ -2172,30 +2046,37 @@ class TestWheelExternalNeededLibs:
             {"pkg/_core.so": _elf64_bytes(["libglib-2.0.so.0"], elf_class=1)},
         )
         assert M.wheel_external_needed_libs(whl) == []
-        # Not a zip at all: best-effort failure, no error.
+        # Not a zip at all: Best-effort failure, no error.
         bogus = tmp_path / "pkg-1.0-cp312-cp312-manylinux_2_31_aarch64.whl"
         bogus.write_bytes(b"not a zip archive")
         assert M.wheel_external_needed_libs(bogus) == []
 
     def test_elf_reader_defensive_branches(self):
-        # The reader must degrade to (None, [], []) on every malformed shape it
-        # can meet, not raise: a vendored wheel is informational input.
         assert M._elf64_dynamic_tags(b"") == (None, [], [])
+
+        def header_head():
+            header = bytearray(64)
+            header[0:4] = b"\x7fELF"
+            header[4] = 2
+            header[5] = 1
+            return header
+
         # e_phentsize == 0 (no program header table).
-        header = bytearray(64)
-        header[0:4] = b"\x7fELF"
-        header[4] = 2
-        header[5] = 1
+        header = header_head()
         struct.pack_into("<H", header, 16, 3)
         struct.pack_into("<H", header, 56, 1)
         assert M._elf64_dynamic_tags(bytes(header)) == (None, [], [])
+
         # phpnum points past EOF -> the phdr scan breaks early and there is no
         # dynamic section.
+        header = header_head()
         struct.pack_into("<Q", header, 32, 64)
         struct.pack_into("<H", header, 54, 56)
         struct.pack_into("<H", header, 56, 2)
         assert M._elf64_dynamic_tags(bytes(header)) == (None, [], [])
+
         # A PT_DYNAMIC that never sets DT_STRTAB.
+        header = header_head()
         phoff, doff, dynsz = 64, 64 + 56, 32
         blob = bytearray(phoff + 56 + dynsz)  # header + 1 phdr + 2 dyn entries
         blob[0:64] = header
@@ -2210,6 +2091,7 @@ class TestWheelExternalNeededLibs:
         struct.pack_into("<Q", blob, doff + 8, 98)  # index into nothing
         struct.pack_into("<q", blob, doff + 16, 0)  # DT_NULL
         assert M._elf64_dynamic_tags(bytes(blob)) == (None, [], [])
+
         # String-table lookups: out-of-range index, and a pointer with no NUL
         # terminator within the cap.
         assert M._elf_strtab_lookup(b"ab\x00cd", 0, 5, 99) == ""
@@ -2217,17 +2099,6 @@ class TestWheelExternalNeededLibs:
 
 
 class TestWheelBundledLibVersions:
-    """The symbol versions the wheel's bundled sidecar libraries define.
-
-    The rpm cross that motivates this: an auditwheel build renames the
-    bundled library (libblkid-e4a77f31.so.1.1.0) and rewrites consumers'
-    DT_NEEDED to that name, while the library's .gnu.version_d still records
-    the original names; rpm then requires
-    libblkid-e4a77f31.so.1.1.0(BLKID_1.0)(64bit) and no package provides it.
-    The recipe re-provides exactly these tokens (see recipe.py), keyed by
-    what this function returns.
-    """
-
     @staticmethod
     def _wheel(
         tmp_path: Path, members: dict[str, bytes], name: str = "pkg-1.0-any.whl"
@@ -2239,8 +2110,6 @@ class TestWheelBundledLibVersions:
         return path
 
     def test_bundled_sidecar_versions(self, tmp_path):
-        # Two auditwheel-renamed sidecars, each defining versioned symbols;
-        # the base node (the library file name) must be dropped.
         blkid = _elf64_bytes(
             [],
             soname="libblkid-e4a77f31.so.1.1.0",
@@ -2262,8 +2131,6 @@ class TestWheelBundledLibVersions:
         }
 
     def test_extension_modules_contribute_nothing(self, tmp_path):
-        # A compiled extension module has no DT_SONAME and (in this build) no
-        # version definitions: it is not a bundled library and must not appear.
         core = _elf64_bytes(["libglib-2.0.so.0"])
         sidecar = _elf64_bytes(
             [], soname="libgstvideo-1.0.so.0", versions=("GSTVIDEO_1_0",)
@@ -2280,8 +2147,6 @@ class TestWheelBundledLibVersions:
         }
 
     def test_sorted_and_deduplicated(self, tmp_path):
-        # Two members carrying the same soname (e.g. a hardlink duplicated by
-        # the build) still yield one sorted, deduplicated entry.
         blob = _elf64_bytes([], soname="libm.so.6", versions=("GLIBC_2.17",))
         whl = self._wheel(
             tmp_path,
@@ -2295,8 +2160,6 @@ class TestWheelBundledLibVersions:
         }
 
     def test_best_effort_failures(self, tmp_path):
-        # Corrupt archive and a wheel with no parseable .so members both give
-        # {} - informational input must never raise.
         bogus = tmp_path / "pkg-1.0-cp312-cp312-manylinux_2_31_aarch64.whl"
         bogus.write_bytes(b"not a zip archive")
         assert M.wheel_bundled_lib_versions(bogus) == {}
@@ -2305,13 +2168,6 @@ class TestWheelBundledLibVersions:
 
 
 class TestVcsBuildSystem:
-    """Recovering [build-system] from the repository when no sdist exists.
-
-    A wheel carries no build config, so without this every wheel-only package is
-    reported as an implicit setuptools build - a guess, and a wrong one for
-    exactly the packages that have moved to another backend.
-    """
-
     @staticmethod
     def _serve(monkeypatch, body: bytes | None, *, seen: list | None = None):
         """Replace the network with a one-URL answer, recording the request."""
@@ -2339,9 +2195,6 @@ class TestVcsBuildSystem:
         )
 
     def test_url_shapes_all_reduce_to_the_repository(self, monkeypatch):
-        # The metadata carries whatever shape the packager typed: a bare URL, a
-        # .git clone URL, a VCS requirement with an #egg fragment, or a deep
-        # link into one subdirectory. All four name the same repo.
         seen: list[str] = []
         self._serve(
             monkeypatch,
@@ -2361,15 +2214,10 @@ class TestVcsBuildSystem:
         )
 
     def test_forged_host_is_not_read_as_the_real_forge(self, monkeypatch):
-        # A host that merely *ends* with github.com is someone else's server.
-        # Reading its file would silently report a build system the user never
-        # pointed py2bbr at.
         assert M._vcs_repo("https://github.com.evil.example/o/r") is None
         assert M._vcs_repo("https://notgithub.example/o/r") is None
 
     def test_non_repository_paths_are_rejected(self):
-        # No netloc at all, and a forge root with a single segment: neither is
-        # a repository, so neither can name a raw-file endpoint.
         assert M._vcs_repo("") is None
         assert M._vcs_repo("https://github.com/just-owner") is None
         assert M._vcs_repo("https://github.com") is None
@@ -2406,9 +2254,6 @@ class TestVcsBuildSystem:
         assert seen == [raw]
 
     def test_fetch_bytes_network_calls(self, monkeypatch):
-        # The one piece of real HTTP in this feature: a 2xx body is returned,
-        # and anything else (a 404, a connection failure) is None - never an
-        # exception from the build-metadata path.
         import urllib.error
         import urllib.request
 
@@ -2458,8 +2303,6 @@ class TestVcsBuildSystem:
     def test_self_hosted_forge_is_skipped(self, monkeypatch):
         seen: list[str] = []
         self._serve(monkeypatch, b"x", seen=seen)
-        # The raw-file layout of a private Gitea/Gogs is not a fixed contract, so
-        # a URL is not guessed for it - better to report "unknown" than to 404.
         assert (
             M.build_system_from_vcs([("Repo", "https://git.corp/o/r")]) is None
         )
@@ -2498,8 +2341,6 @@ class TestVcsBuildSystem:
         assert len(seen) == 1
 
     def test_an_unreachable_forge_is_not_an_error(self, monkeypatch):
-        # A down or proxy-blocked forge must leave the answer unknown, never
-        # fail a fetch that already succeeded.
         monkeypatch.setattr(M, "_fetch_bytes", lambda url, timeout: None)
         assert (
             M.build_system_from_vcs([("Repo", "https://github.com/o/r")])
@@ -2507,8 +2348,6 @@ class TestVcsBuildSystem:
         )
 
     def test_an_html_error_page_is_not_a_backend(self, monkeypatch):
-        # A 200 with an HTML body (a login wall, a renamed repo redirect) must
-        # not be parsed into a build system.
         self._serve(monkeypatch, b"<!doctype html><html>404</html>")
         assert (
             M.build_system_from_vcs([("Repo", "https://github.com/o/r")])
@@ -2516,9 +2355,6 @@ class TestVcsBuildSystem:
         )
 
     def test_file_without_build_system_is_weak_and_skipped(self, monkeypatch):
-        # "No [build-system]" is a real answer, but from the default branch it
-        # only says the project does not declare one *today*; keep looking for a
-        # repository that says more.
         seen: list[str] = []
         self._serve(
             monkeypatch,
@@ -2536,8 +2372,6 @@ class TestVcsBuildSystem:
     def test_metadata_records_the_provenance_it_used(
         self, tmp_path, monkeypatch
     ):
-        # build_backend_source is what stops the recovered backend from reading
-        # as the release's own declaration.
         self._serve(
             monkeypatch,
             b'[build-system]\nbuild-backend = "mesonpy"\nrequires = ["cython"]\n',
@@ -2559,9 +2393,6 @@ class TestVcsBuildSystem:
     def test_wheel_that_declares_nothing_stays_unknown(
         self, tmp_path, monkeypatch
     ):
-        # No repository to ask (or nothing there): the backend stays empty, which
-        # downstream reads as the implicit-setuptools default rather than as a
-        # finding.
         monkeypatch.setattr(M, "_fetch_bytes", lambda url, timeout: None)
         monkeypatch.setattr(
             M,
@@ -2577,11 +2408,6 @@ class TestVcsBuildSystem:
     def test_legacy_sdist_is_not_answered_by_the_repository(
         self, tmp_path, monkeypatch
     ):
-        # An sdist with no pyproject.toml is a legacy setuptools project: the
-        # sdist itself is the truth, and the repository's default branch could
-        # name a backend the project migrated to after this release. The VCS
-        # recovery is therefore gated to wheels - a repository that answers
-        # must not be consulted, even when the metadata names one.
         seen: list[str] = []
         self._serve(
             monkeypatch,
