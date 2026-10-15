@@ -68,7 +68,7 @@ py2bbr mytool \
 Note: By default `py2bbr` bundles dependencies following 2 rules:
 
 1. Stricly follow version requirements (`numpy==1.2.3`, or `numpy>=1.2.3`)
-2. If there is version upper bound, preserve the major version (`numpy>=1.2.3` becomes automatically `numpy>=1.2.3,<2`)
+2. If there is no version upper bound, automatically reserve the major version (`numpy>=1.2.3` becomes `numpy>=1.2.3,<2`)
 
 The second rule can be deactivated with `--no-major-bump-cap`.
 
@@ -176,7 +176,7 @@ Currently: **6.0 (Wayne)** and **5.0 (Scarthgap, default)** are supported. We ex
 commented out in code for now). Add entries in `src/py2bbr/yocto.py` to start
 supporting more.
 
-Tests are currently run on 5.0 (the default), and the others are "experimental"
+End-to-end tests are currently run on 5.0 (the default), and the others are "experimental"
 for now using LLM generated code.
 
 
