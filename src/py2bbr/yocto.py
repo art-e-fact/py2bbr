@@ -17,14 +17,16 @@ from py2bbr.recipe import bitbake_pn, canonical_name, recipe_filename
 
 logger = logging.getLogger(__name__)
 
-# Known Yocto Project series.
+# Known Yocto Project series. Newest first; ``python_version`` is the Python
+# the series ships (see ``_BUNDLED_TOOL_VERSIONS`` in ``recipe.py`` for the
+# matching build-tool versions).
 _YOCTO_SERIES: dict[str, YoctoVersion] = {
     "6.0": YoctoVersion(
         "6.0",
-        "wayne",
-        "wayne",
-        "3.13",
-        meta_python_branch="wayne",
+        "wrynose",
+        "wrynose",
+        "3.14",
+        meta_python_branch="wrynose",
     ),
     "5.0": YoctoVersion(
         "5.0",
@@ -35,23 +37,23 @@ _YOCTO_SERIES: dict[str, YoctoVersion] = {
     ),
     # "4.3": YoctoVersion(
     #     "4.3",
-    #     "styhead",
-    #     "styhead",
+    #     "nanbield",
+    #     "nanbield",
     #     "3.11",
-    #     meta_python_branch="styhead",
+    #     meta_python_branch="nanbield",
     # ),
     # "4.1": YoctoVersion(
     #     "4.1",
-    #     "mickledore",
-    #     "mickledore",
+    #     "langdale",
+    #     "langdale",
     #     "3.10",
-    #     meta_python_branch="mickledore",
+    #     meta_python_branch="langdale",
     # ),
     # "3.1": YoctoVersion(
     #     "3.1",
     #     "dunfell",
     #     "dunfell",
-    #     "3.9",
+    #     "3.8",
     #     meta_python_branch="dunfell",
     # ),
 }

@@ -57,10 +57,10 @@ class TestLayerConf:
         )
         assert "LAYERCOMPATIBLE" not in conf
 
-    def test_wayne_series_compat(self, meta):
+    def test_wrynose_series_compat(self, meta):
         conf = _layer_conf(meta, resolve_yocto_version("6.0"))
         assert _line(conf, "LAYERSERIES_COMPAT_py2bbr") == (
-            'LAYERSERIES_COMPAT_py2bbr = "wayne"'
+            'LAYERSERIES_COMPAT_py2bbr = "wrynose"'
         )
         assert _line(conf, "LAYERDEPENDS_py2bbr") == (
             'LAYERDEPENDS_py2bbr = "core"'
@@ -112,14 +112,17 @@ class TestResolveVersion:
         assert resolve_yocto_version("5").version == "5.0"
 
     def test_codename(self):
-        assert resolve_yocto_version("wayne").version == "6.0"
+        assert resolve_yocto_version("wrynose").version == "6.0"
 
     def test_invalid(self):
         with pytest.raises(YoctoVersionError, match="unknown Yocto version"):
             resolve_yocto_version("9.9")
 
     def test_known_versions_newest_first(self):
-        assert [v.version for v in known_versions()] == ["6.0", "5.0"]
+        assert [v.version for v in known_versions()] == [
+            "6.0",
+            "5.0",
+        ]
 
     def test_version_key(self):
         assert _version_key("6.0") == (6, 0)
