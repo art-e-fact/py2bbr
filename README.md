@@ -27,8 +27,16 @@ mechanically, directly from the target package and its formal dependencies.
 
 ## Install
 
-Hopefully from PyPi soonish. For now, please install from the repository.
+Hopefully from PyPi soonish. For now, please install from the repository, or
+via tool wrappers, e.g.:
 
+```
+uv tool install git+https://github.com/art-e-fact/py2bbr
+
+# or
+
+pipx install git+https://github.com/art-e-fact/py2bbr
+```
 
 ## Dev Install
 
